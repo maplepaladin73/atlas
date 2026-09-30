@@ -313,6 +313,26 @@ impl Qwen3SsmLayer {
             // try_forward_km already wrote moe_output for all rows.
         } else if self.ffn.is_dense() {
             self.ffn.forward_prefill(normed2, num_tokens, ctx, stream)?;
+        } else if num_tokens > 3 && num_tokens % 2 == 0 {
+            // Multi-sequence verify (e.g. 2 seqs x K=2 -> K=4). Run the K=2 arm
+            // once per row pair. With num_drafts=1 every sequence contributes
+            // exactly 2 rows, so each pair is one sequence and its numerics are
+            // those of a solo verify. forward_k2 writes only moe_output rows
+            // 0..2, so go last pair first and move each result up to its rows.
+            let row = ctx.config.hidden_size * 2; // bf16 bytes per row
+            let out = ctx.buffers.moe_output();
+            for pair in (0..num_tokens / 2).rev() {
+                self.ffn
+                    .forward_k2(normed2.offset(pair * 2 * row), ctx, stream)?;
+                if pair > 0 {
+                    ctx.gpu
+                        .copy_d2d_async(out, out.offset(pair * 2 * row), 2 * row, stream)?;
+                }
+            }
+        } else if num_tokens > 3 {
+            // Odd widths (uneven per-sequence K): the general per-token batched
+            // MoE path writes all [num_tokens, h] rows of moe_output.
+            self.ffn.forward_batched(normed2, num_tokens, ctx, stream)?;
         } else {
             anyhow::bail!(
                 "qwen3_ssm mHC batched decode: no batched MoE arm for K={num_tokens}. \
