@@ -412,6 +412,15 @@ impl Qwen3AttentionLayer {
                 "fused_k_norm_rope_cache",
                 "fused_k_norm_rope_cache_write_bf16",
             ),
+            // Resolved alongside for the cutile bulk-only fallback (PR #2).
+            fused_k_norm_rope_op: crate::layers::ops::cutile_k_norm_rope::resolve_fused_k_norm_rope(gpu)
+                .unwrap_or(crate::layers::ops::cutile_k_norm_rope::FusedKNormRopeOp::Registry(
+                    super::super::try_kernel(
+                        gpu,
+                        "fused_k_norm_rope_cache",
+                        "fused_k_norm_rope_cache_write_bf16",
+                    ),
+                )),
             fused_k_norm_rope_mrope_cache_write_bf16_k: super::super::try_kernel(
                 gpu,
                 "fused_k_norm_rope_cache",

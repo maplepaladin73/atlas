@@ -202,6 +202,8 @@ mod moe_nvfp4_mmq;
 mod moe_prefill;
 #[path = "ops/cutile_rms_norm.rs"]
 pub mod cutile_rms_norm;
+#[path = "ops/cutile_k_norm_rope.rs"]
+pub mod cutile_k_norm_rope;
 #[path = "ops/norm.rs"]
 mod norm;
 mod nvfp4_mmq;

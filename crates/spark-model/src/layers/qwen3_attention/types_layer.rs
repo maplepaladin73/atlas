@@ -251,6 +251,7 @@ pub struct Qwen3AttentionLayer {
     /// cliff in chunked-prefill BF16 KV mode (memory:
     /// `project_qwen36_phase2b_softmax_expf.md`).
     pub(super) fused_k_norm_rope_cache_write_bf16_k: KernelHandle,
+    pub(super) fused_k_norm_rope_op: crate::layers::ops::cutile_k_norm_rope::FusedKNormRopeOp,
     /// MRoPE-interleaved variant of the above. Same precision regime.
     /// Dispatched when `mrope_interleaved` is true.
     pub(super) fused_k_norm_rope_mrope_cache_write_bf16_k: KernelHandle,
