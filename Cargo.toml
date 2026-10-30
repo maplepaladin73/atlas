@@ -74,6 +74,14 @@ anyhow = "1"
 # committed gate records — it has to mean the same thing next year.
 sha2 = "0.10"
 
+# cutile-rs (NVIDIA CUDA Tile) — opt-in RMSNorm experiment, see
+# crates/spark-model/src/layers/ops/cutile_rms_norm.rs and issue #263.
+# cuda-only; never enabled on metal builds. Declared non-optional here
+# (workspace deps cannot be optional) and gated with `optional = true` at
+# the crate level.
+cutile = "0.4"
+tokio = { version = "1", features = ["rt"] }
+
 # Synchronization — parking_lot Mutex/RwLock are faster than std::sync,
 # don't poison, and `.lock()` returns the guard directly (no Result).
 # Already a transitive dep of several crates so this adds no binary
