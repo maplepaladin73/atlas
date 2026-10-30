@@ -430,10 +430,90 @@ fn main() -> Result<()> {
         }
     }
 
+    // ── C1 — opt-in cutile-rs path vs the SAME F64 truth (issue #263) ──
+    // Only compiled with --features cutile; without it this section is absent
+    // and the binary behaves exactly as before.
+    #[cfg(feature = "cutile")]
+    {
+        use spark_model::layers::ops::cutile_rms_norm::{rms_norm_op, RmsNormOp};
+        println!("\n=== C1 — cutile-rs `rms_norm_vanilla_tile` vs F64 truth (feature=cutile) ===");
+        println!(
+            "{:<22} {:>6} {:>6} {:>12} {:>12}",
+            "weight regime", "hidden", "seed", "max |abs|", "max rel"
+        );
+        println!("{}", "-".repeat(64));
+        let mut cutile_fail = 0usize;
+        for c in &cases {
+            for &hidden in &dims {
+                for &seed in &seeds {
+                    let tokens = 3usize;
+                    let mut r = Lcg(seed);
+                    let x: Vec<bf16> = (0..tokens * hidden)
+                        .map(|_| bf16::from_f32(r.r(-3.0, 3.0) as f32))
+                        .collect();
+                    let w: Vec<bf16> = (0..hidden)
+                        .map(|_| bf16::from_f32(r.r(c.lo, c.hi) as f32))
+                        .collect();
+                    let w64: Vec<f64> = w.iter().map(|v| v.to_f64()).collect();
+
+                    let xp = ub(g, &x)?;
+                    let wp = ub(g, &w)?;
+                    let op = g.alloc(tokens * hidden * 2)?;
+                    let dw = spark_model::weight_map::DenseWeight { weight: wp };
+                    rms_norm_op(
+                        g,
+                        &RmsNormOp::Cutile,
+                        xp,
+                        &dw,
+                        op,
+                        tokens as u32,
+                        hidden as u32,
+                        EPS,
+                        0,
+                    )?;
+                    g.synchronize(0)?;
+                    let dev = db(g, op, tokens * hidden)?;
+                    let truth_v = truth(&x, &w64, hidden, tokens);
+                    let (a, rel) = cmp(&dev, &truth_v);
+                    // Same tolerance as V2: one BF16 ULP of slack.
+                    let bad = rel > 0.01;
+                    if bad {
+                        cutile_fail += 1;
+                        fail += 1;
+                    }
+                    if seed == seeds[0] && hidden == dims[0] {
+                        println!(
+                            "{:<22} {:>6} {:>6} {:>12.3e} {:>12.3e}{}",
+                            c.name, hidden, seed, a, rel,
+                            if bad { "   <<< FAIL" } else { "" }
+                        );
+                    }
+                    if bad {
+                        println!(
+                            "  FAIL(cutile) {:<14} hidden={} seed={} abs={:.3e} rel={:.3e}",
+                            c.name, hidden, seed, a, rel
+                        );
+                    }
+                    for p in [xp, wp, op] {
+                        g.free(p)?;
+                    }
+                }
+            }
+        }
+        println!(
+            "C1: {} regimes x {} dims x {} seeds = {} cells, {} failures",
+            cases.len(), dims.len(), seeds.len(),
+            cases.len() * dims.len() * seeds.len(), cutile_fail
+        );
+    }
+
     println!();
     if fail > 0 {
         bail!("{fail} failure(s) — READING R1: STOP AND REPAIR. No behavioral eval.");
     }
+    #[cfg(feature = "cutile")]
+    println!("ALL DEVICE CHECKS PASS (V2 + I1 + V3 + V3w + V1d + C1).");
+    #[cfg(not(feature = "cutile"))]
     println!("ALL DEVICE CHECKS PASS (V2 + I1 + V3 + V3w + V1d).");
     Ok(())
 }
