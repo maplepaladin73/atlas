@@ -141,9 +141,9 @@ struct Case {
 /// Wall time per launch, including the sync both paths already do.
 /// Shapes match the 2026-10-29 writeup: bulk 8192x4096 and a decode row.
 fn bench_both(g: &dyn GpuBackend) -> Result<()> {
-    use std::time::Instant;
     #[cfg(feature = "cutile")]
     use spark_model::layers::ops::cutile_rms_norm::{RmsNormOp, rms_norm_op};
+    use std::time::Instant;
     println!("=== bench — cutile vs rms_norm_vanilla (sync each launch) ===");
     println!(
         "{:>8} {:>8} {:>14} {:>14} {:>8}",
@@ -158,11 +158,29 @@ fn bench_both(g: &dyn GpuBackend) -> Result<()> {
         let op = g.alloc(n * 2)?;
         let reps = 30u32;
         for _ in 0..5 {
-            launch(g, "rms_norm_vanilla", "rms_norm_vanilla", xp, wp, op, tokens, hidden)?;
+            launch(
+                g,
+                "rms_norm_vanilla",
+                "rms_norm_vanilla",
+                xp,
+                wp,
+                op,
+                tokens,
+                hidden,
+            )?;
         }
         let t0 = Instant::now();
         for _ in 0..reps {
-            launch(g, "rms_norm_vanilla", "rms_norm_vanilla", xp, wp, op, tokens, hidden)?;
+            launch(
+                g,
+                "rms_norm_vanilla",
+                "rms_norm_vanilla",
+                xp,
+                wp,
+                op,
+                tokens,
+                hidden,
+            )?;
         }
         let cuda_us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
         #[cfg(feature = "cutile")]
@@ -182,9 +200,7 @@ fn bench_both(g: &dyn GpuBackend) -> Result<()> {
         #[cfg(not(feature = "cutile"))]
         let cutile_us = f64::NAN;
         let delta = (cutile_us - cuda_us) / cuda_us * 100.0;
-        println!(
-            "{tokens:>8} {hidden:>8} {cuda_us:>14.2} {cutile_us:>14.2} {delta:>+7.1}%"
-        );
+        println!("{tokens:>8} {hidden:>8} {cuda_us:>14.2} {cutile_us:>14.2} {delta:>+7.1}%");
         for p in [xp, wp, op] {
             g.free(p)?;
         }
@@ -245,271 +261,12 @@ fn main() -> Result<()> {
 
     let mut fail = 0usize;
     if !only_cutile {
-    println!("=== V2 — production `rms_norm_vanilla` vs F64 truth (out = x*w/rms) ===");
-    println!(
-        "{:<22} {:>6} {:>6} {:>12} {:>12}",
-        "weight regime", "hidden", "seed", "max |abs|", "max rel"
-    );
-    println!("{}", "-".repeat(64));
-    for c in &cases {
-        for &hidden in &dims {
-            for &seed in &seeds {
-                let tokens = 3usize;
-                let mut r = Lcg(seed);
-                let x: Vec<bf16> = (0..tokens * hidden)
-                    .map(|_| bf16::from_f32(r.r(-3.0, 3.0) as f32))
-                    .collect();
-                let w: Vec<bf16> = (0..hidden)
-                    .map(|_| bf16::from_f32(r.r(c.lo, c.hi) as f32))
-                    .collect();
-                let w64: Vec<f64> = w.iter().map(|v| v.to_f64()).collect();
-
-                let xp = ub(g, &x)?;
-                let wp = ub(g, &w)?;
-                let op = g.alloc(tokens * hidden * 2)?;
-                launch(
-                    g,
-                    "rms_norm_vanilla",
-                    "rms_norm_vanilla",
-                    xp,
-                    wp,
-                    op,
-                    tokens as u32,
-                    hidden as u32,
-                )?;
-                let dev = db(g, op, tokens * hidden)?;
-                let truth_v = truth(&x, &w64, hidden, tokens);
-                let (a, rel) = cmp(&dev, &truth_v);
-                // BF16 store granularity: one ULP at magnitude ~4 is ~0.03. The kernel
-                // reduces in F32, so allow one BF16 ULP of slack, no more.
-                let bad = rel > 0.01;
-                if bad {
-                    fail += 1;
-                }
-                if seed == seeds[0] && hidden == dims[0] {
-                    println!(
-                        "{:<22} {:>6} {:>6} {:>12.3e} {:>12.3e}{}",
-                        c.name,
-                        hidden,
-                        seed,
-                        a,
-                        rel,
-                        if bad { "   <<< FAIL" } else { "" }
-                    );
-                }
-                if bad {
-                    println!(
-                        "  FAIL {:<20} hidden={} seed={} abs={:.3e} rel={:.3e}",
-                        c.name, hidden, seed, a, rel
-                    );
-                }
-            }
-        }
-    }
-    println!(
-        "V2: {} regimes x {} dims x {} seeds = {} cells, {} failures\n",
-        cases.len(),
-        dims.len(),
-        seeds.len(),
-        cases.len() * dims.len() * seeds.len(),
-        fail
-    );
-
-    // ── I1 — the q_b_norm invariant: offset kernel + ZERO weight == pure normalize ──
-    println!("=== I1 — `rms_norm` + zero weight (norm_unit_w) == pure normalize (unchanged) ===");
-    let hidden = 512usize;
-    let tokens = 4usize;
-    let mut r = Lcg(2026);
-    let x: Vec<bf16> = (0..tokens * hidden)
-        .map(|_| bf16::from_f32(r.r(-3.0, 3.0) as f32))
-        .collect();
-    let wz: Vec<bf16> = vec![bf16::from_f32(0.0); hidden];
-    let xp = ub(g, &x)?;
-    let wp = ub(g, &wz)?;
-    let op = g.alloc(tokens * hidden * 2)?;
-    launch(
-        g,
-        "norm",
-        "rms_norm",
-        xp,
-        wp,
-        op,
-        tokens as u32,
-        hidden as u32,
-    )?;
-    let dev = db(g, op, tokens * hidden)?;
-    let ones = vec![1.0f64; hidden];
-    let truth_v = truth(&x, &ones, hidden, tokens);
-    let (a, rel) = cmp(&dev, &truth_v);
-    let i1_ok = a == 0.0;
-    println!(
-        "  offset kernel, w=0  ->  max|abs| {:.3e}  max rel {:.3e}   {}",
-        a,
-        rel,
-        if i1_ok {
-            "BIT-EXACT — invariant holds"
-        } else {
-            "<<< FAIL"
-        }
-    );
-    if !i1_ok {
-        fail += 1;
-    }
-
-    // ── V3 — non-V4 regression: offset kernel still computes x*(1+w)/rms ──
-    println!("\n=== V3 — regression: `rms_norm` (offset-from-1) is UNCHANGED for non-V4 ===");
-    let mut r = Lcg(5150);
-    let wo: Vec<bf16> = (0..hidden)
-        .map(|_| bf16::from_f32(r.r(-0.5, 0.5) as f32))
-        .collect();
-    // Offset-from-1 model semantics: effective weight = 1 + stored.
-    let w_eff: Vec<f64> = wo.iter().map(|v| 1.0 + v.to_f64()).collect();
-    let wp = ub(g, &wo)?;
-    let op = g.alloc(tokens * hidden * 2)?;
-    launch(
-        g,
-        "norm",
-        "rms_norm",
-        xp,
-        wp,
-        op,
-        tokens as u32,
-        hidden as u32,
-    )?;
-    let dev = db(g, op, tokens * hidden)?;
-    let truth_v = truth(&x, &w_eff, hidden, tokens);
-    let (a, rel) = cmp(&dev, &truth_v);
-    let v3_ok = rel < 0.01;
-    println!(
-        "  offset kernel, w~U(-0.5,0.5)  ->  max|abs| {:.3e}  max rel {:.3e}   {}",
-        a,
-        rel,
-        if v3_ok {
-            "UNCHANGED — offset path intact"
-        } else {
-            "<<< FAIL"
-        }
-    );
-    if !v3_ok {
-        fail += 1;
-    }
-
-    println!("\n=== V3w — offset warp-row kernel at Qwen3.8 Q/K prefill shapes ===");
-    for rows in [4usize * 823, 24 * 823] {
-        let hidden = 256usize;
-        let mut r = Lcg(rows as u64);
-        let x: Vec<bf16> = (0..rows * hidden)
-            .map(|_| bf16::from_f32(r.r(-3.0, 3.0) as f32))
-            .collect();
-        let w: Vec<bf16> = (0..hidden)
-            .map(|_| bf16::from_f32(r.r(-0.5, 0.5) as f32))
-            .collect();
-        let w_eff: Vec<f64> = w.iter().map(|v| 1.0 + v.to_f64()).collect();
-        let xp = ub(g, &x)?;
-        let wp = ub(g, &w)?;
-        let op = g.alloc(rows * hidden * 2)?;
-        launch_offset_warp(g, xp, wp, op, rows as u32, hidden as u32)?;
-        let dev = db(g, op, rows * hidden)?;
-        let truth_v = truth(&x, &w_eff, hidden, rows);
-        let (a, rel) = cmp(&dev, &truth_v);
-        let ok = rel < 0.01;
-        println!(
-            "  rows={rows:>5} hidden={hidden}: max|abs| {a:.3e} max rel {rel:.3e}   {}",
-            if ok { "PASS" } else { "<<< FAIL" }
-        );
-        if !ok {
-            fail += 1;
-        }
-        for p in [xp, wp, op] {
-            g.free(p)?;
-        }
-    }
-
-    // ── V1d — OLD vs NEW on device, both scored against F64 truth from the EXACT weight ──
-    println!(
-        "\n=== V1d — OLD path (1 + bf16(w-1)) vs NEW path (exact w), device, vs F64 truth ==="
-    );
-    println!(
-        "{:<22} {:>13} {:>13} {:>13} {:>13}",
-        "weight regime", "OLD max|abs|", "OLD max rel", "NEW max|abs|", "NEW max rel"
-    );
-    println!("{}", "-".repeat(80));
-    for c in &cases {
-        let mut r = Lcg(31337);
-        let x: Vec<bf16> = (0..tokens * hidden)
-            .map(|_| bf16::from_f32(r.r(-3.0, 3.0) as f32))
-            .collect();
-        let w: Vec<bf16> = (0..hidden)
-            .map(|_| bf16::from_f32(r.r(c.lo, c.hi) as f32))
-            .collect();
-        let w64: Vec<f64> = w.iter().map(|v| v.to_f64()).collect();
-        let truth_v = truth(&x, &w64, hidden, tokens); // truth uses the EXACT checkpoint weight
-        let xp = ub(g, &x)?;
-
-        // OLD: loader stored bf16(w-1); offset kernel adds 1 back.
-        let w_old: Vec<bf16> = w
-            .iter()
-            .map(|v| bf16::from_f32((v.to_f64() - 1.0) as f32))
-            .collect();
-        let wp_old = ub(g, &w_old)?;
-        let op_old = g.alloc(tokens * hidden * 2)?;
-        launch(
-            g,
-            "norm",
-            "rms_norm",
-            xp,
-            wp_old,
-            op_old,
-            tokens as u32,
-            hidden as u32,
-        )?;
-        let (a_old, r_old) = cmp(&db(g, op_old, tokens * hidden)?, &truth_v);
-
-        // NEW: exact weight, vanilla kernel.
-        let wp_new = ub(g, &w)?;
-        let op_new = g.alloc(tokens * hidden * 2)?;
-        launch(
-            g,
-            "rms_norm_vanilla",
-            "rms_norm_vanilla",
-            xp,
-            wp_new,
-            op_new,
-            tokens as u32,
-            hidden as u32,
-        )?;
-        let (a_new, r_new) = cmp(&db(g, op_new, tokens * hidden)?, &truth_v);
-
-        // Sanity: the host-side prediction of the old effective weight.
-        let pred: Vec<f64> = w64.iter().map(|v| old_effective(*v)).collect();
-        let pred_truth = truth(&x, &pred, hidden, tokens);
-        let (a_pred, _) = cmp(&db(g, op_old, tokens * hidden)?, &pred_truth);
-
-        println!(
-            "{:<22} {:>13.3e} {:>13.3e} {:>13.3e} {:>13.3e}   [old==1+bf16(w-1) model: {:.1e}]",
-            c.name, a_old, r_old, a_new, r_new, a_pred
-        );
-        if r_new > r_old && r_old > 1e-6 {
-            println!("  <<< FAIL: the new path is not better than the old one");
-            fail += 1;
-        }
-    }
-
-    } // !only_cutile
-
-    // ── C1 — opt-in cutile-rs path vs the SAME F64 truth (issue #263) ──
-    // Only compiled with --features cutile; without it this section is absent
-    // and the binary behaves exactly as before.
-    #[cfg(feature = "cutile")]
-    {
-        use spark_model::layers::ops::cutile_rms_norm::{rms_norm_op, RmsNormOp};
-        println!("\n=== C1 — cutile-rs `rms_norm_vanilla_tile` vs F64 truth (feature=cutile) ===");
+        println!("=== V2 — production `rms_norm_vanilla` vs F64 truth (out = x*w/rms) ===");
         println!(
             "{:<22} {:>6} {:>6} {:>12} {:>12}",
             "weight regime", "hidden", "seed", "max |abs|", "max rel"
         );
         println!("{}", "-".repeat(64));
-        let mut cutile_fail = 0usize;
         for c in &cases {
             for &hidden in &dims {
                 for &seed in &seeds {
@@ -526,65 +283,241 @@ fn main() -> Result<()> {
                     let xp = ub(g, &x)?;
                     let wp = ub(g, &w)?;
                     let op = g.alloc(tokens * hidden * 2)?;
-                    let dw = spark_model::weight_map::DenseWeight { weight: wp };
-                    rms_norm_op(
+                    launch(
                         g,
-                        &RmsNormOp::Cutile,
+                        "rms_norm_vanilla",
+                        "rms_norm_vanilla",
                         xp,
-                        &dw,
+                        wp,
                         op,
                         tokens as u32,
                         hidden as u32,
-                        EPS,
-                        0,
                     )?;
-                    g.synchronize(0)?;
                     let dev = db(g, op, tokens * hidden)?;
                     let truth_v = truth(&x, &w64, hidden, tokens);
                     let (a, rel) = cmp(&dev, &truth_v);
-                    // Same tolerance as V2: one BF16 ULP of slack.
+                    // BF16 store granularity: one ULP at magnitude ~4 is ~0.03. The kernel
+                    // reduces in F32, so allow one BF16 ULP of slack, no more.
                     let bad = rel > 0.01;
                     if bad {
-                        cutile_fail += 1;
                         fail += 1;
                     }
                     if seed == seeds[0] && hidden == dims[0] {
                         println!(
                             "{:<22} {:>6} {:>6} {:>12.3e} {:>12.3e}{}",
-                            c.name, hidden, seed, a, rel,
+                            c.name,
+                            hidden,
+                            seed,
+                            a,
+                            rel,
                             if bad { "   <<< FAIL" } else { "" }
                         );
                     }
                     if bad {
                         println!(
-                            "  FAIL(cutile) {:<14} hidden={} seed={} abs={:.3e} rel={:.3e}",
+                            "  FAIL {:<20} hidden={} seed={} abs={:.3e} rel={:.3e}",
                             c.name, hidden, seed, a, rel
                         );
-                    }
-                    for p in [xp, wp, op] {
-                        g.free(p)?;
                     }
                 }
             }
         }
         println!(
-            "C1: {} regimes x {} dims x {} seeds = {} cells, {} failures",
-            cases.len(), dims.len(), seeds.len(),
-            cases.len() * dims.len() * seeds.len(), cutile_fail
+            "V2: {} regimes x {} dims x {} seeds = {} cells, {} failures\n",
+            cases.len(),
+            dims.len(),
+            seeds.len(),
+            cases.len() * dims.len() * seeds.len(),
+            fail
         );
-    }
+
+        // ── I1 — the q_b_norm invariant: offset kernel + ZERO weight == pure normalize ──
+        println!(
+            "=== I1 — `rms_norm` + zero weight (norm_unit_w) == pure normalize (unchanged) ==="
+        );
+        let hidden = 512usize;
+        let tokens = 4usize;
+        let mut r = Lcg(2026);
+        let x: Vec<bf16> = (0..tokens * hidden)
+            .map(|_| bf16::from_f32(r.r(-3.0, 3.0) as f32))
+            .collect();
+        let wz: Vec<bf16> = vec![bf16::from_f32(0.0); hidden];
+        let xp = ub(g, &x)?;
+        let wp = ub(g, &wz)?;
+        let op = g.alloc(tokens * hidden * 2)?;
+        launch(
+            g,
+            "norm",
+            "rms_norm",
+            xp,
+            wp,
+            op,
+            tokens as u32,
+            hidden as u32,
+        )?;
+        let dev = db(g, op, tokens * hidden)?;
+        let ones = vec![1.0f64; hidden];
+        let truth_v = truth(&x, &ones, hidden, tokens);
+        let (a, rel) = cmp(&dev, &truth_v);
+        let i1_ok = a == 0.0;
+        println!(
+            "  offset kernel, w=0  ->  max|abs| {:.3e}  max rel {:.3e}   {}",
+            a,
+            rel,
+            if i1_ok {
+                "BIT-EXACT — invariant holds"
+            } else {
+                "<<< FAIL"
+            }
+        );
+        if !i1_ok {
+            fail += 1;
+        }
+
+        // ── V3 — non-V4 regression: offset kernel still computes x*(1+w)/rms ──
+        println!("\n=== V3 — regression: `rms_norm` (offset-from-1) is UNCHANGED for non-V4 ===");
+        let mut r = Lcg(5150);
+        let wo: Vec<bf16> = (0..hidden)
+            .map(|_| bf16::from_f32(r.r(-0.5, 0.5) as f32))
+            .collect();
+        // Offset-from-1 model semantics: effective weight = 1 + stored.
+        let w_eff: Vec<f64> = wo.iter().map(|v| 1.0 + v.to_f64()).collect();
+        let wp = ub(g, &wo)?;
+        let op = g.alloc(tokens * hidden * 2)?;
+        launch(
+            g,
+            "norm",
+            "rms_norm",
+            xp,
+            wp,
+            op,
+            tokens as u32,
+            hidden as u32,
+        )?;
+        let dev = db(g, op, tokens * hidden)?;
+        let truth_v = truth(&x, &w_eff, hidden, tokens);
+        let (a, rel) = cmp(&dev, &truth_v);
+        let v3_ok = rel < 0.01;
+        println!(
+            "  offset kernel, w~U(-0.5,0.5)  ->  max|abs| {:.3e}  max rel {:.3e}   {}",
+            a,
+            rel,
+            if v3_ok {
+                "UNCHANGED — offset path intact"
+            } else {
+                "<<< FAIL"
+            }
+        );
+        if !v3_ok {
+            fail += 1;
+        }
+
+        println!("\n=== V3w — offset warp-row kernel at Qwen3.8 Q/K prefill shapes ===");
+        for rows in [4usize * 823, 24 * 823] {
+            let hidden = 256usize;
+            let mut r = Lcg(rows as u64);
+            let x: Vec<bf16> = (0..rows * hidden)
+                .map(|_| bf16::from_f32(r.r(-3.0, 3.0) as f32))
+                .collect();
+            let w: Vec<bf16> = (0..hidden)
+                .map(|_| bf16::from_f32(r.r(-0.5, 0.5) as f32))
+                .collect();
+            let w_eff: Vec<f64> = w.iter().map(|v| 1.0 + v.to_f64()).collect();
+            let xp = ub(g, &x)?;
+            let wp = ub(g, &w)?;
+            let op = g.alloc(rows * hidden * 2)?;
+            launch_offset_warp(g, xp, wp, op, rows as u32, hidden as u32)?;
+            let dev = db(g, op, rows * hidden)?;
+            let truth_v = truth(&x, &w_eff, hidden, rows);
+            let (a, rel) = cmp(&dev, &truth_v);
+            let ok = rel < 0.01;
+            println!(
+                "  rows={rows:>5} hidden={hidden}: max|abs| {a:.3e} max rel {rel:.3e}   {}",
+                if ok { "PASS" } else { "<<< FAIL" }
+            );
+            if !ok {
+                fail += 1;
+            }
+            for p in [xp, wp, op] {
+                g.free(p)?;
+            }
+        }
+
+        // ── V1d — OLD vs NEW on device, both scored against F64 truth from the EXACT weight ──
+        println!(
+            "\n=== V1d — OLD path (1 + bf16(w-1)) vs NEW path (exact w), device, vs F64 truth ==="
+        );
+        println!(
+            "{:<22} {:>13} {:>13} {:>13} {:>13}",
+            "weight regime", "OLD max|abs|", "OLD max rel", "NEW max|abs|", "NEW max rel"
+        );
+        println!("{}", "-".repeat(80));
+        for c in &cases {
+            let mut r = Lcg(31337);
+            let x: Vec<bf16> = (0..tokens * hidden)
+                .map(|_| bf16::from_f32(r.r(-3.0, 3.0) as f32))
+                .collect();
+            let w: Vec<bf16> = (0..hidden)
+                .map(|_| bf16::from_f32(r.r(c.lo, c.hi) as f32))
+                .collect();
+            let w64: Vec<f64> = w.iter().map(|v| v.to_f64()).collect();
+            let truth_v = truth(&x, &w64, hidden, tokens); // truth uses the EXACT checkpoint weight
+            let xp = ub(g, &x)?;
+
+            // OLD: loader stored bf16(w-1); offset kernel adds 1 back.
+            let w_old: Vec<bf16> = w
+                .iter()
+                .map(|v| bf16::from_f32((v.to_f64() - 1.0) as f32))
+                .collect();
+            let wp_old = ub(g, &w_old)?;
+            let op_old = g.alloc(tokens * hidden * 2)?;
+            launch(
+                g,
+                "norm",
+                "rms_norm",
+                xp,
+                wp_old,
+                op_old,
+                tokens as u32,
+                hidden as u32,
+            )?;
+            let (a_old, r_old) = cmp(&db(g, op_old, tokens * hidden)?, &truth_v);
+
+            // NEW: exact weight, vanilla kernel.
+            let wp_new = ub(g, &w)?;
+            let op_new = g.alloc(tokens * hidden * 2)?;
+            launch(
+                g,
+                "rms_norm_vanilla",
+                "rms_norm_vanilla",
+                xp,
+                wp_new,
+                op_new,
+                tokens as u32,
+                hidden as u32,
+            )?;
+            let (a_new, r_new) = cmp(&db(g, op_new, tokens * hidden)?, &truth_v);
+
+            // Sanity: the host-side prediction of the old effective weight.
+            let pred: Vec<f64> = w64.iter().map(|v| old_effective(*v)).collect();
+            let pred_truth = truth(&x, &pred, hidden, tokens);
+            let (a_pred, _) = cmp(&db(g, op_old, tokens * hidden)?, &pred_truth);
+
+            println!(
+                "{:<22} {:>13.3e} {:>13.3e} {:>13.3e} {:>13.3e}   [old==1+bf16(w-1) model: {:.1e}]",
+                c.name, a_old, r_old, a_new, r_new, a_pred
+            );
+            if r_new > r_old && r_old > 1e-6 {
+                println!("  <<< FAIL: the new path is not better than the old one");
+                fail += 1;
+            }
+        }
+    } // !only_cutile
 
     println!();
     if fail > 0 {
         bail!("{fail} failure(s) — READING R1: STOP AND REPAIR. No behavioral eval.");
     }
-    #[cfg(feature = "cutile")]
-    if only_cutile {
-        println!("ALL DEVICE CHECKS PASS (C1 cutile only).");
-    } else {
-        println!("ALL DEVICE CHECKS PASS (V2 + I1 + V3 + V3w + V1d + C1).");
-    }
-    #[cfg(not(feature = "cutile"))]
     println!("ALL DEVICE CHECKS PASS (V2 + I1 + V3 + V3w + V1d).");
     Ok(())
 }

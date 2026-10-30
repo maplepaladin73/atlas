@@ -115,15 +115,36 @@ pub fn fused_k_norm_rope_cache_write_bf16_op(
             {
                 gpu.synchronize(stream)?;
                 cutile_k_norm_rope_launch(
-                    k_in, k_norm_weight, positions, k_cache, slot_mapping, num_tokens,
-                    num_kv_heads, head_dim, rotary_dim, block_size, rms_eps, theta,
+                    k_in,
+                    k_norm_weight,
+                    positions,
+                    k_cache,
+                    slot_mapping,
+                    num_tokens,
+                    num_kv_heads,
+                    head_dim,
+                    rotary_dim,
+                    block_size,
+                    rms_eps,
+                    theta,
                 )
             }
             #[cfg(not(feature = "cutile"))]
             {
                 let _ = (
-                    k_in, k_norm_weight, positions, k_cache, slot_mapping, num_tokens,
-                    num_kv_heads, head_dim, rotary_dim, block_size, rms_eps, theta, stream,
+                    k_in,
+                    k_norm_weight,
+                    positions,
+                    k_cache,
+                    slot_mapping,
+                    num_tokens,
+                    num_kv_heads,
+                    head_dim,
+                    rotary_dim,
+                    block_size,
+                    rms_eps,
+                    theta,
+                    stream,
                 );
                 bail!("ATLAS_CUTILE_KNORM_ROPE=1 requires building with --features cutile")
             }
@@ -231,15 +252,10 @@ mod imp {
             );
         }
         // SAFETY: caller owns these allocations for the whole launch.
-        let x = unsafe {
-            Tensor::<bf16>::borrow_raw_parts(k_in.0, 0, vec![rows, hd], vec![hd, 1])
-        };
-        let w = unsafe {
-            Tensor::<bf16>::borrow_raw_parts(k_norm_weight.0, 0, vec![hd], vec![1])
-        };
-        let mut out = unsafe {
-            Tensor::<bf16>::borrow_raw_parts(k_out.0, 0, vec![rows, hd], vec![hd, 1])
-        };
+        let x = unsafe { Tensor::<bf16>::borrow_raw_parts(k_in.0, 0, vec![rows, hd], vec![hd, 1]) };
+        let w = unsafe { Tensor::<bf16>::borrow_raw_parts(k_norm_weight.0, 0, vec![hd], vec![1]) };
+        let mut out =
+            unsafe { Tensor::<bf16>::borrow_raw_parts(k_out.0, 0, vec![rows, hd], vec![hd, 1]) };
         let pos_i = unsafe {
             Tensor::<i32>::borrow_raw_parts(positions.0, 0, vec![num_tokens as i32], vec![1])
         };
@@ -248,9 +264,7 @@ mod imp {
             .map_err(|e| anyhow::anyhow!("cutile position convert: {e}"))?;
         let inv_host: Arc<Vec<f32>> = Arc::new(
             (0..half)
-                .map(|d| {
-                    (theta as f64).powf(-2.0 * d as f64 / (half as f64 * 2.0)) as f32
-                })
+                .map(|d| (theta as f64).powf(-2.0 * d as f64 / (half as f64 * 2.0)) as f32)
                 .collect(),
         );
         let inv = cutile::api::copy_host_vec_to_device(&inv_host)
@@ -302,7 +316,17 @@ fn cutile_k_norm_rope_launch(
     theta: f32,
 ) -> Result<()> {
     imp::cutile_k_norm_rope_launch(
-        k_in, k_norm_weight, positions, k_cache, slot_mapping, num_tokens, num_kv_heads,
-        head_dim, rotary_dim, block_size, rms_eps, theta,
+        k_in,
+        k_norm_weight,
+        positions,
+        k_cache,
+        slot_mapping,
+        num_tokens,
+        num_kv_heads,
+        head_dim,
+        rotary_dim,
+        block_size,
+        rms_eps,
+        theta,
     )
 }

@@ -40,8 +40,19 @@ fn main() -> Result<()> {
         g,
         &spark_model::layers::ops::cutile_k_norm_rope::FusedKNormRopeOp::Cutile,
         spark_runtime::gpu::KernelHandle(0),
-        xp, wp, pp, op, xp,
-        rows as u32, 1, HD as u32, HD as u32, 16, EPS, THETA, 0,
+        xp,
+        wp,
+        pp,
+        op,
+        xp,
+        rows as u32,
+        1,
+        HD as u32,
+        HD as u32,
+        16,
+        EPS,
+        THETA,
+        0,
     )?;
     g.synchronize(0)?;
     let got = download(g, op, rows * HD)?;
@@ -54,13 +65,20 @@ fn main() -> Result<()> {
         let xf: Vec<f32> = row.iter().map(|v| v.to_f32()).collect();
         let sum: f32 = xf.iter().map(|v| v * v).sum();
         let rms = (sum / HD as f32 + EPS).sqrt().recip();
-        let n: Vec<f32> = xf.iter().zip(&w).map(|(v, ww)| v * rms * (1.0 + ww.to_f32())).collect();
+        let n: Vec<f32> = xf
+            .iter()
+            .zip(&w)
+            .map(|(v, ww)| v * rms * (1.0 + ww.to_f32()))
+            .collect();
         let pos = positions[r] as f32;
         for d in 0..half {
             let freq = (THETA as f64).powf(-2.0 * d as f64 / HD as f64) as f32;
             let ang = pos * freq;
             let (c, s) = (ang.cos(), ang.sin());
-            for (col, y) in [(d, n[d] * c - n[d + half] * s), (d + half, n[d + half] * c + n[d] * s)] {
+            for (col, y) in [
+                (d, n[d] * c - n[d + half] * s),
+                (d + half, n[d + half] * c + n[d] * s),
+            ] {
                 let expect = bf16::from_f32(y);
                 let got_b = bf16::from_f64(got[r * HD + col]);
                 let ulp = (expect.to_bits() as i32 - got_b.to_bits() as i32).unsigned_abs();
@@ -69,9 +87,7 @@ fn main() -> Result<()> {
             }
         }
     }
-    println!(
-        "rows={rows} hd={HD} pos={positions:?} max|abs|={worst:.3e} max_ulp={worst_ulp}"
-    );
+    println!("rows={rows} hd={HD} pos={positions:?} max|abs|={worst:.3e} max_ulp={worst_ulp}");
     if worst_ulp > 1 {
         anyhow::bail!("K-norm+RoPE cutile check failed: {worst_ulp} ulp");
     }
@@ -94,13 +110,16 @@ fn upload(g: &dyn GpuBackend, d: &[bf16]) -> Result<DevicePtr> {
 }
 
 fn bench() -> Result<()> {
-    use std::time::Instant;
     use spark_model::layers::ops::cutile_k_norm_rope::{
-        fused_k_norm_rope_cache_write_bf16_op, FusedKNormRopeOp,
+        FusedKNormRopeOp, fused_k_norm_rope_cache_write_bf16_op,
     };
+    use std::time::Instant;
     let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &gpu;
-    let k = g.kernel("fused_k_norm_rope_cache", "fused_k_norm_rope_cache_write_bf16")?;
+    let k = g.kernel(
+        "fused_k_norm_rope_cache",
+        "fused_k_norm_rope_cache_write_bf16",
+    )?;
     println!(
         "{:>8} {:>6} {:>12} {:>12} {:>8}",
         "tokens", "hd", "cuda us", "cutile us", "delta"

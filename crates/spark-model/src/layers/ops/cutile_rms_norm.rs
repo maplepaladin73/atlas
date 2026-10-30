@@ -73,17 +73,15 @@ pub fn rms_norm_op(
     stream: u64,
 ) -> Result<()> {
     match op {
-        RmsNormOp::Registry(k) => {
-            KernelLaunch::new(gpu, *k)
-                .grid([num_tokens, 1, 1])
-                .block([hidden_size.min(1024), 1, 1])
-                .arg_ptr(input)
-                .arg_ptr(weight.weight)
-                .arg_ptr(output)
-                .arg_u32(hidden_size)
-                .arg_f32(eps)
-                .launch(stream)
-        }
+        RmsNormOp::Registry(k) => KernelLaunch::new(gpu, *k)
+            .grid([num_tokens, 1, 1])
+            .block([hidden_size.min(1024), 1, 1])
+            .arg_ptr(input)
+            .arg_ptr(weight.weight)
+            .arg_ptr(output)
+            .arg_u32(hidden_size)
+            .arg_f32(eps)
+            .launch(stream),
         RmsNormOp::Cutile => {
             #[cfg(feature = "cutile")]
             {
@@ -131,8 +129,7 @@ mod imp {
             let mean = sum * broadcast_scalar(inv_h, shape![1]);
             let rms: Tile<f32, { [1] }> =
                 rsqrt(mean + broadcast_scalar(eps, shape![1]), ftz::Disabled);
-            let rms_row: Tile<f32, { [1, H] }> =
-                rms.reshape(shape![1, 1]).broadcast(out.shape());
+            let rms_row: Tile<f32, { [1, H] }> = rms.reshape(shape![1, 1]).broadcast(out.shape());
             let wb: Tile<bf16, { [H] }> = w.load_tile(shape![H], [0]);
             let wf: Tile<f32, { [1, H] }> = convert_tile(wb.reshape(shape![1, H]));
             let y: Tile<bf16, { [1, H] }> = convert_tile(xf * rms_row * wf);
@@ -226,7 +223,9 @@ mod imp {
             let op = rms_norm::rms_norm_row(
                 &x,
                 &w,
-                (&mut out).partition([1, c as usize]).map([1, OWNED], tokens as u32),
+                (&mut out)
+                    .partition([1, c as usize])
+                    .map([1, OWNED], tokens as u32),
                 eps,
                 inv_h,
             )
@@ -252,7 +251,6 @@ mod imp {
             .map(|_| ())
             .map_err(|e| anyhow::anyhow!("cutile rms_norm launch: {e}"))
     }
-
 }
 
 #[cfg(feature = "cutile")]
