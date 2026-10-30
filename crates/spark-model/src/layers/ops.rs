@@ -200,6 +200,8 @@ pub mod moe_lora_grouped;
 mod moe_nvfp4_mmq;
 #[path = "ops/moe_prefill.rs"]
 mod moe_prefill;
+#[path = "ops/cutile_rms_norm.rs"]
+pub mod cutile_rms_norm;
 #[path = "ops/norm.rs"]
 mod norm;
 mod nvfp4_mmq;
