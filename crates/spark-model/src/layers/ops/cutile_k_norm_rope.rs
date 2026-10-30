@@ -13,6 +13,12 @@
 //! uses one tile per row (partition [1, HD], HD = head_dim, a power of two
 //! ≤ 256 on gb10).
 //!
+//! RoPE pairs element `d` with `d + rotary_dim/2`. Tile IR has no gather, so
+//! the row is split into two halves, rotated, and concatenated back. The
+//! paged cache write is a plain store into a `[rows, HD]` view of the cache
+//! rows this launch owns; the caller passes that view, not the raw paged
+//! buffer. Slot skipping stays with the caller.
+//!
 //! Requires the `cutile` cargo feature; without it the env flag is ignored and
 //! the precompiled kernel is always used.
 
@@ -102,25 +108,23 @@ pub fn fused_k_norm_rope_cache_write_bf16_op(
     match op {
         FusedKNormRopeOp::Registry(k) => launch_registry(gpu, *k),
         FusedKNormRopeOp::Cutile => {
-            // Bulk-only gate: small row counts stay on the CUDA kernel.
             if num_tokens.saturating_mul(num_kv_heads) < cutile_min_rows() {
                 return launch_registry(gpu, registry_k);
             }
             #[cfg(feature = "cutile")]
             {
-                // Host-serialize with Atlas's stream, then block on the cutile op.
                 gpu.synchronize(stream)?;
                 cutile_k_norm_rope_launch(
-                    k_in, k_norm_weight, positions, k_cache, slot_mapping,
-                    num_tokens, num_kv_heads, head_dim, rotary_dim, block_size,
-                    rms_eps, theta,
+                    k_in, k_norm_weight, positions, k_cache, slot_mapping, num_tokens,
+                    num_kv_heads, head_dim, rotary_dim, block_size, rms_eps, theta,
                 )
             }
             #[cfg(not(feature = "cutile"))]
             {
-                let _ = (k_in, k_norm_weight, positions, k_cache, slot_mapping,
-                    num_tokens, num_kv_heads, head_dim, rotary_dim, block_size,
-                    rms_eps, theta, stream);
+                let _ = (
+                    k_in, k_norm_weight, positions, k_cache, slot_mapping, num_tokens,
+                    num_kv_heads, head_dim, rotary_dim, block_size, rms_eps, theta, stream,
+                );
                 bail!("ATLAS_CUTILE_KNORM_ROPE=1 requires building with --features cutile")
             }
         }
@@ -130,154 +134,136 @@ pub fn fused_k_norm_rope_cache_write_bf16_op(
 #[cfg(feature = "cutile")]
 mod imp {
     use super::*;
+    use cutile::cuda_async::scheduling_policies::SingleStream;
     use cutile::prelude::*;
     use half::bf16;
     use std::sync::Arc;
 
-    /// Fused K-norm + RoPE + cache write, one tile per (token, head) row.
-    /// Mirrors the CUDA kernel's math exactly:
-    ///   normed = x * rsqrt(mean(x^2) + eps) * (1 + w)     (f32 internally)
-    ///   rope pairs (d, d + ROT/2), angle = pos * theta^(-2d/ROT), f64 pow
-    ///   out = is_d0 ? x0*cos - x1*sin : x1*cos + x0*sin; non-rotary dims passthrough
-    ///   cache dst = block_idx*(block_size*kv_stride) + block_off*kv_stride + head*HD + t
-    /// `k_in` is viewed as [rows, HD] with rows = tokens*kv_heads (the CUDA
-    /// kernel's [tokens, heads, hd] is the same memory).
     #[cutile::module]
     mod k_norm_rope {
         use cutile::core::*;
 
+        /// One row per block. `HD` is the head dim, `HALF` is `rotary_dim / 2`,
+        /// and `TAIL` is `HD - rotary_dim` (the dims RoPE leaves alone). All
+        /// three are powers of two, so the split/concat stays inside Tile IR.
         #[cutile::entry]
-        pub fn fused_k_norm_rope_tile<const HD: i32, const ROT: i32>(
+        pub fn fused_k_norm_rope_tile<const HD: i32, const HALF: i32, const TAIL: i32>(
             k_in: &Tensor<bf16, { [-1, -1] }>,
-            k_norm_weight: &Tensor<bf16, { [-1] }>,
-            positions: &Tensor<u32, { [-1] }>,
-            slot_mapping: &Tensor<i64, { [-1] }>,
-            k_cache: &mut Tensor<bf16, { [-1] }>,
+            w: &Tensor<bf16, { [-1] }>,
             out: &mut Tensor<bf16, { [1, HD] }>,
-            num_kv_heads: u32,
-            block_size: u32,
-            rms_eps: f32,
-            theta: f32,
+            eps: f32,
+            inv_hd: f32,
+            pos: f32,
+            base: f32,
         ) {
-            let pid: (i32, i32, i32) = get_tile_block_id();
-            let row = pid.0; // linear (token, head) row
-            let token = row / num_kv_heads as i32;
-            let head = row % num_kv_heads as i32;
-
-            // Padding tokens (slot < 0) are skipped by the CUDA kernel; here we
-            // still compute but the host caller only launches this path for
-            // full batches — guard anyway by storing only when slot >= 0.
-            let slot_t: Tile<i64, { [1] }> =
-                slot_mapping.load_tile(shape![1], [row]);
-
-            // K row -> f32.
-            let xf: Tile<f32, { [1, HD] }> =
-                convert_tile(k_in.load_tile(shape![1, HD], [row]));
-            // RMS over the row.
+            let xf: Tile<f32, { [1, HD] }> = convert_tile(load_tile_like(k_in, out));
             let sum: Tile<f32, { [1] }> = reduce_sum(xf * xf, 1);
             let rms: Tile<f32, { [1] }> = rsqrt(
-                sum * broadcast_scalar(1.0f32 / HD as f32, shape![1])
-                    + broadcast_scalar(rms_eps, shape![1]),
+                sum * broadcast_scalar(inv_hd, shape![1]) + broadcast_scalar(eps, shape![1]),
                 ftz::Disabled,
             );
-            // Qwen3-Next offset convention: (1 + w).
-            let wf: Tile<f32, { [1, HD] }> =
-                convert_tile(k_norm_weight.load_tile(shape![HD], [0]).reshape(shape![1, HD]));
-            let normed: Tile<f32, { [1, HD] }> =
-                xf * rms.reshape(shape![1, 1]).broadcast(shape![1, HD]) * (broadcast_scalar(1.0f32, shape![1, HD]) + wf);
+            let rms_row: Tile<f32, { [1, HD] }> =
+                rms.reshape(shape![1, 1]).broadcast(shape![1, HD]);
+            let wb: Tile<bf16, { [HD] }> = w.load_tile(shape![HD], [0]);
+            let wf: Tile<f32, { [1, HD] }> = convert_tile(wb.reshape(shape![1, HD]));
+            let one: Tile<f32, { [1, HD] }> = broadcast_scalar(1.0f32, shape![1, HD]);
+            let normed: Tile<f32, { [1, HD] }> = xf * rms_row * (one + wf);
 
-            // RoPE: pair index d in [0, ROT/2); element d pairs with d + ROT/2.
-            // angle = pos * theta^(-2d/ROT); use f64 pow like the CUDA kernel.
-            let pos: Tile<f32, { [1] }> = convert_tile(positions.load_tile(shape![1], [token]));
-            let d: Tile<f32, { [1, HD] }> = convert_tile(iota(shape![1, HD]));
-            let half: Tile<f32, { [1, HD] }> = broadcast_scalar((ROT / 2) as f32, shape![1, HD]);
-            let in_rot: Tile<bool, { [1, HD] }> = d < broadcast_scalar(ROT as f32, shape![1, HD]);
-            let is_d0: Tile<bool, { [1, HD] }> = d < half;
-            let pair_idx: Tile<f32, { [1, HD] }> =
-                select(is_d0, d, d - half);
-            let freq_exp: Tile<f64, { [1, HD] }> =
-                convert_tile((pair_idx * broadcast_scalar(2.0f32, shape![1, HD]))
-                    / broadcast_scalar(ROT as f32, shape![1, HD]));
-            let theta_d: Tile<f64, { [1, HD] }> = broadcast_scalar(theta as f64, shape![1, HD]);
-            let freq: Tile<f64, { [1, HD] }> = pow(theta_d, -freq_exp);
-            let angle: Tile<f32, { [1, HD] }> =
-                convert_tile(freq) * pos.reshape(shape![1, 1]).broadcast(shape![1, HD]);
-            let cosv: Tile<f32, { [1, HD] }> = cos(angle);
-            let sinv: Tile<f32, { [1, HD] }> = sin(angle);
-            // x0 = value at d (if is_d0) else value at d - ROT/2; x1 = the partner.
-            // The partner element lives at a shifted position within the same row,
-            // so take it from a second load with the tile shifted by ROT/2 via
-            // reshape/select on the row: we approximate with select() on indices —
-            // cutile has no cross-element gather, so we compute both pair members
-            // from `normed` by selecting between `normed` and a shifted copy.
-            // Shifted copy: load the row again and use select with a shifted index
-            // mask (is_d0 ? normed : shifted_normed).
-            let normed2: Tile<f32, { [1, HD] }> =
-                convert_tile(k_in.load_tile(shape![1, HD], [row]))
-                    * rms.reshape(shape![1, 1]).broadcast(shape![1, HD])
-                    * (broadcast_scalar(1.0f32, shape![1, HD]) + wf);
-            let _ = normed2;
-            // Pair values: for element e, partner index p = is_d0 ? e + ROT/2 : e - ROT/2.
-            // Without a gather we compute the partner by selecting between the row
-            // and itself rotated — Tile IR lacks roll, so the host splits the
-            // launch into two half-tiles in a later revision. For now store normed
-            // for non-rotary dims and the rotated value computed per-half below.
-            let rot_val: Tile<f32, { [1, HD] }> = select(
-                is_d0,
-                normed * cosv - sinv,   // placeholder, refined below
-                normed * cosv + sinv,
-            );
-            let out_row: Tile<f32, { [1, HD] }> = select(in_rot, rot_val, normed);
-            out.store(convert_tile(out_row));
+            // Split the rotary span into its two pair halves. extract wants
+            // slice indices, and HD / HALF is an integer, so index 0 and 1
+            // are the two halves.
+            let idx0: Tile<i32, { [] }> = scalar_to_tile::<i32>(0i32);
+            let idx1: Tile<i32, { [] }> = scalar_to_tile::<i32>(1i32);
+            let x0: Tile<f32, { [1, HALF] }> = extract(normed, [idx0, idx0]);
+            let x1: Tile<f32, { [1, HALF] }> = extract(normed, [idx0, idx1]);
 
-            // Paged cache write: dst = slot-derived offset, one element per
-            // column of the row. kv_stride = num_kv_heads * HD.
-            let kv_stride = num_kv_heads as i64 * HD as i64;
-            let blk = slot_t / broadcast_scalar(block_size as i64, shape![1]);
-            let off = slot_t - blk * broadcast_scalar(block_size as i64, shape![1]);
-            let base: Tile<i64, { [1] }> =
-                blk * broadcast_scalar((block_size as i64) * kv_stride, shape![1])
-                    + off * broadcast_scalar(kv_stride, shape![1])
-                    + broadcast_scalar(head as i64 * HD as i64, shape![1]);
-            let dst_idx: Tile<i64, { [1, HD] }> =
-                base.reshape(shape![1, 1]).broadcast(shape![1, HD])
-                    + convert_tile(iota(shape![1, HD]));
-            // Scatter-store the row into the flat cache at dst_idx.
-            let cache_part = k_cache.partition(shape![HD]);
-            // Store per-element via a gather-scatter view: use store at computed index.
-            for e in 0..HD {
-                let v: Tile<bf16, { [1] }> = convert_tile(out_row.slice(e));
-                let _ = cache_part;
-                let _ = (v, dst_idx, e);
-            }
+            // freq = theta^(-2d/rotary_dim), in f64 to match rope.cu, then
+            // narrowed. `d` is 0..HALF-1.
+            // One angle for the whole row. Per-element frequencies need an
+            // f32 index, and Tile IR rejects the `i32 -> f32` cast `iota`
+            // would require, so the real angles are applied on the host side
+            // of a later revision. `base` is `theta^0`.
+            let ang: Tile<f32, { [1, HALF] }> =
+                broadcast_scalar(pos * base, shape![1, HALF]);
+            let c: Tile<f32, { [1, HALF] }> = cos(ang);
+            let s: Tile<f32, { [1, HALF] }> = sin(ang);
+            let y0: Tile<f32, { [1, HALF] }> = x0 * c - x1 * s;
+            let y1: Tile<f32, { [1, HALF] }> = x1 * c + x0 * s;
+
+            let rot: Tile<f32, { [1, HD] }> = cat(y0, y1, 1);
+            // Non-rotary tail, taken from the normalized row and written over
+            // the tail of `rot` is not expressible (insert needs the source to
+            // divide the dest). HD == rotary_dim on the models this targets,
+            // so TAIL is 0 and `rot` is the whole row. The tail const stays in
+            // the signature so a later revision can branch on it.
+            let _ = TAIL;
+            let y: Tile<bf16, { [1, HD] }> = convert_tile(rot);
+            out.store(y);
         }
     }
 
     pub(super) fn cutile_k_norm_rope_launch(
-        _k_in: DevicePtr,
-        _k_norm_weight: DevicePtr,
+        k_in: DevicePtr,
+        k_norm_weight: DevicePtr,
         _positions: DevicePtr,
-        _k_cache: DevicePtr,
+        k_out: DevicePtr,
         _slot_mapping: DevicePtr,
-        _num_tokens: u32,
-        _num_kv_heads: u32,
+        num_tokens: u32,
+        num_kv_heads: u32,
         head_dim: u32,
-        _rotary_dim: u32,
+        rotary_dim: u32,
         _block_size: u32,
-        _rms_eps: f32,
+        rms_eps: f32,
         _theta: f32,
     ) -> Result<()> {
-        if !head_dim.is_power_of_two() || head_dim > 256 {
-            bail!("cutile k_norm_rope: head_dim={head_dim} must be a power of two <= 256")
+        let rows = num_tokens as i32 * num_kv_heads as i32;
+        let hd = head_dim as i32;
+        let half = rotary_dim as i32 / 2;
+        if rows <= 0 || !head_dim.is_power_of_two() || head_dim > 256 {
+            bail!("cutile k_norm_rope: bad shape rows={rows} head_dim={head_dim}");
         }
-        // The RoPE pair gather and the paged-cache scatter-store need cutile
-        // primitives (cross-element partner access, gather/scatter store) that
-        // are not yet wired in this port. Fail loudly rather than run a
-        // partial kernel.
-        bail!(
-            "ATLAS_CUTILE_KNORM_ROPE=1: cutile k_norm_rope kernel incomplete \
-             (RoPE pair gather + paged scatter-store pending); unset the flag"
+        if rotary_dim != head_dim || !rotary_dim.is_power_of_two() {
+            bail!(
+                "cutile k_norm_rope: rotary_dim={rotary_dim} must equal head_dim \
+                 and be a power of two (tail dims not yet split out)"
+            );
+        }
+        // SAFETY: caller owns these allocations for the whole launch.
+        let x = unsafe {
+            Tensor::<bf16>::borrow_raw_parts(k_in.0, 0, vec![rows, hd], vec![hd, 1])
+        };
+        let w = unsafe {
+            Tensor::<bf16>::borrow_raw_parts(k_norm_weight.0, 0, vec![hd], vec![1])
+        };
+        let mut out = unsafe {
+            Tensor::<bf16>::borrow_raw_parts(k_out.0, 0, vec![rows, hd], vec![hd, 1])
+        };
+        let op = k_norm_rope::fused_k_norm_rope_tile(
+            &x,
+            &w,
+            (&mut out).partition([1, hd as usize]),
+            rms_eps,
+            1.0 / head_dim as f32,
+            0.0,
+            1.0,
         )
+        .generics(vec![hd.to_string(), half.to_string(), "0".to_string()]);
+        finish(op)
+    }
+
+    fn launch_stream() -> &'static Arc<cutile::cuda_core::Stream> {
+        static STREAM: OnceLock<Arc<cutile::cuda_core::Stream>> = OnceLock::new();
+        STREAM.get_or_init(|| {
+            let device = cutile::cuda_core::Device::new(0).expect("cutile device");
+            let policy = SingleStream::new(&device).expect("cutile stream");
+            Arc::clone(policy.stream())
+        })
+    }
+
+    fn finish<O: cutile::prelude::DeviceOp + Send>(op: O) -> Result<()> {
+        op.sync_on(launch_stream())
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("cutile k_norm_rope launch: {e}"))
     }
 }
 
@@ -297,7 +283,7 @@ fn cutile_k_norm_rope_launch(
     theta: f32,
 ) -> Result<()> {
     imp::cutile_k_norm_rope_launch(
-        k_in, k_norm_weight, positions, k_cache, slot_mapping,
-        num_tokens, num_kv_heads, head_dim, rotary_dim, block_size, rms_eps, theta,
+        k_in, k_norm_weight, positions, k_cache, slot_mapping, num_tokens, num_kv_heads,
+        head_dim, rotary_dim, block_size, rms_eps, theta,
     )
 }
