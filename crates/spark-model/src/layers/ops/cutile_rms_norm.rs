@@ -106,8 +106,10 @@ pub fn rms_norm_op(
 #[cfg(feature = "cutile")]
 mod imp {
     use super::*;
+    use cutile::cuda_async::scheduling_policies::SingleStream;
     use cutile::prelude::*;
     use half::bf16;
+    use std::sync::Arc;
 
     #[cutile::module]
     mod rms_norm {
@@ -212,11 +214,7 @@ mod imp {
                 inv_h,
             )
             .generics(vec![hidden.to_string()]);
-            runtime().block_on(async move {
-                op.await
-                    .map(|_| ())
-                    .map_err(|e| anyhow::anyhow!("cutile rms_norm launch: {e}"))
-            })
+            finish(op)
         } else {
             let mut c = 4096i32;
             while c > 1 && hidden % c != 0 {
@@ -233,23 +231,28 @@ mod imp {
                 inv_h,
             )
             .generics(vec![c.to_string(), "1".to_string(), "0".to_string()]);
-            runtime().block_on(async move {
-                op.await
-                    .map(|_| ())
-                    .map_err(|e| anyhow::anyhow!("cutile rms_norm launch: {e}"))
-            })
+            finish(op)
         }
     }
 
-    fn runtime() -> &'static tokio::runtime::Runtime {
-        static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-        RT.get_or_init(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("cutile tokio runtime")
+    /// One stream for every cutile launch. The default policy is a pool of
+    /// four, and `sync_on` waits for the whole stream, so a pool turns each
+    /// call into a device-wide sync.
+    fn launch_stream() -> &'static Arc<cutile::cuda_core::Stream> {
+        static STREAM: OnceLock<Arc<cutile::cuda_core::Stream>> = OnceLock::new();
+        STREAM.get_or_init(|| {
+            let device = cutile::cuda_core::Device::new(0).expect("cutile device");
+            let policy = SingleStream::new(&device).expect("cutile stream");
+            Arc::clone(policy.stream())
         })
     }
+
+    fn finish<O: cutile::prelude::DeviceOp + Send>(op: O) -> Result<()> {
+        op.sync_on(launch_stream())
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("cutile rms_norm launch: {e}"))
+    }
+
 }
 
 #[cfg(feature = "cutile")]
