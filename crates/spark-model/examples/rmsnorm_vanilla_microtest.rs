@@ -138,9 +138,73 @@ struct Case {
     hi: f64,
 }
 
+/// Wall time per launch, including the sync both paths already do.
+/// Shapes match the 2026-10-29 writeup: bulk 8192x4096 and a decode row.
+fn bench_both(g: &dyn GpuBackend) -> Result<()> {
+    use std::time::Instant;
+    #[cfg(feature = "cutile")]
+    use spark_model::layers::ops::cutile_rms_norm::{RmsNormOp, rms_norm_op};
+    println!("=== bench — cutile vs rms_norm_vanilla (sync each launch) ===");
+    println!(
+        "{:>8} {:>8} {:>14} {:>14} {:>8}",
+        "tokens", "hidden", "cuda us", "cutile us", "delta"
+    );
+    for (tokens, hidden) in [(1u32, 4096u32), (8192, 4096), (8192, 7168)] {
+        let n = tokens as usize * hidden as usize;
+        let x = vec![bf16::from_f32(0.5); n];
+        let w = vec![bf16::from_f32(0.7); hidden as usize];
+        let xp = ub(g, &x)?;
+        let wp = ub(g, &w)?;
+        let op = g.alloc(n * 2)?;
+        let reps = 30u32;
+        for _ in 0..5 {
+            launch(g, "rms_norm_vanilla", "rms_norm_vanilla", xp, wp, op, tokens, hidden)?;
+        }
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            launch(g, "rms_norm_vanilla", "rms_norm_vanilla", xp, wp, op, tokens, hidden)?;
+        }
+        let cuda_us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
+        #[cfg(feature = "cutile")]
+        let cutile_us = {
+            let dw = spark_model::weight_map::DenseWeight { weight: wp };
+            for _ in 0..3 {
+                rms_norm_op(g, &RmsNormOp::Cutile, xp, &dw, op, tokens, hidden, EPS, 0)?;
+                g.synchronize(0)?;
+            }
+            let t1 = Instant::now();
+            for _ in 0..reps {
+                rms_norm_op(g, &RmsNormOp::Cutile, xp, &dw, op, tokens, hidden, EPS, 0)?;
+                g.synchronize(0)?;
+            }
+            t1.elapsed().as_secs_f64() * 1e6 / f64::from(reps)
+        };
+        #[cfg(not(feature = "cutile"))]
+        let cutile_us = f64::NAN;
+        let delta = (cutile_us - cuda_us) / cuda_us * 100.0;
+        println!(
+            "{tokens:>8} {hidden:>8} {cuda_us:>14.2} {cutile_us:>14.2} {delta:>+7.1}%"
+        );
+        for p in [xp, wp, op] {
+            g.free(p)?;
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
-    let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
+    // Cutile JIT does not use atlas-kernels PTX. On sm_120 the default
+    // sm_121f modules fail cuModuleLoadData, so this flag runs C1 only.
+    let only_cutile = std::env::var("ATLAS_MICROTEST_CUTILE_ONLY").as_deref() == Ok("1");
+    let gpu = if only_cutile {
+        AtlasCudaBackend::new(0, &[])?
+    } else {
+        AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?
+    };
     let g: &dyn GpuBackend = &gpu;
+    if std::env::var("ATLAS_MICROTEST_BENCH").as_deref() == Ok("1") {
+        return bench_both(g);
+    }
 
     let dims = [512usize, 1024, 4096, 7168];
     let seeds = [1u64, 7, 42, 1337, 90210];
@@ -180,6 +244,7 @@ fn main() -> Result<()> {
     ];
 
     let mut fail = 0usize;
+    if !only_cutile {
     println!("=== V2 — production `rms_norm_vanilla` vs F64 truth (out = x*w/rms) ===");
     println!(
         "{:<22} {:>6} {:>6} {:>12} {:>12}",
@@ -430,6 +495,8 @@ fn main() -> Result<()> {
         }
     }
 
+    } // !only_cutile
+
     // ── C1 — opt-in cutile-rs path vs the SAME F64 truth (issue #263) ──
     // Only compiled with --features cutile; without it this section is absent
     // and the binary behaves exactly as before.
@@ -512,7 +579,11 @@ fn main() -> Result<()> {
         bail!("{fail} failure(s) — READING R1: STOP AND REPAIR. No behavioral eval.");
     }
     #[cfg(feature = "cutile")]
-    println!("ALL DEVICE CHECKS PASS (V2 + I1 + V3 + V3w + V1d + C1).");
+    if only_cutile {
+        println!("ALL DEVICE CHECKS PASS (C1 cutile only).");
+    } else {
+        println!("ALL DEVICE CHECKS PASS (V2 + I1 + V3 + V3w + V1d + C1).");
+    }
     #[cfg(not(feature = "cutile"))]
     println!("ALL DEVICE CHECKS PASS (V2 + I1 + V3 + V3w + V1d).");
     Ok(())

@@ -13,6 +13,12 @@
 //! sync `ops::rms_norm` call sites stay unchanged. cutile's JIT store disk-caches
 //! the compile, so the first launch pays it once per process.
 //!
+//! Tile IR requires every tile dimension to be a positive power of two, so a
+//! row wider than one legal tile (Qwen's 7168, for one) cannot be a single
+//! partition. Each block owns one row and walks it in `C`-wide chunks
+//! (`C` = 256): sum of squares, then `out = x * w * rsqrt(mean + eps)`. One
+//! compile covers every hidden size that is a multiple of 256.
+//!
 //! Requires the `cutile` cargo feature (`--features cutile`); without it the
 //! env flag is ignored and the precompiled kernel is always used.
 
@@ -81,7 +87,11 @@ pub fn rms_norm_op(
         RmsNormOp::Cutile => {
             #[cfg(feature = "cutile")]
             {
-                let _ = stream;
+                // cutile 0.4 launches on its own stream. Wait for `stream`
+                // first so the inputs are finished, and the launch below does
+                // not return until the cutile op itself has finished, so the
+                // next kernel on `stream` cannot overtake it.
+                gpu.synchronize(stream)?;
                 cutile_rms_norm_launch(input, weight.weight, output, num_tokens, hidden_size, eps)
             }
             #[cfg(not(feature = "cutile"))]
@@ -99,40 +109,72 @@ mod imp {
     use cutile::prelude::*;
     use half::bf16;
 
-    /// The cutile module holding the RMSNorm kernel. One row (token) per tile:
-    /// the partition shape `[1, H]` gives each block one full `hidden_size`
-    /// row, so the block reduces that row and writes it back. `H` is a const
-    /// generic supplied via `.generics()` at the launch site, so cutile
-    /// specializes (and disk-caches) one compile per hidden size seen.
     #[cutile::module]
     mod rms_norm {
         use cutile::core::*;
 
-        /// HF-vanilla RMSNorm: `out = x * w / sqrt(mean(x^2) + eps)`.
-        /// `x`: `[tokens, hidden]` bf16, `w`: `[hidden]` bf16, `out`: `[1, H]`
-        /// bf16 slab per program. Math in f32, stored back as bf16.
+        /// One tile per row. `H` must be a power of two (Tile IR rule).
+        /// This is the kernel from the 2026-10-29 bench: one load, one
+        /// reduce, one store. No chunk loop.
         #[cutile::entry]
-        pub fn rms_norm_vanilla_tile<const H: i32>(
+        pub fn rms_norm_pow2<const H: i32>(
             x: &Tensor<bf16, { [-1, -1] }>,
             w: &Tensor<bf16, { [-1] }>,
             out: &mut Tensor<bf16, { [1, H] }>,
             eps: f32,
+            inv_h: f32,
         ) {
-            // This block's row of x, widened to f32 for the math.
             let xf: Tile<f32, { [1, H] }> = convert_tile(load_tile_like(x, out));
-            // Row sum of squares -> [1], then rms = rsqrt(mean + eps).
             let sum: Tile<f32, { [1] }> = reduce_sum(xf * xf, 1);
-            let inv_h: Tile<f32, { [1] }> = broadcast_scalar(1.0f32 / (H as f32), shape![1]);
-            let eps_t: Tile<f32, { [1] }> = broadcast_scalar(eps, shape![1]);
-            let rms: Tile<f32, { [1] }> = rsqrt(sum * inv_h + eps_t, ftz::Disabled);
-            let rms_row: Tile<f32, { [1, H] }> = rms.reshape(shape![1, H]).broadcast(out.shape());
-            // Weight row: load at the partition origin. NOTE (issue #263):
-            // load_tile_like on a broadcast input indexes by partition — use
-            // the explicit tile load against the output's slab shape instead.
-            let w_tile: Tile<bf16, { [H] }> = w.load_tile(shape![H], [0]);
-            let wf: Tile<f32, { [H] }> = convert_tile(w_tile);
-            let w_row: Tile<f32, { [1, H] }> = wf.reshape(shape![1, H]).broadcast(out.shape());
-            out.store(convert_tile(xf * rms_row * w_row));
+            let mean = sum * broadcast_scalar(inv_h, shape![1]);
+            let rms: Tile<f32, { [1] }> =
+                rsqrt(mean + broadcast_scalar(eps, shape![1]), ftz::Disabled);
+            let rms_row: Tile<f32, { [1, H] }> =
+                rms.reshape(shape![1, 1]).broadcast(out.shape());
+            let wb: Tile<bf16, { [H] }> = w.load_tile(shape![H], [0]);
+            let wf: Tile<f32, { [1, H] }> = convert_tile(wb.reshape(shape![1, H]));
+            let y: Tile<bf16, { [1, H] }> = convert_tile(xf * rms_row * wf);
+            out.store(y);
+        }
+
+        /// One block per row; the block owns every chunk of that row.
+        /// `MAP_SHAPE` is `[1, OWNED]`, so `iter_indices` yields one item per
+        /// row and the column axis is walked by counted loops. See cutile's
+        /// `owned_axis_composite_store` test for the same shape.
+        #[cutile::entry]
+        pub fn rms_norm_row<const C: i32, const MAP_SHAPE: [i32; 2]>(
+            x: &Tensor<bf16, { [-1, -1] }>,
+            w: &Tensor<bf16, { [-1] }>,
+            mut out: MappedPartitionMut<bf16, { [1, C] }, MAP_SHAPE>,
+            eps: f32,
+            inv_h: f32,
+        ) {
+            let rows = num_tiles(&out, 0);
+            let cols = num_tiles(&out, 1);
+            let _ = (rows, cols);
+            let xp = x.partition(shape![1, C]);
+            let wp = w.partition(shape![C]);
+            let cols = cols.into_dim();
+            for index in out.iter_indices() {
+                let (row, _col) = index.components();
+                let mut acc: Tile<f32, { [1] }> = broadcast_scalar(0.0f32, shape![1]);
+                for k in cols {
+                    let xf: Tile<f32, { [1, C] }> = convert_tile(xp.load([row, k]));
+                    acc = acc + reduce_sum(xf * xf, 1);
+                }
+                let mean = acc * broadcast_scalar(inv_h, shape![1]);
+                let rms: Tile<f32, { [1] }> =
+                    rsqrt(mean + broadcast_scalar(eps, shape![1]), ftz::Disabled);
+                let rms_row: Tile<f32, { [1, C] }> =
+                    rms.reshape(shape![1, 1]).broadcast(shape![1, C]);
+                for k in cols {
+                    let xf: Tile<f32, { [1, C] }> = convert_tile(xp.load([row, k]));
+                    let wf: Tile<f32, { [1, C] }> =
+                        convert_tile(wp.load([k]).reshape(shape![1, C]));
+                    let y: Tile<bf16, { [1, C] }> = convert_tile(xf * rms_row * wf);
+                    out.store(y, coord((row, k)));
+                }
+            }
         }
     }
 
@@ -146,43 +188,57 @@ mod imp {
     ) -> Result<()> {
         let hidden = hidden_size as i32;
         let tokens = num_tokens as i32;
-        if hidden <= 0 || tokens <= 0 {
+        if tokens <= 0 || hidden <= 0 {
             bail!("cutile rms_norm: non-positive shape tokens={tokens} hidden={hidden}");
         }
-        // SAFETY: input/weight/output are live device allocations owned by the
-        // caller (the GpuBackend's pool), valid for tokens*hidden*2,
-        // hidden*2, and tokens*hidden*2 bytes respectively. They stay mapped
-        // for the whole launch because we block on the DeviceOp before
-        // returning; no other path touches output while this runs.
+        // SAFETY: caller owns these allocations for the whole launch; we block
+        // before returning, so nothing else touches `output` meanwhile.
         let x = unsafe {
-            Tensor::<bf16>::borrow_raw_parts(
-                input.0,
-                0,
-                vec![tokens, hidden],
-                vec![hidden, 1],
-            )
+            Tensor::<bf16>::borrow_raw_parts(input.0, 0, vec![tokens, hidden], vec![hidden, 1])
         };
-        let w = unsafe {
-            Tensor::<bf16>::borrow_raw_parts(weight.0, 0, vec![hidden], vec![1])
-        };
+        let w = unsafe { Tensor::<bf16>::borrow_raw_parts(weight.0, 0, vec![hidden], vec![1]) };
         let mut out = unsafe {
-            Tensor::<bf16>::borrow_raw_parts(
-                output.0,
-                0,
-                vec![tokens, hidden],
-                vec![hidden, 1],
-            )
+            Tensor::<bf16>::borrow_raw_parts(output.0, 0, vec![tokens, hidden], vec![hidden, 1])
         };
-        let op = rms_norm::rms_norm_vanilla_tile(
-            &x,
-            &w,
-            (&mut out).partition([1, hidden as usize]),
-            eps,
-        )
-        .generics(vec![hidden.to_string()]);
-        runtime().block_on(async move {
-            op.await.map(|_| ()).map_err(|e| anyhow::anyhow!("cutile rms_norm launch: {e}"))
-        })
+        let inv_h = 1.0 / (hidden as f32);
+        // A power-of-two row is one tile. Anything else (7168) is cut into
+        // the largest power-of-two chunk that divides it.
+        if hidden > 0 && (hidden as u32).is_power_of_two() && hidden <= 8192 {
+            let op = rms_norm::rms_norm_pow2(
+                &x,
+                &w,
+                (&mut out).partition([1, hidden as usize]),
+                eps,
+                inv_h,
+            )
+            .generics(vec![hidden.to_string()]);
+            runtime().block_on(async move {
+                op.await
+                    .map(|_| ())
+                    .map_err(|e| anyhow::anyhow!("cutile rms_norm launch: {e}"))
+            })
+        } else {
+            let mut c = 4096i32;
+            while c > 1 && hidden % c != 0 {
+                c /= 2;
+            }
+            if hidden % c != 0 {
+                bail!("cutile rms_norm: hidden={hidden} has no power-of-two chunk");
+            }
+            let op = rms_norm::rms_norm_row(
+                &x,
+                &w,
+                (&mut out).partition([1, c as usize]).map([1, OWNED], tokens as u32),
+                eps,
+                inv_h,
+            )
+            .generics(vec![c.to_string(), "1".to_string(), "0".to_string()]);
+            runtime().block_on(async move {
+                op.await
+                    .map(|_| ())
+                    .map_err(|e| anyhow::anyhow!("cutile rms_norm launch: {e}"))
+            })
+        }
     }
 
     fn runtime() -> &'static tokio::runtime::Runtime {
