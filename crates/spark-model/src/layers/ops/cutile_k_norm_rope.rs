@@ -150,11 +150,12 @@ mod imp {
         pub fn fused_k_norm_rope_tile<const HD: i32, const HALF: i32, const TAIL: i32>(
             k_in: &Tensor<bf16, { [-1, -1] }>,
             w: &Tensor<bf16, { [-1] }>,
+            positions: &Tensor<f32, { [-1] }>,
+            inv_freq: &Tensor<f32, { [-1] }>,
             out: &mut Tensor<bf16, { [1, HD] }>,
+            num_kv_heads: i32,
             eps: f32,
             inv_hd: f32,
-            pos: f32,
-            base: f32,
         ) {
             let xf: Tile<f32, { [1, HD] }> = convert_tile(load_tile_like(k_in, out));
             let sum: Tile<f32, { [1] }> = reduce_sum(xf * xf, 1);
@@ -177,14 +178,15 @@ mod imp {
             let x0: Tile<f32, { [1, HALF] }> = extract(normed, [idx0, idx0]);
             let x1: Tile<f32, { [1, HALF] }> = extract(normed, [idx0, idx1]);
 
-            // freq = theta^(-2d/rotary_dim), in f64 to match rope.cu, then
-            // narrowed. `d` is 0..HALF-1.
-            // One angle for the whole row. Per-element frequencies need an
-            // f32 index, and Tile IR rejects the `i32 -> f32` cast `iota`
-            // would require, so the real angles are applied on the host side
-            // of a later revision. `base` is `theta^0`.
-            let ang: Tile<f32, { [1, HALF] }> =
-                broadcast_scalar(pos * base, shape![1, HALF]);
+            // Frequencies and positions are f32 from the host. `iota` is
+            // i32 and both `as f32` and `itof` lower to a cast the compiler
+            // rejects, so neither can build this table inside the kernel.
+            let (row, _, _) = get_tile_block_id();
+            let token = row / num_kv_heads;
+            let pos: Tile<f32, { [1] }> = positions.load_tile(shape![1], [token]);
+            let freq: Tile<f32, { [HALF] }> = inv_freq.load_tile(shape![HALF], [0]);
+            let ang: Tile<f32, { [1, HALF] }> = freq.reshape(shape![1, HALF])
+                * pos.reshape(shape![1, 1]).broadcast(shape![1, HALF]);
             let c: Tile<f32, { [1, HALF] }> = cos(ang);
             let s: Tile<f32, { [1, HALF] }> = sin(ang);
             let y0: Tile<f32, { [1, HALF] }> = x0 * c - x1 * s;
@@ -205,7 +207,7 @@ mod imp {
     pub(super) fn cutile_k_norm_rope_launch(
         k_in: DevicePtr,
         k_norm_weight: DevicePtr,
-        _positions: DevicePtr,
+        positions: DevicePtr,
         k_out: DevicePtr,
         _slot_mapping: DevicePtr,
         num_tokens: u32,
@@ -214,7 +216,7 @@ mod imp {
         rotary_dim: u32,
         _block_size: u32,
         rms_eps: f32,
-        _theta: f32,
+        theta: f32,
     ) -> Result<()> {
         let rows = num_tokens as i32 * num_kv_heads as i32;
         let hd = head_dim as i32;
@@ -238,14 +240,31 @@ mod imp {
         let mut out = unsafe {
             Tensor::<bf16>::borrow_raw_parts(k_out.0, 0, vec![rows, hd], vec![hd, 1])
         };
+        let pos_i = unsafe {
+            Tensor::<i32>::borrow_raw_parts(positions.0, 0, vec![num_tokens as i32], vec![1])
+        };
+        let pos = cutile::api::convert::<i32, f32>(Arc::new(pos_i))
+            .sync()
+            .map_err(|e| anyhow::anyhow!("cutile position convert: {e}"))?;
+        let inv_host: Arc<Vec<f32>> = Arc::new(
+            (0..half)
+                .map(|d| {
+                    (theta as f64).powf(-2.0 * d as f64 / (half as f64 * 2.0)) as f32
+                })
+                .collect(),
+        );
+        let inv = cutile::api::copy_host_vec_to_device(&inv_host)
+            .sync()
+            .map_err(|e| anyhow::anyhow!("cutile inv_freq upload: {e}"))?;
         let op = k_norm_rope::fused_k_norm_rope_tile(
             &x,
             &w,
+            &pos,
+            &inv,
             (&mut out).partition([1, hd as usize]),
+            num_kv_heads as i32,
             rms_eps,
             1.0 / head_dim as f32,
-            0.0,
-            1.0,
         )
         .generics(vec![hd.to_string(), half.to_string(), "0".to_string()]);
         finish(op)
