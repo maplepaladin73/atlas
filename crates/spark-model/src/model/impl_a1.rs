@@ -78,7 +78,12 @@ impl TransformerModel {
         // checkpoint tensor). Models that ship HF-vanilla norm weights load it
         // exactly and must use the vanilla kernel.
         let rms_norm_kernel = if crate::ships_vanilla_norm_weights(&config) {
-            gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?
+            match crate::layers::ops::cutile_rms_norm::resolve_rms_norm_vanilla(gpu.as_ref())? {
+                crate::layers::ops::cutile_rms_norm::RmsNormOp::Registry(k) => k,
+                crate::layers::ops::cutile_rms_norm::RmsNormOp::Cutile => {
+                    gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?
+                }
+            }
         } else {
             gpu.kernel("norm", "rms_norm")?
         };

@@ -140,7 +140,12 @@ impl BlockDiffusionDraftHead {
             // `rms_norm` kernel includes the `+1` for Qwen3-Next-style
             // checkpoints; we must use `rms_norm_vanilla` for the drafter
             // to match the drafter's HF-trained weights exactly.
-            rms_norm: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
+            rms_norm: match crate::layers::ops::cutile_rms_norm::resolve_rms_norm_vanilla(gpu)? {
+                crate::layers::ops::cutile_rms_norm::RmsNormOp::Registry(k) => k,
+                crate::layers::ops::cutile_rms_norm::RmsNormOp::Cutile => {
+                    gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?
+                }
+            },
             // `rms_norm_residual` lands the post-attn / post-MLP add+norm in
             // a single launch. Atlas exposes this as a separate kernel — see
             // `mtp_head.rs:469` for the established lookup.

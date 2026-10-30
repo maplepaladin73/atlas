@@ -257,12 +257,19 @@ impl Qwen3AttentionLayer {
             ),
             rms_norm_k: gpu.kernel("norm", "rms_norm")?,
             rms_norm_w_k: if crate::ships_vanilla_norm_weights(config) {
-                crate::layers::ops::glm_decode_fuse::twin(
-                    gpu,
-                    crate::layers::ops::glm_decode_fuse::RMS_NORM,
-                    gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
-                    ("glm_rms_norm_regs", "rms_norm_vanilla_regs"),
-                )?
+                match crate::layers::ops::cutile_rms_norm::resolve_rms_norm_vanilla(gpu)? {
+                    crate::layers::ops::cutile_rms_norm::RmsNormOp::Registry(k) => {
+                        crate::layers::ops::glm_decode_fuse::twin(
+                            gpu,
+                            crate::layers::ops::glm_decode_fuse::RMS_NORM,
+                            k,
+                            ("glm_rms_norm_regs", "rms_norm_vanilla_regs"),
+                        )?
+                    }
+                    crate::layers::ops::cutile_rms_norm::RmsNormOp::Cutile => {
+                        gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?
+                    }
+                }
             } else {
                 gpu.kernel("norm", "rms_norm")?
             },

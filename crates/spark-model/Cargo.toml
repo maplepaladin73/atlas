@@ -34,6 +34,9 @@ metal-example = ["metal", "dep:tokenizers", "dep:memmap2", "dep:safetensors"]
 gpu-examples = []
 # The NCCL/RDMA-pair CommBackend, for the two-rank `comm_pair_bench` example.
 nccl = ["cuda", "spark-comm/nccl"]
+# Opt-in cutile-rs (CUDA Tile) RMSNorm experiment, gated at runtime on
+# ATLAS_CUTILE_RMSNORM=1. CUDA-only; off by default.
+cutile = ["cuda", "dep:cutile", "dep:tokio"]
 
 [dependencies]
 atlas-core = { workspace = true }
@@ -53,6 +56,8 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 tracing = "0.1"
 half = "2"
+cutile = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["rt"] }
 base64 = "0.22"
 # `gif` carries the video path: it is the one genuinely multi-frame container
 # decodable in pure Rust with no system dependency, so the whole temporal
