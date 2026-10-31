@@ -185,7 +185,9 @@ mod imp {
                 convert_tile(g.load_tile(shape![1, H], [row * gate_stride, 0]));
             // sigmoid(g) = 1 / (1 + exp(-g))
             let one: Tile<f32, { [1, H] }> = broadcast_scalar(1.0f32, shape![1, H]);
-            let sig: Tile<f32, { [1, H] }> = one / (one + exp(-gf));
+            // cutile 0.4 Tile has no `Neg` impl; negation is the `negf` fn
+            // (same lesson as the mamba2 kernel's `negf(exp(alog))`).
+            let sig: Tile<f32, { [1, H] }> = one / (one + exp(negf(gf)));
 
             let wb: Tile<bf16, { [H] }> = w.load_tile(shape![H], [0]);
             let wf: Tile<f32, { [1, H] }> = convert_tile(wb.reshape(shape![1, H]));
