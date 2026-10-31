@@ -166,7 +166,9 @@ mod imp {
         #[cutile::entry]
         pub fn gated_rms_norm_sigmoid_tile<const H: i32>(
             x: &Tensor<f32, { [-1, -1] }>,
-            g: &Tensor<bf16, { [-1, -1] }>,
+            // gate is a flat `[rows * gate_stride]` buffer; the row for
+            // `row` starts at flat offset `row * gate_stride`.
+            g: &Tensor<bf16, { [-1] }>,
             w: &Tensor<bf16, { [-1] }>,
             out: &mut Tensor<bf16, { [1, H] }>,
             gate_stride: i32,
@@ -182,7 +184,7 @@ mod imp {
             let rms_row: Tile<f32, { [1, H] }> = rms.reshape(shape![1, 1]).broadcast(out.shape());
 
             let gf: Tile<f32, { [1, H] }> =
-                convert_tile(g.load_tile(shape![1, H], [row * gate_stride, 0]));
+                convert_tile(g.load_tile(shape![1, H], [row * gate_stride]));
             // sigmoid(g) = 1 / (1 + exp(-g))
             let one: Tile<f32, { [1, H] }> = broadcast_scalar(1.0f32, shape![1, H]);
             // cutile 0.4 Tile has no `Neg` impl; negation is the `negf` fn
