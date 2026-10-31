@@ -77,6 +77,7 @@ pub struct NemotronMamba2Layer {
     w8a16_gemv_batch16_k: KernelHandle,
     conv1d_update_k: KernelHandle,
     mamba2_ssm_k: KernelHandle,
+    mamba2_ssm_op: crate::layers::ops::cutile_mamba2_decode::Mamba2DecodeOp,
     gated_rms_norm_k: KernelHandle,
     residual_add_k: KernelHandle,
     // Kernel handles — prefill (GEMM + batched kernels)
@@ -166,6 +167,10 @@ impl NemotronMamba2Layer {
             w8a16_gemv_batch16_k: super::try_kernel(gpu, "w8a16_gemv_batch4", "w8a16_gemv_batch16"),
             conv1d_update_k: gpu.kernel("causal_conv1d", "causal_conv1d_update")?,
             mamba2_ssm_k: gpu.kernel("mamba2_ssm", "mamba2_ssm_decode")?,
+            mamba2_ssm_op: crate::layers::ops::cutile_mamba2_decode::resolve_mamba2_decode(gpu)
+                .unwrap_or(crate::layers::ops::cutile_mamba2_decode::Mamba2DecodeOp::Registry(
+                    gpu.kernel("mamba2_ssm", "mamba2_ssm_decode")?,
+                )),
             gated_rms_norm_k: gpu.kernel("norm", "gated_rms_norm")?,
             residual_add_k: gpu.kernel("residual_add", "bf16_residual_add")?,
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
