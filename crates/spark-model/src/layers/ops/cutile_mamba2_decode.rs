@@ -55,10 +55,9 @@ pub fn resolve_mamba2_decode(gpu: &dyn GpuBackend) -> Result<Mamba2DecodeOp> {
     if cutile_mamba2_enabled() {
         Ok(Mamba2DecodeOp::Cutile)
     } else {
-        Ok(Mamba2DecodeOp::Registry(gpu.kernel(
-            "mamba2_ssm",
-            "mamba2_ssm_decode",
-        )?))
+        Ok(Mamba2DecodeOp::Registry(
+            gpu.kernel("mamba2_ssm", "mamba2_ssm_decode")?,
+        ))
     }
 }
 
@@ -122,15 +121,16 @@ pub fn mamba2_ssm_decode_op(
             {
                 gpu.synchronize(stream)?;
                 cutile_mamba2_launch(
-                    h_state, x, b_proj, c_proj, dt_raw, a_log, d_param, dt_bias, output,
+                    gpu, h_state, x, b_proj, c_proj, dt_raw, a_log, d_param, dt_bias, output,
                     batch_size, num_heads, head_dim, state_size, n_groups, dt_min, dt_max,
                 )
             }
             #[cfg(not(feature = "cutile"))]
             {
-                let _ = (h_state, x, b_proj, c_proj, dt_raw, a_log, d_param, dt_bias,
-                    output, batch_size, num_heads, head_dim, state_size, n_groups,
-                    dt_min, dt_max, stream);
+                let _ = (
+                    h_state, x, b_proj, c_proj, dt_raw, a_log, d_param, dt_bias, output,
+                    batch_size, num_heads, head_dim, state_size, n_groups, dt_min, dt_max, stream,
+                );
                 bail!("ATLAS_CUTILE_MAMBA2_DECODE=1 requires building with --features cutile")
             }
         }
@@ -140,129 +140,178 @@ pub fn mamba2_ssm_decode_op(
 #[cfg(feature = "cutile")]
 mod imp {
     use super::*;
+    use cutile::cuda_async::scheduling_policies::SingleStream;
     use cutile::prelude::*;
     use half::bf16;
     use std::sync::Arc;
 
-    /// One tile per (head, batch): partition `[HD, S]` over the state tile.
-    /// dt = clamp(softplus(dt_raw + dt_bias), dt_min, dt_max); dA = exp(-exp(A_log[h])*dt);
-    /// H[hd, s] = dA*H[hd, s] + dt*x[hd]*B[g, s); y[hd] = sum_s(H*C) + D[h]*x[hd].
+    /// One tile per state row. A whole [HD, S] tile mis-broadcast x across rows
+    /// on cutile 0.4, so each block owns one row of length S.
     #[cutile::module]
     mod mamba2 {
         use cutile::core::*;
 
         #[cutile::entry]
-        pub fn mamba2_decode_tile<const HD: i32, const S: i32>(
-            h_state: &mut Tensor<f32, { [-1, -1] }>,
+        pub fn mamba2_row<const S: i32>(
+            h_in: &Tensor<f32, { [-1, -1] }>,
             x: &Tensor<bf16, { [-1] }>,
-            b_proj: &Tensor<bf16, { [-1] }>,
-            c_proj: &Tensor<bf16, { [-1] }>,
+            b_proj: &Tensor<bf16, { [-1, -1] }>,
+            c_proj: &Tensor<bf16, { [-1, -1] }>,
             dt_raw: &Tensor<bf16, { [-1] }>,
             a_log: &Tensor<f32, { [-1] }>,
             d_param: &Tensor<f32, { [-1] }>,
             dt_bias: &Tensor<f32, { [-1] }>,
-            out: &mut Tensor<bf16, { [HD, 1] }>,
-            state: &mut Tensor<f32, { [HD, S] }>,
-            num_heads: u32,
-            n_groups: u32,
+            h_out: &mut Tensor<f32, { [1, S] }>,
+            y_out: &mut Tensor<bf16, { [1] }>,
+            hd: i32,
+            heads: i32,
+            groups: i32,
             dt_min: f32,
             dt_max: f32,
         ) {
             let pid: (i32, i32, i32) = get_tile_block_id();
-            let head = pid.0;
-            let b = pid.1;
-            let heads_per_group = (num_heads / n_groups) as i32;
-            let group = head / heads_per_group;
+            let row = pid.0;
+            let token_head = row / hd;
+            let head = token_head % heads;
+            let b = token_head / heads;
+            let group = head / (heads / groups);
 
-            // dt = clamp(softplus(dt_raw[b, head] + dt_bias[head]), dt_min, dt_max)
-            let dt_bf: Tile<bf16, { [1] }> = dt_raw.load_tile(shape![1], [b * num_heads as i32 + head]);
-            let bias: Tile<f32, { [1] }> = a_log.load_tile(shape![1], [head]); // placeholder shape, fixed below
-            let _ = bias;
-            let dtab: Tile<f32, { [1] }> = convert_tile(dt_bf);
-            let dtb: Tile<f32, { [1] }> = dt_bias.load_tile(shape![1], [head]);
-            let raw: Tile<f32, { [1] }> = dtab + dtb;
-            // stable softplus: x>20 ? x : log1p(exp(x))
-            let e: Tile<f32, { [1] }> = exp(raw);
-            let sp: Tile<f32, { [1] }> = log(e + broadcast_scalar(1.0f32, shape![1]));
+            let h_old: Tile<f32, { [1, S] }> = load_tile_like(h_in, h_out);
+            let xs: Tile<f32, { [1] }> = convert_tile(x.load_tile(shape![1], [row]));
+            let b_row: Tile<f32, { [1, S] }> =
+                convert_tile(b_proj.load_tile(shape![1, S], [b * groups + group, 0]));
+            let c_row: Tile<f32, { [1, S] }> =
+                convert_tile(c_proj.load_tile(shape![1, S], [b * groups + group, 0]));
+
+            let raw: Tile<f32, { [1] }> = convert_tile(dt_raw.load_tile(shape![1], [token_head]))
+                + dt_bias.load_tile(shape![1], [head]);
+            let sp: Tile<f32, { [1] }> = log(exp(raw) + broadcast_scalar(1.0f32, shape![1]));
+            let dt: Tile<f32, { [1] }> =
+                select(gt_tile(raw, broadcast_scalar(20.0f32, shape![1])), raw, sp);
             let dt: Tile<f32, { [1] }> = select(
-                raw > broadcast_scalar(20.0f32, shape![1]),
-                raw,
-                sp,
-            );
-            let dt: Tile<f32, { [1] }> = select(
-                dt < broadcast_scalar(dt_min, shape![1]),
+                lt_tile(dt, broadcast_scalar(dt_min, shape![1])),
                 broadcast_scalar(dt_min, shape![1]),
-                select(dt > broadcast_scalar(dt_max, shape![1]), broadcast_scalar(dt_max, shape![1]), dt),
+                dt,
             );
-            // dA = exp(-exp(A_log[h]) * dt)
-            let alog: Tile<f32, { [1] }> = a_log.load_tile(shape![1], [head]);
-            let da: Tile<f32, { [1] }> = exp(-exp(alog) * dt);
+            let dt: Tile<f32, { [1] }> = select(
+                gt_tile(dt, broadcast_scalar(dt_max, shape![1])),
+                broadcast_scalar(dt_max, shape![1]),
+                dt,
+            );
+            let da: Tile<f32, { [1] }> = exp(negf(exp(a_log.load_tile(shape![1], [head]))) * dt);
 
-            // Load B/C for this group: B[g, :], C[g, :] — [1, S]
-            let b_t: Tile<f32, { [1, S] }> =
-                convert_tile(b_proj.load_tile(shape![1, S], [b * n_groups as i32 + group]));
-            let c_t: Tile<f32, { [1, S] }> =
-                convert_tile(c_proj.load_tile(shape![1, S], [b * n_groups as i32 + group]));
-            // x row for this (b, head): x[b, head, :] — [1, HD]
-            let x_row: Tile<f32, { [1, HD] }> =
-                convert_tile(x.load_tile(shape![1, HD], [b * num_heads as i32 + head]));
+            let da_w: Tile<f32, { [1, S] }> = da.reshape(shape![1, 1]).broadcast(shape![1, S]);
+            let dt_w: Tile<f32, { [1, S] }> = dt.reshape(shape![1, 1]).broadcast(shape![1, S]);
+            let x_w: Tile<f32, { [1, S] }> = xs.reshape(shape![1, 1]).broadcast(shape![1, S]);
+            let h_new: Tile<f32, { [1, S] }> = da_w * h_old + x_w * dt_w * b_row;
+            let lo = broadcast_scalar(-200.0f32, shape![1, S]);
+            let hi = broadcast_scalar(200.0f32, shape![1, S]);
+            let h_new: Tile<f32, { [1, S] }> = select(lt_tile(h_new, lo), lo, h_new);
+            let h_new: Tile<f32, { [1, S] }> = select(gt_tile(h_new, hi), hi, h_new);
+            h_out.store(h_new);
 
-            // State update: H = dA*H + dt * x ⊗ B  →  [HD, S]
-            let h_old: Tile<f32, { [HD, S] }> = h_state.load_tile(shape![HD, S], [head, b]);
-            let h_new: Tile<f32, { [HD, S] }> = h_old * da.reshape(shape![1, 1]).broadcast(shape![HD, S])
-                + dt.reshape(shape![1, 1]).broadcast(shape![HD, S])
-                    * x_row.reshape(shape![HD, 1]).broadcast(shape![HD, S])
-                    * b_t.reshape(shape![1, S]).broadcast(shape![HD, S]);
-            state.store(h_new);
-
-            // Output: y[hd] = sum_s(H*C) + D*x
-            let hc: Tile<f32, { [HD, S] }> = h_new * c_t.reshape(shape![1, S]).broadcast(shape![HD, S]);
-            let y: Tile<f32, { [HD, 1] }> = reduce_sum(hc, 1);
-            let d_v: Tile<f32, { [1] }> = d_param.load_tile(shape![1], [head]);
-            let y: Tile<f32, { [HD, 1] }> =
-                y + d_v.reshape(shape![1, 1]).broadcast(shape![HD, 1])
-                    * x_row.reshape(shape![HD, 1]).broadcast(shape![HD, 1]);
-            out.store(convert_tile(y));
+            let summed: Tile<f32, { [1] }> = reduce_sum(h_new * c_row, 1);
+            let y: Tile<f32, { [1] }> = summed + d_param.load_tile(shape![1], [head]) * xs;
+            let yb: Tile<bf16, { [1] }> = convert_tile(y);
+            y_out.store(yb);
         }
     }
 
     pub(super) fn cutile_mamba2_launch(
-        _h_state: DevicePtr,
-        _x: DevicePtr,
-        _b_proj: DevicePtr,
-        _c_proj: DevicePtr,
-        _dt_raw: DevicePtr,
-        _a_log: DevicePtr,
-        _d_param: DevicePtr,
-        _dt_bias: DevicePtr,
-        _output: DevicePtr,
-        _batch_size: u32,
-        _num_heads: u32,
+        gpu: &dyn GpuBackend,
+        h_state: DevicePtr,
+        x: DevicePtr,
+        b_proj: DevicePtr,
+        c_proj: DevicePtr,
+        dt_raw: DevicePtr,
+        a_log: DevicePtr,
+        d_param: DevicePtr,
+        dt_bias: DevicePtr,
+        output: DevicePtr,
+        batch_size: u32,
+        num_heads: u32,
         head_dim: u32,
         state_size: u32,
-        _n_groups: u32,
-        _dt_min: f32,
-        _dt_max: f32,
+        n_groups: u32,
+        dt_min: f32,
+        dt_max: f32,
     ) -> Result<()> {
         if !head_dim.is_power_of_two() || head_dim > 256 {
             bail!("cutile mamba2: head_dim={head_dim} must be a power of two <= 256");
         }
         if !state_size.is_power_of_two() || state_size > 256 {
-            bail!("cutile mamba2: state_size={state_size} must be a power of two <= 256 (Puzzle's 96 needs a chunked path — see PR body)");
+            bail!("cutile mamba2: state_size={state_size} must be a power of two <= 256");
         }
-        // The rank-1 outer-product state update + state-sized reduction need
-        // 2-D tile broadcast semantics (x ⊗ B over [HD, S]) that are not yet
-        // verified against cutile 0.4's broadcast rules. Fail loudly rather
-        // than run a partial kernel.
-        bail!(
-            "ATLAS_CUTILE_MAMBA2_DECODE=1: cutile mamba2 kernel not yet verified \
-             (2-D outer-product state update pending); unset the flag"
+        if n_groups == 0 || num_heads % n_groups != 0 {
+            bail!("cutile mamba2: num_heads={num_heads} must divide by n_groups={n_groups}");
+        }
+        let batch = batch_size as i32;
+        let heads = num_heads as i32;
+        let hd = head_dim as i32;
+        let ss = state_size as i32;
+        let groups = n_groups as i32;
+        let nrows = batch * heads * hd;
+        let bytes = (nrows * ss) as usize * std::mem::size_of::<f32>();
+        let staged = gpu.alloc(bytes)?;
+        gpu.copy_d2d(h_state, staged, bytes)?;
+        let h_in =
+            unsafe { Tensor::<f32>::borrow_raw_parts(staged.0, 0, vec![nrows, ss], vec![ss, 1]) };
+        let mut h_out =
+            unsafe { Tensor::<f32>::borrow_raw_parts(h_state.0, 0, vec![nrows, ss], vec![ss, 1]) };
+        let x_t = unsafe { Tensor::<bf16>::borrow_raw_parts(x.0, 0, vec![nrows], vec![1]) };
+        let b_t = unsafe {
+            Tensor::<bf16>::borrow_raw_parts(b_proj.0, 0, vec![batch * groups, ss], vec![ss, 1])
+        };
+        let c_t = unsafe {
+            Tensor::<bf16>::borrow_raw_parts(c_proj.0, 0, vec![batch * groups, ss], vec![ss, 1])
+        };
+        let dt_t =
+            unsafe { Tensor::<bf16>::borrow_raw_parts(dt_raw.0, 0, vec![batch * heads], vec![1]) };
+        let a_t = unsafe { Tensor::<f32>::borrow_raw_parts(a_log.0, 0, vec![heads], vec![1]) };
+        let d_t = unsafe { Tensor::<f32>::borrow_raw_parts(d_param.0, 0, vec![heads], vec![1]) };
+        let bias_t = unsafe { Tensor::<f32>::borrow_raw_parts(dt_bias.0, 0, vec![heads], vec![1]) };
+        let mut y = unsafe { Tensor::<bf16>::borrow_raw_parts(output.0, 0, vec![nrows], vec![1]) };
+        let op = mamba2::mamba2_row(
+            &h_in,
+            &x_t,
+            &b_t,
+            &c_t,
+            &dt_t,
+            &a_t,
+            &d_t,
+            &bias_t,
+            (&mut h_out).partition([1, ss as usize]),
+            (&mut y).partition([1]),
+            hd,
+            heads,
+            groups,
+            dt_min,
+            dt_max,
         )
+        .generics(vec![ss.to_string()]);
+        let _staged = staged;
+        finish(op)
+    }
+
+    fn launch_stream() -> &'static Arc<cutile::cuda_core::Stream> {
+        static STREAM: OnceLock<Arc<cutile::cuda_core::Stream>> = OnceLock::new();
+        STREAM.get_or_init(|| {
+            let device = cutile::cuda_core::Device::new(0).expect("cutile device");
+            let policy = SingleStream::new(&device).expect("cutile stream");
+            Arc::clone(policy.stream())
+        })
+    }
+
+    fn finish<O: cutile::prelude::DeviceOp + Send>(op: O) -> Result<()> {
+        op.sync_on(launch_stream())
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("cutile mamba2 launch: {e}"))
     }
 }
 
 #[cfg(feature = "cutile")]
 fn cutile_mamba2_launch(
+    gpu: &dyn GpuBackend,
     h_state: DevicePtr,
     x: DevicePtr,
     b_proj: DevicePtr,
@@ -281,7 +330,7 @@ fn cutile_mamba2_launch(
     dt_max: f32,
 ) -> Result<()> {
     imp::cutile_mamba2_launch(
-        h_state, x, b_proj, c_proj, dt_raw, a_log, d_param, dt_bias, output,
-        batch_size, num_heads, head_dim, state_size, n_groups, dt_min, dt_max,
+        gpu, h_state, x, b_proj, c_proj, dt_raw, a_log, d_param, dt_bias, output, batch_size,
+        num_heads, head_dim, state_size, n_groups, dt_min, dt_max,
     )
 }
