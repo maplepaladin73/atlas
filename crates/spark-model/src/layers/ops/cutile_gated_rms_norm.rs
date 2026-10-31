@@ -183,8 +183,11 @@ mod imp {
                 rsqrt(mean + broadcast_scalar(eps, shape![1]), ftz::Disabled);
             let rms_row: Tile<f32, { [1, H] }> = rms.reshape(shape![1, 1]).broadcast(out.shape());
 
-            let gf: Tile<f32, { [1, H] }> =
-                convert_tile(g.load_tile(shape![1, H], [row * gate_stride]));
+            // g is rank-1, so the load is shape![H] and the result is
+            // reshaped up to a [1, H] row (reshape keeps element order).
+            let g_row: Tile<f32, { [H] }> =
+                convert_tile(g.load_tile(shape![H], [row * gate_stride]));
+            let gf: Tile<f32, { [1, H] }> = g_row.reshape(shape![1, H]);
             // sigmoid(g) = 1 / (1 + exp(-g))
             let one: Tile<f32, { [1, H] }> = broadcast_scalar(1.0f32, shape![1, H]);
             // cutile 0.4 Tile has no `Neg` impl; negation is the `negf` fn
