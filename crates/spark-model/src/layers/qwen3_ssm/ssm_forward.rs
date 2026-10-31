@@ -406,9 +406,24 @@ impl Qwen3SsmLayer {
             } else {
                 self.gated_rms_norm_k
             };
-            ops::gated_rms_norm(
+            // The cutile op implements the f32-input sigmoid-gate math; when
+            // the flag is off (or the f32 kernel is absent) this resolves to
+            // the registry handle and the launch is byte-identical to main.
+            // (The per-token decode loops in trait_decode_batched*.rs use the
+            // bf16-input `gated_rms_norm_k` and stay on the registry path —
+            // the cutile port covers the f32 prefill/fused path only.)
+            let (norm_op, norm_registry_k) = if use_f32_gdn {
+                (&self.gated_rms_norm_op, self.gated_rms_norm_f32_k)
+            } else {
+                (
+                    &ops::cutile_gated_rms_norm::GatedRmsNormOp::Registry(norm_kernel),
+                    norm_kernel,
+                )
+            };
+            ops::cutile_gated_rms_norm::gated_rms_norm_op(
                 ctx.gpu,
-                norm_kernel,
+                norm_op,
+                norm_registry_k,
                 gdn_out,
                 z_ptr,
                 &self.ssm.norm,
@@ -417,7 +432,6 @@ impl Qwen3SsmLayer {
                 vd as u32,
                 vd as u32,
                 ctx.config.rms_norm_eps as f32,
-                vd as u32,
                 stream,
             )?;
             if trace {

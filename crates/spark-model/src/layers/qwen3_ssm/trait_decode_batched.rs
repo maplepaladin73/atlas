@@ -1036,6 +1036,8 @@ impl Qwen3SsmLayer {
                 let gdn_t = gdn_out_buf.offset(t as usize * value_dim * bf16);
                 let z_t = deinterleaved.offset(t as usize * qkvz_size * bf16 + z_offset * bf16);
                 let normed_t = normed_out_buf.offset(t as usize * value_dim * bf16);
+                // Per-token loop on the bf16-input kernel: the cutile op is
+                // f32-input only, so the Registry arm always runs here.
                 ops::gated_rms_norm(
                     ctx.gpu,
                     self.gated_rms_norm_k,

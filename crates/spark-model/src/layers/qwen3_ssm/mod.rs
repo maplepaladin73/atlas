@@ -119,6 +119,10 @@ pub struct Qwen3SsmLayer {
     rms_norm_residual_k: KernelHandle,
     gated_rms_norm_k: KernelHandle,
     gated_rms_norm_f32_k: KernelHandle,
+    /// Opt-in cutile flavor of the gated RMS norm (`ATLAS_CUTILE_GATED_RMSNORM=1`).
+    /// Resolved once here; `GatedRmsNormOp::Registry` carries the matching
+    /// precompiled handle so flag-off is byte-identical to main.
+    gated_rms_norm_op: ops::cutile_gated_rms_norm::GatedRmsNormOp,
     dense_gemv_k: KernelHandle,
     /// K=2 verify: batched (M=2) BF16 GDN in_proj_qkvz — one weight pass for
     /// both verify tokens instead of two M=1 `dense_gemv` reads.

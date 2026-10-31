@@ -78,6 +78,11 @@ impl Qwen3SsmLayer {
                 "norm",
                 &super::kernel_select::gated_norm_kernel(config, "gated_rms_norm_f32_input")?,
             ),
+            gated_rms_norm_op: {
+                let name =
+                    super::kernel_select::gated_norm_kernel(config, "gated_rms_norm_f32_input")?;
+                ops::cutile_gated_rms_norm::resolve_gated_rms_norm(gpu, &name)?
+            },
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
             dense_gemv_batch2_k: gpu.kernel("dense_gemv_bf16_batch2", "dense_gemv_bf16_batch2")?,
             dense_gemv_batchm_k: super::super::try_kernel(

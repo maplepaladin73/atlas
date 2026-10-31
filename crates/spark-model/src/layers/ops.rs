@@ -162,6 +162,8 @@ mod hyper_connection_lowrank_tests;
 // The same kernels against the in-process CPU oracle instead of a
 // checkpoint-backed fixture: weaker evidence (both sides read the same source
 // document) but it runs from a clean checkout with no 126 GiB download.
+#[path = "ops/cutile_gated_rms_norm.rs"]
+pub mod cutile_gated_rms_norm;
 #[path = "ops/cutile_k_norm_rope.rs"]
 pub mod cutile_k_norm_rope;
 #[path = "ops/cutile_rms_norm.rs"]
