@@ -166,16 +166,15 @@ mod imp {
         #[cutile::entry]
         pub fn gated_rms_norm_sigmoid_tile<const H: i32>(
             x: &Tensor<f32, { [-1, -1] }>,
-            // gate is a flat `[rows * gate_stride]` buffer; the row for the
-            // current block starts at flat offset `row * gate_stride`.
-            g: &Tensor<bf16, { [-1] }>,
+            // gate is viewed rank-2 as [rows, gate_stride]; load_tile_like
+            // reads row `row`, cols 0..H — exactly the CUDA layout
+            // (gate + row*gate_stride). No explicit indices anywhere.
+            g: &Tensor<bf16, { [-1, -1] }>,
             w: &Tensor<bf16, { [-1] }>,
             out: &mut Tensor<bf16, { [1, H] }>,
-            gate_stride: i32,
             eps: f32,
             inv_h: f32,
         ) {
-            let (row, _, _) = get_tile_block_id();
             let xf: Tile<f32, { [1, H] }> = load_tile_like(x, out);
             let sum: Tile<f32, { [1] }> = reduce_sum(xf * xf, 1);
             let mean = sum * broadcast_scalar(inv_h, shape![1]);
@@ -183,11 +182,7 @@ mod imp {
                 rsqrt(mean + broadcast_scalar(eps, shape![1]), ftz::Disabled);
             let rms_row: Tile<f32, { [1, H] }> = rms.reshape(shape![1, 1]).broadcast(shape![1, H]);
 
-            // g is rank-1, so the load is shape![H] and the result is
-            // reshaped up to a [1, H] row (reshape keeps element order).
-            let g_row: Tile<f32, { [H] }> =
-                convert_tile(g.load_tile(shape![H], [row * gate_stride]));
-            let gf: Tile<f32, { [1, H] }> = g_row.reshape(shape![1, H]);
+            let gf: Tile<f32, { [1, H] }> = convert_tile(load_tile_like(g, out));
             // sigmoid(g) = 1 / (1 + exp(-g))
             let one: Tile<f32, { [1, H] }> = broadcast_scalar(1.0f32, shape![1, H]);
             // cutile 0.4 Tile has no `Neg` impl; negation is the `negf` fn
@@ -229,13 +224,14 @@ mod imp {
         }
         // SAFETY: caller owns these allocations for the whole launch; we
         // block before returning, so nothing else touches `output` meanwhile.
-        // The gate is a flat [tokens*gate_stride] buffer; the kernel indexes
-        // it at row * gate_stride, matching the CUDA layout.
+        // The gate is borrowed as [tokens, gate_stride] with strides
+        // [gate_stride, 1], matching the CUDA layout (gate + row*gate_stride).
         let x = unsafe {
             Tensor::<f32>::borrow_raw_parts(input.0, 0, vec![tokens, hidden], vec![hidden, 1])
         };
-        let g =
-            unsafe { Tensor::<bf16>::borrow_raw_parts(gate.0, 0, vec![tokens * gstride], vec![1]) };
+        let g = unsafe {
+            Tensor::<bf16>::borrow_raw_parts(gate.0, 0, vec![tokens, gstride], vec![gstride, 1])
+        };
         let w = unsafe { Tensor::<bf16>::borrow_raw_parts(weight.0, 0, vec![hidden], vec![1]) };
         let mut out = unsafe {
             Tensor::<bf16>::borrow_raw_parts(output.0, 0, vec![tokens, hidden], vec![hidden, 1])
@@ -245,7 +241,6 @@ mod imp {
             &g,
             &w,
             (&mut out).partition([1, hidden as usize]),
-            gstride,
             eps,
             1.0 / (hidden as f32),
         )
