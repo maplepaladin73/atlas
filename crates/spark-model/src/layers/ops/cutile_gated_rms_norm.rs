@@ -159,15 +159,15 @@ mod imp {
     mod gated_rms_norm {
         use cutile::core::*;
 
-        /// One row per tile. `H` must be a power of two (Tile IR rule).
+        /// One row per tile, matching the PR #1 pow2 pattern exactly (the
+        /// partition gives each block its row; `load_tile_like` infers the
+        /// load shape from the output partition). `H` must be a power of two.
         /// Input is f32; gate and weight are bf16 and convert up.
-        /// `GS` is the gate stride (elements between gate rows); the gate
-        /// row for `row` starts at `[row, 0]` of a `[rows, GS]` view.
         #[cutile::entry]
         pub fn gated_rms_norm_sigmoid_tile<const H: i32>(
             x: &Tensor<f32, { [-1, -1] }>,
-            // gate is a flat `[rows * gate_stride]` buffer; the row for
-            // `row` starts at flat offset `row * gate_stride`.
+            // gate is a flat `[rows * gate_stride]` buffer; the row for the
+            // current block starts at flat offset `row * gate_stride`.
             g: &Tensor<bf16, { [-1] }>,
             w: &Tensor<bf16, { [-1] }>,
             out: &mut Tensor<bf16, { [1, H] }>,
@@ -176,12 +176,12 @@ mod imp {
             inv_h: f32,
         ) {
             let (row, _, _) = get_tile_block_id();
-            let xf: Tile<f32, { [1, H] }> = x.load_tile(shape![1, H], [row, 0]);
+            let xf: Tile<f32, { [1, H] }> = load_tile_like(x, out);
             let sum: Tile<f32, { [1] }> = reduce_sum(xf * xf, 1);
             let mean = sum * broadcast_scalar(inv_h, shape![1]);
             let rms: Tile<f32, { [1] }> =
                 rsqrt(mean + broadcast_scalar(eps, shape![1]), ftz::Disabled);
-            let rms_row: Tile<f32, { [1, H] }> = rms.reshape(shape![1, 1]).broadcast(out.shape());
+            let rms_row: Tile<f32, { [1, H] }> = rms.reshape(shape![1, 1]).broadcast(shape![1, H]);
 
             // g is rank-1, so the load is shape![H] and the result is
             // reshaped up to a [1, H] row (reshape keeps element order).
@@ -229,8 +229,8 @@ mod imp {
         }
         // SAFETY: caller owns these allocations for the whole launch; we
         // block before returning, so nothing else touches `output` meanwhile.
-        // The gate is viewed as [tokens, gate_stride] and the kernel indexes
-        // it flat ([row * gate_stride, 0]), matching the CUDA layout.
+        // The gate is a flat [tokens*gate_stride] buffer; the kernel indexes
+        // it at row * gate_stride, matching the CUDA layout.
         let x = unsafe {
             Tensor::<f32>::borrow_raw_parts(input.0, 0, vec![tokens, hidden], vec![hidden, 1])
         };
