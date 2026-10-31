@@ -138,73 +138,9 @@ struct Case {
     hi: f64,
 }
 
-/// Wall time per launch, including the sync both paths already do.
-/// Shapes match the 2026-10-29 writeup: bulk 8192x4096 and a decode row.
-fn bench_both(g: &dyn GpuBackend) -> Result<()> {
-    use std::time::Instant;
-    #[cfg(feature = "cutile")]
-    use spark_model::layers::ops::cutile_rms_norm::{RmsNormOp, rms_norm_op};
-    println!("=== bench — cutile vs rms_norm_vanilla (sync each launch) ===");
-    println!(
-        "{:>8} {:>8} {:>14} {:>14} {:>8}",
-        "tokens", "hidden", "cuda us", "cutile us", "delta"
-    );
-    for (tokens, hidden) in [(1u32, 4096u32), (8192, 4096), (8192, 7168)] {
-        let n = tokens as usize * hidden as usize;
-        let x = vec![bf16::from_f32(0.5); n];
-        let w = vec![bf16::from_f32(0.7); hidden as usize];
-        let xp = ub(g, &x)?;
-        let wp = ub(g, &w)?;
-        let op = g.alloc(n * 2)?;
-        let reps = 30u32;
-        for _ in 0..5 {
-            launch(g, "rms_norm_vanilla", "rms_norm_vanilla", xp, wp, op, tokens, hidden)?;
-        }
-        let t0 = Instant::now();
-        for _ in 0..reps {
-            launch(g, "rms_norm_vanilla", "rms_norm_vanilla", xp, wp, op, tokens, hidden)?;
-        }
-        let cuda_us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
-        #[cfg(feature = "cutile")]
-        let cutile_us = {
-            let dw = spark_model::weight_map::DenseWeight { weight: wp };
-            for _ in 0..3 {
-                rms_norm_op(g, &RmsNormOp::Cutile, xp, &dw, op, tokens, hidden, EPS, 0)?;
-                g.synchronize(0)?;
-            }
-            let t1 = Instant::now();
-            for _ in 0..reps {
-                rms_norm_op(g, &RmsNormOp::Cutile, xp, &dw, op, tokens, hidden, EPS, 0)?;
-                g.synchronize(0)?;
-            }
-            t1.elapsed().as_secs_f64() * 1e6 / f64::from(reps)
-        };
-        #[cfg(not(feature = "cutile"))]
-        let cutile_us = f64::NAN;
-        let delta = (cutile_us - cuda_us) / cuda_us * 100.0;
-        println!(
-            "{tokens:>8} {hidden:>8} {cuda_us:>14.2} {cutile_us:>14.2} {delta:>+7.1}%"
-        );
-        for p in [xp, wp, op] {
-            g.free(p)?;
-        }
-    }
-    Ok(())
-}
-
 fn main() -> Result<()> {
-    // Cutile JIT does not use atlas-kernels PTX. On sm_120 the default
-    // sm_121f modules fail cuModuleLoadData, so this flag runs C1 only.
-    let only_cutile = std::env::var("ATLAS_MICROTEST_CUTILE_ONLY").as_deref() == Ok("1");
-    let gpu = if only_cutile {
-        AtlasCudaBackend::new(0, &[])?
-    } else {
-        AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?
-    };
+    let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &gpu;
-    if std::env::var("ATLAS_MICROTEST_BENCH").as_deref() == Ok("1") {
-        return bench_both(g);
-    }
 
     let dims = [512usize, 1024, 4096, 7168];
     let seeds = [1u64, 7, 42, 1337, 90210];
@@ -244,7 +180,6 @@ fn main() -> Result<()> {
     ];
 
     let mut fail = 0usize;
-    if !only_cutile {
     println!("=== V2 — production `rms_norm_vanilla` vs F64 truth (out = x*w/rms) ===");
     println!(
         "{:<22} {:>6} {:>6} {:>12} {:>12}",
@@ -494,97 +429,10 @@ fn main() -> Result<()> {
             fail += 1;
         }
     }
-
-    } // !only_cutile
-
-    // ── C1 — opt-in cutile-rs path vs the SAME F64 truth (issue #263) ──
-    // Only compiled with --features cutile; without it this section is absent
-    // and the binary behaves exactly as before.
-    #[cfg(feature = "cutile")]
-    {
-        use spark_model::layers::ops::cutile_rms_norm::{rms_norm_op, RmsNormOp};
-        println!("\n=== C1 — cutile-rs `rms_norm_vanilla_tile` vs F64 truth (feature=cutile) ===");
-        println!(
-            "{:<22} {:>6} {:>6} {:>12} {:>12}",
-            "weight regime", "hidden", "seed", "max |abs|", "max rel"
-        );
-        println!("{}", "-".repeat(64));
-        let mut cutile_fail = 0usize;
-        for c in &cases {
-            for &hidden in &dims {
-                for &seed in &seeds {
-                    let tokens = 3usize;
-                    let mut r = Lcg(seed);
-                    let x: Vec<bf16> = (0..tokens * hidden)
-                        .map(|_| bf16::from_f32(r.r(-3.0, 3.0) as f32))
-                        .collect();
-                    let w: Vec<bf16> = (0..hidden)
-                        .map(|_| bf16::from_f32(r.r(c.lo, c.hi) as f32))
-                        .collect();
-                    let w64: Vec<f64> = w.iter().map(|v| v.to_f64()).collect();
-
-                    let xp = ub(g, &x)?;
-                    let wp = ub(g, &w)?;
-                    let op = g.alloc(tokens * hidden * 2)?;
-                    let dw = spark_model::weight_map::DenseWeight { weight: wp };
-                    rms_norm_op(
-                        g,
-                        &RmsNormOp::Cutile,
-                        xp,
-                        &dw,
-                        op,
-                        tokens as u32,
-                        hidden as u32,
-                        EPS,
-                        0,
-                    )?;
-                    g.synchronize(0)?;
-                    let dev = db(g, op, tokens * hidden)?;
-                    let truth_v = truth(&x, &w64, hidden, tokens);
-                    let (a, rel) = cmp(&dev, &truth_v);
-                    // Same tolerance as V2: one BF16 ULP of slack.
-                    let bad = rel > 0.01;
-                    if bad {
-                        cutile_fail += 1;
-                        fail += 1;
-                    }
-                    if seed == seeds[0] && hidden == dims[0] {
-                        println!(
-                            "{:<22} {:>6} {:>6} {:>12.3e} {:>12.3e}{}",
-                            c.name, hidden, seed, a, rel,
-                            if bad { "   <<< FAIL" } else { "" }
-                        );
-                    }
-                    if bad {
-                        println!(
-                            "  FAIL(cutile) {:<14} hidden={} seed={} abs={:.3e} rel={:.3e}",
-                            c.name, hidden, seed, a, rel
-                        );
-                    }
-                    for p in [xp, wp, op] {
-                        g.free(p)?;
-                    }
-                }
-            }
-        }
-        println!(
-            "C1: {} regimes x {} dims x {} seeds = {} cells, {} failures",
-            cases.len(), dims.len(), seeds.len(),
-            cases.len() * dims.len() * seeds.len(), cutile_fail
-        );
-    }
-
     println!();
     if fail > 0 {
         bail!("{fail} failure(s) — READING R1: STOP AND REPAIR. No behavioral eval.");
     }
-    #[cfg(feature = "cutile")]
-    if only_cutile {
-        println!("ALL DEVICE CHECKS PASS (C1 cutile only).");
-    } else {
-        println!("ALL DEVICE CHECKS PASS (V2 + I1 + V3 + V3w + V1d + C1).");
-    }
-    #[cfg(not(feature = "cutile"))]
     println!("ALL DEVICE CHECKS PASS (V2 + I1 + V3 + V3w + V1d).");
     Ok(())
 }

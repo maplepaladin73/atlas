@@ -162,6 +162,10 @@ mod hyper_connection_lowrank_tests;
 // The same kernels against the in-process CPU oracle instead of a
 // checkpoint-backed fixture: weaker evidence (both sides read the same source
 // document) but it runs from a clean checkout with no 126 GiB download.
+#[path = "ops/cutile_k_norm_rope.rs"]
+pub mod cutile_k_norm_rope;
+#[path = "ops/cutile_rms_norm.rs"]
+pub mod cutile_rms_norm;
 #[path = "ops/kv_cache.rs"]
 mod kv_cache;
 #[path = "ops/kv_cache_fp8k.rs"]
@@ -200,8 +204,6 @@ pub mod moe_lora_grouped;
 mod moe_nvfp4_mmq;
 #[path = "ops/moe_prefill.rs"]
 mod moe_prefill;
-#[path = "ops/cutile_rms_norm.rs"]
-pub mod cutile_rms_norm;
 #[path = "ops/norm.rs"]
 mod norm;
 mod nvfp4_mmq;
