@@ -1,0 +1,13 @@
+[build]
+# Ripple's head_dim is 128. The gb10 attention kernels inherited from the
+# qwen3.6-27b tree (`paged_decode_attn` in kernels/gb10/common) fix their
+# per-lane vector width at compile time from HDIM, defaulting to 256 — at
+# runtime head_dim 128 each lane would read past its 128-element slice and the
+# decode attention output is garbage. Same remedy as gb10/laguna-s-2.1.
+# `--fmad=false` follows the gb10 convention (qwen3.6-27b/laguna-s-2.1 trees)
+# for bit-identical GEMM numerics vs the HF reference.
+#
+# [modules] needs no local entries: KERNEL.toml merges common → kernel_source
+# → target-local, so the qwen3.6-27b module renames apply, and unlisted .cu
+# files (ripple_ops.cu, embed_scale.cu) use their file stem as module name.
+extra_nvcc_flags = ["--fmad=false", "-DHDIM=128"]

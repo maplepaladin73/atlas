@@ -56,11 +56,14 @@ clang libclang-dev`, CUDA 13.0 (`nvcc --version` → 13.0), Rust via `rust-toolc
 First `cargo build --release -p spark-server` ≈ 15–30 min (PTX compile dominates).
 
 ```bash
-git fetch https://github.com/Atlas-Inf/atlas.git feat/ripple-65b-hip
-git checkout vibe/ricursive-65b-complete-07de47   # this branch, in maplepaladin73/atlas
+git fetch origin && git checkout vibe/ricursive-65b-07de47   # this branch, in maplepaladin73/atlas
 hf download ricursiveAI/Ripple-65B-Preview-NVFP4   # ~33 GB into the HF cache
 cargo test -p atlas-core ricursive                  # parser tests (3)
-ATLAS_TARGET_HW=strix-hip cargo build --release -p spark-server   # branch kernels are strix-hip
+# GB10 (default target; kernels/gb10/ripple-65b is on this branch):
+cargo build --release -p spark-server
+./target/release/spark serve ricursiveAI/Ripple-65B-Preview-NVFP4
+# strix-hip (upstream's original target):
+ATLAS_TARGET_HW=strix-hip cargo build --release -p spark-server
 ATLAS_TARGET_HW=strix-hip ./target/release/spark serve ricursiveAI/Ripple-65B-Preview-NVFP4
 ```
 
@@ -73,16 +76,27 @@ Verification loop (CONTRIBUTING.md "Pull Request Process"):
    (`bfcl-subset` ST-995 with normalized floor, `agentic-50`, …). Per-model gate files
    live in the kernel dir's `BENCH.toml`.
 
+## Kernel targets on this branch
+- **gb10** (default `ATLAS_TARGET_HW`): `kernels/gb10/ripple-65b/` — MODEL.toml with
+  `kernel_source = "qwen3.6-27b"` (the gb10 tree that already serves the same dense
+  BF16-attention + NVFP4-FFN shapes family), plus a two-file overlay:
+  `nvfp4/ripple_ops.cu` (`ripple_silu_mul_clamp`, `ripple_valres_lerp`) and
+  `nvfp4/embed_scale.cu` (`bf16_scale_inplace`, same as the gb10 gemma-4 trees).
+  `nvfp4/KERNEL.toml` sets `extra_nvcc_flags = ["--fmad=false", "-DHDIM=128"]`
+  (gb10's common `paged_decode_attn.cu` defaults `HDIM 256`; head_dim 128 needs the
+  flag — same remedy as `gb10/laguna-s-2.1`). Build audit: target
+  `(gb10, ripple-65b, nvfp4)` compiles 211 kernels, overlay shadowing verified.
+- **strix-hip**: upstream's original `kernels/strix-hip/ripple-65b/` (HDIM=128 flag).
+
 ## Remaining work to call the port done
-1. **GB10 kernels**: the branch ships `kernels/strix-hip/ripple-65b/` only. For the
-   dual-GB10 pair, add `kernels/gb10/ripple-65b/` (MODEL.toml + the `embed_scale` /
-   clamped-SwiGLU ops as gb10 `.cu`; the generic paged-decode/reshape kernels are
-   target-agnostic). Build with `ATLAS_TARGET_HW=gb10` (default).
-2. **TP=2 for the BF16 checkpoint** (129.6 GB): wire `slice_for_rank` for Q/K/V/O,
+1. **TP=2 for the BF16 checkpoint** (129.6 GB): wire `slice_for_rank` for Q/K/V/O,
    gate/up/down, lm_head, flip `supports_tp()` (reference: `weight_loader/minimax.rs`).
-   NVFP4 (~33 GB) serves single-GPU without this.
-3. **Gates for the new model dir** (`BENCH.toml` under the ripple kernel dir) so
-   `spark benchmark run --pull-request-gate` covers ricursive.
+   NVFP4 (~33 GB) serves a single GB10 without this.
+2. **Gates for the new model dir** (`BENCH.toml` under `kernels/gb10/ripple-65b/` and
+   `kernels/strix-hip/ripple-65b/`) so `spark benchmark run --pull-request-gate`
+   covers ricursive.
+3. **GPU verification** on the target host: vLLM parity (KL 0), T=0 byte-identical
+   controls, then the benchmark gates.
 4. Optional: DFlash2 spec-dec end-to-end on the target host (already wired in code).
 
 ## Provenance / authorship
