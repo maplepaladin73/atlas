@@ -107,6 +107,8 @@ pub struct Qwen3AttentionLayer {
     pub(super) mx8_rt: Option<super::mx8::Mx8AttnRt>,
     // ── MLA (Multi-head Latent Attention) — 2-step decode ──
     pub(crate) mla: Option<MlaWeights>,
+    /// MiMo-V2 attention (Q/K 192, V 128); short-circuits the standard chain.
+    pub(crate) mimo: Option<super::mimo::MimoAttn>,
     /// MXFP8 twins of MLA weights keyed by the BF16 weight pointer, with the
     /// `[n, k]` they were quantized as: verify rows and paged prefill chunks
     /// that short (<= 32) read half the bytes; longer chunks keep BF16.
