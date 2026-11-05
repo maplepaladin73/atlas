@@ -137,6 +137,9 @@ impl ModelConfig {
             num_mtp_modules: 0,
             mtp_transformer_layers: 0,
             rotary_dim: 0,
+            full_num_key_value_heads: 0,
+            swa_rope_theta: 0.0,
+            attention_value_scale: 1.0,
             dflash_capture_layers: Vec::new(),
             adapter_max_rank: 0,
             // No n-gram embeddings: the trio is opt-in per checkpoint.
