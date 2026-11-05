@@ -1,13 +1,15 @@
 [build]
-# Ripple's head_dim is 128. The gb10 attention kernels inherited from the
-# qwen3.6-27b tree (`paged_decode_attn` in kernels/gb10/common) fix their
-# per-lane vector width at compile time from HDIM, defaulting to 256 — at
-# runtime head_dim 128 each lane would read past its 128-element slice and the
-# decode attention output is garbage. Same remedy as gb10/laguna-s-2.1.
-# `--fmad=false` follows the gb10 convention (qwen3.6-27b/laguna-s-2.1 trees)
-# for bit-identical GEMM numerics vs the HF reference.
-#
-# [modules] needs no local entries: KERNEL.toml merges common → kernel_source
-# → target-local, so the qwen3.6-27b module renames apply, and unlisted .cu
-# files (ripple_ops.cu, embed_scale.cu) use their file stem as module name.
+# Ripple's head_dim is 128. gb10's common paged_decode_attn.cu defaults
+# HDIM 256, so the flag is required (same remedy as gb10/laguna-s-2.1, whose
+# KERNEL.toml these merge over via kernel_source). `--fmad=false` is the gb10
+# bit-parity convention. Duplicated flags from the merged laguna KERNEL.toml
+# are benign.
 extra_nvcc_flags = ["--fmad=false", "-DHDIM=128"]
+
+# The overlay's w4a4_gemm.cu (from glm-5.3-flash) must compile as module
+# `w4a4` — that is the module name dense_ffn looks up
+# (`w4a4::w4a4_gemm_mfast`). Without this mapping the file stem
+# (`w4a4_gemm`) would be used and the lookup would resolve to handle 0,
+# which the startup audit refuses.
+[modules]
+w4a4_gemm = "w4a4"

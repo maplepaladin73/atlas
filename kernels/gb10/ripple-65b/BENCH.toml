@@ -1,0 +1,55 @@
+# Benchmarks for Ricursive Ripple-65B Preview NVFP4 on GB10, and the thresholds
+# its gate records must meet.
+#
+# EVERY ENTRY HERE IS `status = "unmeasured"` on purpose: Ripple-65B has never
+# been gated on this tree, and per the schema an unmeasured entry carries NO
+# [benchmarks.metrics] table — a guessed threshold a run could clear would
+# report PASS for something nobody measured. These entries BASELINE: the first
+# local gate run fills in metrics and flips status to "measured".
+#
+# Gates follow the house set (bfcl-subset = ST-995, agentic-webserver = the
+# agentic-50 probe, decode-floor, ttft-cold-gate). Run with:
+#   ./target/release/spark benchmark run <gate> --pull-request-gate --yes
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "ricursiveAI/Ripple-65B-Preview-NVFP4"
+gate = "bfcl-subset"
+recipe = "ricursive/ripple-65b-nvfp4"
+label = "Ripple-65B Preview (NVFP4, single GB10)"
+default = true
+status = "unmeasured"
+note = """\
+First BFCL ST-995 measurement for ricursive on gb10. Vendor-reported 80.52 on
+TerminalBench 2.1 (self-reported); no in-repo baseline exists yet. The first
+run records the metrics table here; ratchet from there, never guess."""
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "ricursiveAI/Ripple-65B-Preview-NVFP4"
+gate = "agentic-webserver"
+recipe = "ricursive/ripple-65b-nvfp4"
+label = "Ripple-65B Preview (NVFP4, single GB10)"
+default = true
+status = "unmeasured"
+note = "Agentic webserver 50-turn probe; baseline on first run."
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "ricursiveAI/Ripple-65B-Preview-NVFP4"
+gate = "decode-floor"
+recipe = "ricursive/ripple-65b-nvfp4"
+label = "Ripple-65B Preview (NVFP4, single GB10)"
+default = true
+status = "unmeasured"
+note = "Median-of-3 server decode rate; baseline on first run."
+
+[[benchmarks]]
+quant = "nvfp4"
+checkpoint = "ricursiveAI/Ripple-65B-Preview-NVFP4"
+gate = "ttft-cold-gate"
+recipe = "ricursive/ripple-65b-nvfp4"
+label = "Ripple-65B Preview (NVFP4, single GB10)"
+default = false
+status = "unmeasured"
+note = "Cold TTFT at 2K/8K/16K/28K; baseline on first run."
