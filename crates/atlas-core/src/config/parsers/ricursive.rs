@@ -31,7 +31,10 @@ pub(crate) fn parse_ricursive(raw: &Value) -> Result<ModelConfig> {
 
     let mut config: ModelConfig =
         serde_json::from_value(normalized).context("Failed to parse ricursive config.json")?;
-    ensure!(config.hidden_size > 0, "ricursive hidden_size must be non-zero");
+    ensure!(
+        config.hidden_size > 0,
+        "ricursive hidden_size must be non-zero"
+    );
     ensure!(config.head_dim > 0, "ricursive head_dim must be non-zero");
     ensure!(
         config.num_key_value_heads > 0
@@ -42,10 +45,10 @@ pub(crate) fn parse_ricursive(raw: &Value) -> Result<ModelConfig> {
     );
     ensure!(
         config.layer_types.len() == config.num_hidden_layers
-            && config.layer_types.iter().all(|t| matches!(
-                t,
-                LayerType::SlidingAttention | LayerType::FullAttention
-            )),
+            && config
+                .layer_types
+                .iter()
+                .all(|t| matches!(t, LayerType::SlidingAttention | LayerType::FullAttention)),
         "ricursive layer_types must list sliding/full attention for every layer"
     );
     ensure!(
@@ -78,6 +81,10 @@ pub(crate) fn parse_ricursive(raw: &Value) -> Result<ModelConfig> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     config.weight_prefix.clear();
+    // Set explicitly so the `architectures: ["RicursiveForCausalLM"]` dispatch
+    // fallback (no `model_type` in config.json) still lands on the ricursive
+    // loader in `factory.rs`.
+    config.model_type = "ricursive".to_string();
     config.embed_scale = raw
         .get("embed_scale")
         .and_then(Value::as_f64)
@@ -148,5 +155,48 @@ mod tests {
         assert!((c.embed_scale - 71.554_18).abs() < 1e-3);
         assert_eq!(c.num_experts, 0);
         assert!(!c.tie_word_embeddings);
+    }
+
+    /// A remote-code checkpoint may omit `model_type`; `architectures[0]`
+    /// must route `RicursiveForCausalLM` to the ricursive parser.
+    #[test]
+    fn architectures_fallback_maps_ricursive() {
+        let json = CONFIG.replace("\"model_type\": \"ricursive\",", "");
+        let config = crate::config::parse_config(&json).expect("parse via architectures");
+        assert_eq!(config.model_type, "ricursive");
+        assert_eq!(config.sliding_layers, vec![true, true, true, true, false]);
+    }
+
+    /// The -NVFP4 checkpoint adds a ModelOpt quantization_config (group 16;
+    /// `lm_head`/`embed_tokens`/`self_attn*` stay BF16) — it must survive
+    /// `finalize_config` so the loader's `detect_nvfp4_variant` sees it.
+    #[test]
+    fn parses_nvfp4_quantization_config() {
+        let json = CONFIG.replace(
+            "\"use_valres\": true",
+            r#""use_valres": true,
+            "quantization_config": {
+                "config_groups": { "group_0": {
+                    "input_activations": { "num_bits": 4, "type": "float", "group_size": 16 },
+                    "weights": { "num_bits": 4, "type": "float", "group_size": 16 },
+                    "targets": ["Linear"]
+                } },
+                "ignore": ["lm_head", "model.embed_tokens", "model.layers.0.self_attn*"],
+                "quant_algo": "NVFP4",
+                "producer": { "name": "modelopt", "version": "0.46.0" },
+                "quant_method": "modelopt"
+            }"#,
+        );
+        let config = crate::config::parse_config(&json).expect("parse ricursive nvfp4");
+        let qc = config
+            .quantization_config
+            .expect("quantization_config parsed");
+        assert_eq!(qc.quant_method, "modelopt");
+        assert_eq!(qc.quant_algo, "NVFP4");
+        assert_eq!(qc.group_size, 16);
+        assert!(
+            qc.ignore_modules
+                .contains(&"model.layers.0.self_attn*".to_string())
+        );
     }
 }

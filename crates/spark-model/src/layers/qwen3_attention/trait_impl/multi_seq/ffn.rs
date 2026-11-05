@@ -93,13 +93,25 @@ impl Qwen3AttentionLayer {
         // (which runs its K rows through this path). One arm, any n: norm the
         // attention output, add + pre-FFN norm, the n-row dense FFN, norm its
         // output, add.
-        if let (Some(post_attn), Some(post_ffn)) = (&self.post_attn_out_norm, &self.post_ffn_out_norm) {
+        if let (Some(post_attn), Some(post_ffn)) =
+            (&self.post_attn_out_norm, &self.post_ffn_out_norm)
+        {
             anyhow::ensure!(
                 self.moe_ffn.is_none() && self.ffn.is_dense() && self.layer_scalar.is_none(),
                 "L{}: batched PeriNorm arm covers dense FFN without layer_scalar only",
                 self.attn_layer_idx
             );
-            ops::rms_norm(fwd.gpu, self.rms_norm_w_k, o_out, post_attn, o_out, n as u32, h as u32, eps, stream)?;
+            ops::rms_norm(
+                fwd.gpu,
+                self.rms_norm_w_k,
+                o_out,
+                post_attn,
+                o_out,
+                n as u32,
+                h as u32,
+                eps,
+                stream,
+            )?;
             let normed2 = fwd.buffers.norm_output();
             ops::residual_add_rms_norm(
                 fwd.gpu,
@@ -116,8 +128,25 @@ impl Qwen3AttentionLayer {
             )?;
             self.ffn.forward_prefill(normed2, n, fwd, stream)?;
             let ffn_out = fwd.buffers.moe_output();
-            ops::rms_norm(fwd.gpu, self.rms_norm_w_k, ffn_out, post_ffn, ffn_out, n as u32, h as u32, eps, stream)?;
-            ops::residual_add(fwd.gpu, self.residual_add_k, hidden, ffn_out, (n * h) as u32, stream)?;
+            ops::rms_norm(
+                fwd.gpu,
+                self.rms_norm_w_k,
+                ffn_out,
+                post_ffn,
+                ffn_out,
+                n as u32,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            ops::residual_add(
+                fwd.gpu,
+                self.residual_add_k,
+                hidden,
+                ffn_out,
+                (n * h) as u32,
+                stream,
+            )?;
             return Ok(());
         }
         let force_seq_ffn = self.mla.is_some();

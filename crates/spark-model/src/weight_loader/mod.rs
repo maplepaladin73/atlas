@@ -20,7 +20,6 @@ pub mod dflash_preshrink;
 mod gemma4;
 pub(crate) mod glm5;
 mod laguna;
-mod ricursive;
 mod longcat;
 mod minimax;
 mod nemotron;
@@ -31,6 +30,7 @@ mod qwen35_dense;
 mod qwen3_vl;
 #[cfg_attr(test, allow(unreachable_pub))]
 pub(crate) mod qwen4_exp;
+mod ricursive;
 mod step3p7;
 
 pub use deepseek_v4::DeepSeekV4WeightLoader;
@@ -42,7 +42,6 @@ pub use gemma4::Gemma4WeightLoader;
 pub use glm5::Glm5WeightLoader;
 pub use glm5::mode as glm5_mode;
 pub use laguna::LagunaWeightLoader;
-pub use ricursive::RicursiveWeightLoader;
 pub use longcat::LongcatWeightLoader;
 pub use minimax::MinimaxM2WeightLoader;
 pub use nemotron::NemotronHWeightLoader;
@@ -53,6 +52,7 @@ pub use qwen4_exp::Qwen4ExpWeightLoader;
 pub use qwen4_exp::mode as qwen4exp_mode;
 pub use qwen35::Qwen35WeightLoader;
 pub use qwen35_dense::Qwen35DenseWeightLoader;
+pub use ricursive::RicursiveWeightLoader;
 pub use step3p7::Step3p7WeightLoader;
 
 use anyhow::Result;

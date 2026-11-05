@@ -85,8 +85,24 @@ impl Qwen3AttentionLayer {
         self.prepare_value_input(ctx, hidden, normed, 1, stream)?;
         if !ctx.graph_capture {
             let l = self.attn_layer_idx;
-            super::super::op_dump::dump_bf16(ctx.gpu, hidden, 0, h, l, "dec_input_norm_in", stream)?;
-            super::super::op_dump::dump_bf16(ctx.gpu, normed, 0, h, l, "dec_input_norm_out", stream)?;
+            super::super::op_dump::dump_bf16(
+                ctx.gpu,
+                hidden,
+                0,
+                h,
+                l,
+                "dec_input_norm_in",
+                stream,
+            )?;
+            super::super::op_dump::dump_bf16(
+                ctx.gpu,
+                normed,
+                0,
+                h,
+                l,
+                "dec_input_norm_out",
+                stream,
+            )?;
         }
         if gemma4_diag {
             diag_norm(

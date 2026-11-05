@@ -406,9 +406,20 @@ impl BlockDiffusionDraftHead {
                 dflash2_conv_delta: gpu.alloc(
                     n_attn
                         * 2
-                        * weights.config.dflash_config.as_ref().and_then(|c| c.conv_kernel_size).unwrap_or(2)
+                        * weights
+                            .config
+                            .dflash_config
+                            .as_ref()
+                            .and_then(|c| c.conv_kernel_size)
+                            .unwrap_or(2)
                         * (hidden_size
-                            / weights.config.dflash_config.as_ref().and_then(|c| c.conv_group_size).unwrap_or(16).max(1))
+                            / weights
+                                .config
+                                .dflash_config
+                                .as_ref()
+                                .and_then(|c| c.conv_group_size)
+                                .unwrap_or(16)
+                                .max(1))
                         .max(1)
                         * bf16,
                 )?,

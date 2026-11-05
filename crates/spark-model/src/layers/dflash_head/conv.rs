@@ -166,7 +166,10 @@ impl Dflash2Conv {
     ) -> Result<()> {
         let h = self.hidden_size as u32;
         // base_kernel is [2 (input, output), kernel_size, hidden] BF16.
-        let output_base_kernel = self.base_kernel.weight.offset(self.kernel_size * self.hidden_size * 2);
+        let output_base_kernel = self
+            .base_kernel
+            .weight
+            .offset(self.kernel_size * self.hidden_size * 2);
 
         if let Some(k) = conv_kernel {
             let total_elems = gamma * h;

@@ -134,7 +134,10 @@ pub(crate) fn install_value_residual(
     hidden_states_bytes: usize,
     gpu: &dyn spark_runtime::gpu::GpuBackend,
 ) -> Result<()> {
-    ensure!(hidden_states_bytes > 0, "value residuals: empty hidden_states region");
+    ensure!(
+        hidden_states_bytes > 0,
+        "value residuals: empty hidden_states region"
+    );
     let shadow = gpu.alloc(hidden_states_bytes)?;
     let vin = gpu.alloc(hidden_states_bytes)?;
     for (i, layer) in layers.iter_mut().enumerate() {

@@ -104,7 +104,10 @@ fn load_layers(
         config.ffn_clamp_threshold,
         KERNEL_FFN_CLAMP
     );
-    ensure!(config.attn_gated, "ricursive without use_gated_attention is not supported");
+    ensure!(
+        config.attn_gated,
+        "ricursive without use_gated_attention is not supported"
+    );
 
     let variant = detect_nvfp4_variant(store, config);
     tracing::info!("Ripple NVFP4 variant: {variant:?}");
@@ -115,8 +118,9 @@ fn load_layers(
     let mut layers: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
         let lp = format!("model.layers.{i}");
-        let ffn_weights =
-            load_dense_ffn(store, &lp, gpu, variant, absmax_k, quantize_k, stream, config)?;
+        let ffn_weights = load_dense_ffn(
+            store, &lp, gpu, variant, absmax_k, quantize_k, stream, config,
+        )?;
         let ffn = FfnComponent::Dense(DenseFfnLayer::new(ffn_weights, gpu, &config.model_type)?);
         let layer = load_attention(store, config, gpu, &lp, ffn, layer_kv_dtypes[i], i)?;
         layers.push(Box::new(layer));
@@ -239,7 +243,11 @@ fn interleave_q_gate(
     for head in 0..nq {
         let dst = out.offset(2 * head * head_bytes);
         gpu.copy_d2d(q.ptr.offset(head * head_bytes), dst, head_bytes)?;
-        gpu.copy_d2d(g.ptr.offset(head * head_bytes), dst.offset(head_bytes), head_bytes)?;
+        gpu.copy_d2d(
+            g.ptr.offset(head * head_bytes),
+            dst.offset(head_bytes),
+            head_bytes,
+        )?;
     }
     store.reclaim(gpu, &q_name)?;
     store.reclaim(gpu, &g_name)?;
