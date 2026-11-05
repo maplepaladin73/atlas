@@ -140,7 +140,10 @@ impl TransformerModel {
 
         // ── 1b. Overwrite image_pad token positions with vision encoder embeddings ──
         {
-            let pending = *self.vision_embed_patches.lock();
+            // Per-sequence state: this request's rows (the model holds no
+            // vision state between requests). The two-phase path encodes the
+            // whole prompt in one pass, so every row is resident.
+            let pending = seq.vision.rows_encoded;
             if pending > 0
                 && let Some(ve) = &self.vision_encoder
             {
@@ -449,7 +452,7 @@ impl TransformerModel {
             graph_capture: false,
             // Marconi warm hit: GDN layers replay from a restored SSM state
             // and must use the bit-faithful WY4 recurrence (see layer.rs).
-            gdn_exact_replay: marconi_skip,
+            gdn_exact_replay: marconi_skip && !self.grid_replay_is_cold(),
             token_ids: None,
             host_token_ids: None,
             // #30: request slot pairs (None unless routing to a non-active slot).

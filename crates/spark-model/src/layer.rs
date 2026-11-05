@@ -14,6 +14,7 @@ use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 pub mod glm_long_owner;
+pub mod glm_packed;
 mod prefill_pieces;
 pub mod ssm_batch;
 pub use prefill_pieces::{
@@ -380,6 +381,8 @@ pub struct ForwardContext<'a> {
     /// cached K/V, and the replay range [snap_tok, matched) is rewritten
     /// into SHARED prefix-cache blocks — non-exact recompute poisons them
     /// and the drift ratchets across turns (2026-06-10 warm-hit stutter).
+    /// Exact path: register-resident token-sequential kernel (default), WY4
+    /// fallback. Off under the prefill grid (see `grid_replay_is_cold`).
     pub gdn_exact_replay: bool,
     /// Device `[num_tokens]` u32 token IDs for the tokens being processed this
     /// pass, in the SAME order the per-token MoE loop visits them. Required by
@@ -492,7 +495,6 @@ pub enum MoeLoraRoute {
 /// 1. Pre-norm -> attention/SSM -> residual add
 /// 2. Post-norm -> FFN/MoE -> residual add
 ///
-/// The generic model loop iterates `layers` without knowing whether
-/// each is attention, SSM, MoE, or dense FFN.
+/// The generic model loop iterates `layers` whatever each one is.
 #[cfg(test)]
 mod tests;

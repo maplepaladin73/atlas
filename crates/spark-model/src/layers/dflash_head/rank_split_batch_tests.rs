@@ -16,8 +16,8 @@ fn the_batch_switch_is_0_or_1_and_sets_its_own_parity_bit() {
     }
     // Off, both ranks compare the split's own word; on, a word of its own.
     for parts in [None, Some(MLP), Some(HEAD), Some(ALL)] {
-        assert_eq!(parity_word(parts, false, false), Parts::word(parts));
-        assert_ne!(parity_word(parts, true, false), Parts::word(parts));
+        assert_eq!(parity_word(parts, false, false, false), Parts::word(parts));
+        assert_ne!(parity_word(parts, true, false, false), Parts::word(parts));
     }
 }
 
@@ -29,13 +29,22 @@ fn frame(rank: &Rank, g: Geometry, rows: usize) -> Frame {
         inter: alloc(g.inter),
         acc: alloc(g.hidden),
         logits: alloc(g.vocab),
+        q: alloc(g.q_dim),
+        k: alloc(g.kv_dim),
+        v: alloc(g.kv_dim),
+        attn: alloc(g.q_dim),
+        attn_proj: alloc(g.hidden),
         ..Frame::serial(&rank.scratch)
     }
 }
 
 #[test]
 fn a_batched_propose_swaps_its_rows_through_the_batch_frame() {
-    let g = geometry(ALL);
+    batched_swaps(geometry(ALL));
+    batched_swaps(geometry(ATTN));
+}
+
+fn batched_swaps(g: Geometry) {
     let capacity = 4 * g.gamma;
     let (r0, r1) = (
         Rank::with_capacity(g, capacity),
@@ -88,6 +97,26 @@ fn a_batched_propose_swaps_its_rows_through_the_batch_frame() {
             }
             Swap::CtxInput(_) | Swap::CtxHidden(_) | Swap::CtxKv(_) => {
                 unreachable!("no context append was announced")
+            }
+            Swap::Candidates => unreachable!("a batched propose swaps logits"),
+            Swap::AttnIn(_) => assert_eq!(r1.read(f1.norm, hidden), sent0),
+            Swap::AttnOut(_) => assert_eq!(r1.read(f1.attn, rows * g.q_dim * 2), sent0),
+            Swap::Qkv(_) => {
+                let (wq, wk) = (widest(g.q_dim, 2), widest(g.kv_dim, 2));
+                for (at, dst, n) in [
+                    (0, f0.q, g.q_dim),
+                    (wq, f0.k, g.kv_dim),
+                    (wq + wk, f0.v, g.kv_dim),
+                ] {
+                    let (lo, hi) = (&sent0[at * rows * 2..], &sent1[at * rows * 2..]);
+                    assert_eq!(r0.read(dst, rows * n * 2), joined(rows, n, lo, hi));
+                }
+            }
+            Swap::OProj(_) => {
+                assert_eq!(
+                    r0.read(f0.attn_proj, hidden),
+                    joined(rows, g.hidden, &sent0, &sent1)
+                )
             }
         }
     }

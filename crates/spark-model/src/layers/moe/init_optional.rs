@@ -16,6 +16,7 @@ pub(super) struct OptionalKernels {
     /// Persistent CTAs of the K128W `_persist` twins above when resolved,
     /// else 0.
     pub(super) k128w_persist_ctas: u32,
+    pub(super) down_e4m3: Option<DownE4m3>,
     pub(super) moe_mtile_prefix_k: KernelHandle,
     pub(super) moe_w4a4_prequant_t_k64_compact: KernelHandle,
     pub(super) moe_w4a4_prequant_t_k64_vecscale_compact: KernelHandle,
@@ -103,17 +104,19 @@ pub(super) fn router_gemv_batchm(
     config: &atlas_core::config::ModelConfig,
 ) -> KernelHandle {
     let module = "dense_gemv_bf16_batchm";
+    // FP32 router logits: the FP32-output twins.
+    let f32 = if config.router_logits_f32 { "_f32" } else { "" };
     let ahead = super::super::try_kernel_gated(
         config.model_type == "glm5_next"
             && config.num_experts.div_ceil(4) <= ops::DENSE_GEMV_AHEAD_MAX_CTAS as usize,
         gpu,
         module,
-        "dense_gemv_bf16_batchm_ahead",
+        &format!("dense_gemv_bf16_batchm_ahead{f32}"),
     );
     if ahead.0 != 0 {
         return ahead;
     }
-    super::super::try_kernel(gpu, module, "dense_gemv_bf16_batchm")
+    super::super::try_kernel(gpu, module, &format!("dense_gemv_bf16_batchm{f32}"))
 }
 
 impl OptionalKernels {
@@ -157,6 +160,7 @@ impl OptionalKernels {
             moe_w4a4_prequant_t_k128w: t_k128w,
             moe_w4a4_prequant_gate_up_silu: gate_up_silu,
             k128w_persist_ctas,
+            down_e4m3: down_e4m3(gpu, k128w && down_e4m3_requested(), k128w_persist_ctas > 0),
             moe_mtile_prefix_k: if k128w {
                 super::super::try_kernel(gpu, "moe_w4a16", "moe_mtile_prefix")
             } else {
@@ -388,6 +392,54 @@ impl OptionalKernels {
     }
 }
 
+/// The lossy E4M3 routed down (`ATLAS_GLM_MOE_DOWN_E4M3`): the K128W down's
+/// `_e4m3` grid (and `_persist_e4m3` twin when the persistent schedule is
+/// on), which write E4M3 rows and per-64-column FP32 scales, and the sparse
+/// EP reduce that reads them.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DownE4m3 {
+    pub(super) down: ops::K128wKernel,
+    pub(super) unpermute: KernelHandle,
+}
+
+/// `ATLAS_GLM_MOE_DOWN_E4M3=1`.
+pub(crate) fn down_e4m3_requested() -> bool {
+    std::env::var("ATLAS_GLM_MOE_DOWN_E4M3").as_deref() == Ok("1")
+}
+
+fn down_e4m3(gpu: &dyn GpuBackend, on: bool, persist: bool) -> Option<DownE4m3> {
+    if !on {
+        return None;
+    }
+    let name = "moe_w4a4_grouped_gemm_prequant_t_k128w_compact";
+    let e4m3 = DownE4m3 {
+        down: ops::K128wKernel {
+            grid: super::super::try_kernel(gpu, "moe_w4a16", &format!("{name}_e4m3")),
+            persist: super::super::try_kernel_gated(
+                persist,
+                gpu,
+                "moe_w4a16",
+                &format!("{name}_persist_e4m3"),
+            ),
+        },
+        unpermute: super::super::try_kernel(
+            gpu,
+            "moe",
+            "moe_unpermute_reduce_indexed_ep_vec8_e4m3",
+        ),
+    };
+    let ok =
+        e4m3.down.grid.0 != 0 && (e4m3.down.persist.0 != 0 || !persist) && e4m3.unpermute.0 != 0;
+    if gpu.op_cache().once("moe:down_e4m3") {
+        if ok {
+            tracing::info!("ATLAS_GLM_MOE_DOWN_E4M3: E4M3 routed down rows (lossy)");
+        } else {
+            tracing::warn!("ATLAS_GLM_MOE_DOWN_E4M3=1 ignored: E4M3 down kernels unavailable");
+        }
+    }
+    ok.then_some(e4m3)
+}
+
 /// The K128W down and fused gate/up kernels (gate/up only with `silu`),
 /// with `persist` (`ATLAS_GLM_MOE_PREFILL_PERSIST=1`) also their `_persist`
 /// twins, which write the same bytes, and the CTAs those launch: two per SM,
@@ -432,24 +484,9 @@ fn k128w_kernels(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::k128w_kernels;
-    use spark_runtime::gpu::mock::MockGpuBackend;
+#[path = "init_optional_k128w_tests.rs"]
+mod tests;
 
-    fn handles(k128w: bool, silu: bool, persist: bool) -> ([u64; 4], u32) {
-        let (down, gate_up, ctas) = k128w_kernels(&MockGpuBackend::new(), k128w, silu, persist);
-        let ids = [down.grid, down.persist, gate_up.grid, gate_up.persist].map(|h| h.0);
-        (ids.map(|h| u64::from(h != 0)), ctas)
-    }
-
-    #[test]
-    fn k128w_persist_adds_the_twins_and_keeps_the_grid_kernels() {
-        // Flag off: the base grid kernels only.
-        assert_eq!(handles(true, true, false), ([1, 0, 1, 0], 0));
-        // Flag on: both sets, two CTAs per SM (the mock's 48 SMs).
-        assert_eq!(handles(true, true, true), ([1, 1, 1, 1], 96));
-        assert_eq!(handles(true, false, true), ([1, 1, 0, 0], 96));
-        // K128W off: nothing, whatever the flag.
-        assert_eq!(handles(false, true, true), ([0, 0, 0, 0], 0));
-    }
-}
+#[cfg(test)]
+#[path = "init_optional_tests.rs"]
+mod lookup_tests;

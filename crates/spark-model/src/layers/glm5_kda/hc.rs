@@ -8,28 +8,37 @@ use spark_runtime::gpu::DevicePtr;
 use super::Glm5KdaLayer;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
-use crate::layers::qwen3_attention::HcSiteWeights;
+use crate::layers::qwen3_attention::{HcNorm, HcSiteWeights};
 
 fn parse_fast_prefill(value: Option<&str>) -> bool {
     matches!(value, Some("1" | "true" | "yes"))
 }
 
 fn fast_prefill(tokens: u32) -> bool {
+    // A packed prefill takes the fused mixer at every row count.
+    if crate::layers::glm_packed_scope::active() {
+        return true;
+    }
     (tokens >= 128 && parse_fast_prefill(std::env::var("ATLAS_HC_CUBLAS_PREFILL").ok().as_deref()))
         || (tokens == 5
+            && !crate::layers::canonical_verify::enabled()
             && parse_fast_prefill(std::env::var("ATLAS_GLM_K5_HC_CUBLAS").ok().as_deref()))
 }
 
 impl Glm5KdaLayer {
+    /// The site's pre into `hidden`; with `norm`, also its block input norm
+    /// where the fused prefill mixer runs. Returns whether `norm` was written.
     pub(super) fn hc_pre(
         &self,
         site: &HcSiteWeights,
         hidden: DevicePtr,
         tokens: u32,
+        norm: Option<HcNorm>,
         ctx: &ForwardContext,
         stream: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if tokens <= 32
+            && !crate::layers::glm_packed_scope::active()
             && crate::layers::qwen3_attention::hc_post_pre_prefill_fused(
                 site,
                 None,
@@ -38,11 +47,13 @@ impl Glm5KdaLayer {
                 self.hc.hc_mult as u32,
                 self.hc.sinkhorn_iters as u32,
                 self.hc.hc_eps,
+                None,
                 ctx,
                 stream,
             )?
+            .ran()
         {
-            return Ok(());
+            return Ok(false);
         }
         if fast_prefill(tokens) {
             return crate::layers::qwen3_attention::hc_pre_prefill_mix(
@@ -53,6 +64,7 @@ impl Glm5KdaLayer {
                 self.hc.sinkhorn_iters as u32,
                 self.hc.hc_eps,
                 self.hc_pre_from_raw_mix_k,
+                norm,
                 ctx,
                 stream,
             );
@@ -79,7 +91,7 @@ impl Glm5KdaLayer {
             self.hc.hc_eps,
             stream,
         )? {
-            return Ok(());
+            return Ok(false);
         }
         ops::hc_pre(
             ctx.gpu,
@@ -98,7 +110,8 @@ impl Glm5KdaLayer {
             ctx.config.rms_norm_eps as f32,
             self.hc.hc_eps,
             stream,
-        )
+        )?;
+        Ok(false)
     }
 
     pub(super) fn hc_post(

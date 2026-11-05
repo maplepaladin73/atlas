@@ -60,13 +60,22 @@ pub struct Qwen3AttentionLayer {
     /// attn_out *= sigmoid(g_proj @ hidden_states), broadcast over head_dim.
     pub(crate) head_gate_weight: Option<DenseWeight>,
     pub(crate) head_gate_activation: HeadGateActivation,
+    /// Ripple value residuals: `blend = bf16(sigmoid(value_res_lambda))`.
+    /// `Some` makes V project from `lerp(vres_row, normed, blend)` — see
+    /// `value_residual.rs`.
+    pub(crate) valres_blend: Option<f32>,
+    /// Model-owned value-residual buffers, installed after the arena exists.
+    pub(crate) valres: Option<super::value_residual::ValresBuffers>,
+    /// The V-projection input for the forward in flight (0 = `normed`).
+    pub(crate) valres_vin: std::sync::atomic::AtomicU64,
+    pub(super) valres_lerp_k: KernelHandle,
     /// Kernel handle for per-head sigmoid gate broadcast multiply.
     pub(super) sigmoid_gate_head_broadcast_k: KernelHandle,
     pub(super) softplus_gate_head_broadcast_k: KernelHandle,
     /// Optional YaRN frequencies for standard (non-MLA) attention.
     pub(crate) yarn_inv_freq: DevicePtr,
     pub(crate) yarn_attention_factor: f32,
-    /// Post-attention output norm (Gemma-4).  
+    /// Post-attention output norm (Gemma-4).
     pub(crate) post_attn_out_norm: Option<DenseWeight>,
     /// Post-FFN output norm (Gemma-4).
     pub(crate) post_ffn_out_norm: Option<DenseWeight>,
@@ -107,13 +116,13 @@ pub struct Qwen3AttentionLayer {
     pub(super) mx8_rt: Option<super::mx8::Mx8AttnRt>,
     // ── MLA (Multi-head Latent Attention) — 2-step decode ──
     pub(crate) mla: Option<MlaWeights>,
-    /// MXFP8 twins of MLA weights keyed by the BF16 weight pointer, with the
-    /// `[n, k]` they were quantized as: verify rows and paged prefill chunks
-    /// that short (<= 32) read half the bytes; longer chunks keep BF16.
+    /// MXFP8 twins of MLA weights keyed by the BF16 pointer, with their `[n, k]`:
+    /// rows of short (<= 32) calls read half the bytes; longer keep BF16.
     pub(crate) mla_mx: Vec<(DevicePtr, [usize; 2], crate::weight_map::Mxfp8Weight)>,
-    /// NVFP4 twins of the same projections (`ATLAS_GLM_MLA_NVFP4=1`, LOSSY
-    /// opt-in: ~half the MXFP8 bytes) on the W4A16 tensor-core tier.
+    /// NVFP4 twins (`ATLAS_GLM_MLA_NVFP4=1`, LOSSY) on the W4A16 TC tier.
     pub(crate) mla_q4: Vec<(DevicePtr, crate::weight_map::QuantizedWeight)>,
+    /// The checkpoint's FP8 block q_a / q_b / kv_a / o (`mla_native.rs`).
+    pub(crate) mla_native: super::mla_native::MlaNative,
     // ── Manifold-Constrained Hyper-Connections (mHC) — DeepSeek-V4 ──
     /// Per-block HC parameters. `Some` only for DeepSeek-V4 (`hc_mult > 0`),
     /// in which case the attn/ffn residual sites use `hc_pre`/`hc_post`

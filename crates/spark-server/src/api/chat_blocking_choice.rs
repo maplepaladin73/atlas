@@ -14,6 +14,16 @@ use crate::tool_parser;
 
 use super::chat_blocking::{extract_hoisted_tool_calls, merge_hoisted_tool_calls};
 
+/// Whether GLM's native opener at `pos` opens a call: it sits outside any
+/// quote or code span of the text decoded before it.
+pub(super) fn native_opener_opens_call(state: &AppState, tokens: &[u32], pos: usize) -> bool {
+    !state
+        .tokenizer
+        .decode(&tokens[..pos])
+        .ok()
+        .is_some_and(|prefix| crate::literal_xml::state_after(&prefix).is_literal())
+}
+
 /// Build the assistant message + finish_reason for one choice. Tool
 /// parsing, validation, content-strip + refusal-classifier all live
 /// here.
@@ -32,7 +42,6 @@ pub(super) fn build_choice_message(
     cwd_hint: Option<&str>,
     choice_idx: usize,
 ) -> ir::Choice {
-    let _ = response; // currently only used for finish_reason.clone() below
     // Neutral locals — the wire annotations (URL citations) are derived
     // at encode time by the surfaces that emit them.
     let mut reasoning_content = reasoning_content_i;
@@ -77,18 +86,36 @@ pub(super) fn build_choice_message(
             tool_parser::parse_tool_calls(&output_text_i)
         };
         let mut tool_calls_i = merge_hoisted_tool_calls(hoisted_tool_calls, parsed_tool_calls);
-        if state.glm_tool_boundary.is_some() {
+        let mut undeclared_native = Vec::new();
+        if let Some(opener) = state.glm_tool_boundary {
             // Native GLM parser semantics require a declared name. Do this
             // before repair/coercion: the generic validator can fuzzy-map an
             // unknown name to the sole supplied tool, which is not authority
             // to execute a call emitted at an implicit reasoning boundary.
+            let mut undeclared = Vec::new();
             tool_calls_i.retain(|call| {
-                req.tools
+                let declared = req
+                    .tools
                     .iter()
-                    .any(|tool| tool.function.name == call.function.name)
+                    .any(|tool| tool.function.name == call.function.name);
+                if !declared {
+                    undeclared.push(call.clone());
+                }
+                declared
             });
+            // Behind a native opener an undeclared name is still a call. It
+            // skips repair and validation and reaches the client unchanged, as
+            // in the stream; the client's unknown-tool result keeps the turn.
+            let tokens = &response.output_tokens;
+            if !undeclared.is_empty()
+                && (0..tokens.len()).any(|pos| {
+                    tokens[pos] == opener && native_opener_opens_call(state, tokens, pos)
+                })
+            {
+                undeclared_native = undeclared;
+            }
         }
-        if !tool_calls_i.is_empty() {
+        if !tool_calls_i.is_empty() || !undeclared_native.is_empty() {
             let tools_ref = req.tools.clone();
             tool_parser::backfill_required_params(&mut tool_calls_i, &tools_ref);
             if state
@@ -103,6 +130,7 @@ pub(super) fn build_choice_message(
             }
             if let Some(reason) = tool_calls_i
                 .iter()
+                .chain(&undeclared_native)
                 .find_map(|tc| state.tool_guard.inspect(&tc.function.arguments).err())
             {
                 tracing::warn!(reason = reason.code(), "tool-call guard blocked a response");
@@ -118,35 +146,19 @@ pub(super) fn build_choice_message(
                     logprobs: None,
                 };
             }
-            let validated = tool_parser::validate_tool_calls(tool_calls_i, &tools_ref);
+            let mut validated = tool_parser::validate_tool_calls(tool_calls_i, &tools_ref);
+            validated.valid.extend(undeclared_native);
             if !validated.errors.is_empty() {
                 for err in &validated.errors {
                     tracing::warn!("Tool call validation error: {err}");
                 }
             }
-            // Strip orphan tool call XML tags + ```lang fences from content
-            // (Qwen3-Coder pattern: emits markdown narration AND structured
-            // tool_call for the same payload).
-            let content = content.map(|mut c| {
-                for tag in &["</parameter>", "</function>", "</tool_call>", "<tool_call>"] {
-                    c = c.replace(tag, "");
-                }
-                while let Some(start) = c.find("<function=") {
-                    let end = c[start..]
-                        .find('>')
-                        .map(|p| start + p + 1)
-                        .unwrap_or(c.len());
-                    c = format!("{}{}", &c[..start], &c[end..]);
-                }
-                while let Some(start) = c.find("```") {
-                    let after_open = start + 3;
-                    let Some(rel_close) = c[after_open..].find("```") else {
-                        break;
-                    };
-                    let close_end = after_open + rel_close + 3;
-                    c = format!("{}{}", &c[..start], &c[close_end..]);
-                }
-                c.trim().to_string()
+            // Strip orphan tool-call XML tags from narration while preserving
+            // the same bytes when they occur in a quoted/code example.
+            let content = content.map(|c| {
+                super::strip::strip_tool_markup_preserving_literals(&c)
+                    .trim()
+                    .to_string()
             });
             msg_content = content;
             if !validated.valid.is_empty() {

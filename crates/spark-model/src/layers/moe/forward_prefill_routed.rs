@@ -31,7 +31,9 @@ impl MoeLayer {
     /// Routed-expert grouped-GEMM path: upper-bound grid sizing → grouped
     /// gate+up GEMM → SiLU+mul → grouped down GEMM.
     ///
-    /// Writes routed expert outputs into `ctx.buffers.expert_down_out()`.
+    /// Writes routed expert outputs into `ctx.buffers.expert_down_out()`:
+    /// BF16, or E4M3 rows whose FP32 scales the returned pointer holds
+    /// (`ATLAS_GLM_MOE_DOWN_E4M3`, `prequant_fp4_down`).
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::unnecessary_unwrap)]
     pub(super) fn run_routed_grouped_gemm(
@@ -46,10 +48,16 @@ impl MoeLayer {
         top_k: u32,
         num_tokens: usize,
         ne: usize,
+        // `route_and_sort` already wrote the M16 worklist and the NVFP4
+        // input (`ATLAS_GLM_MOE_ROUTE_FUSE`).
+        prerouted: bool,
+        // The NVFP4 input is already in place (`sp_quant_gather.rs`): the
+        // K128W prequant path must serve, and does not quantize it again.
+        quantized: bool,
         t0: &mut Option<std::time::Instant>,
         ctx: &ForwardContext,
         stream: u64,
-    ) -> Result<()> {
+    ) -> Result<Option<DevicePtr>> {
         macro_rules! prof_step {
             ($label:expr) => {
                 if let Some(t) = t0.take() {
@@ -61,6 +69,10 @@ impl MoeLayer {
             };
         }
 
+        anyhow::ensure!(
+            !quantized || self.k128w_prequant(n, h, inter, self.verify_decode_batch(false, ctx, n)),
+            "a quantized MoE input needs the K128W prequant path"
+        );
         let avg_per_expert = (num_tokens * top_k as usize).div_ceil(ne);
         // Default to the absolute worst case (one expert receives every routed
         // token) to prevent silent truncation. An opt-in load-factor cap lets
@@ -82,7 +94,17 @@ impl MoeLayer {
         //     exact_tiles off  p90 -5.0%
         // Median barely moved either way (+0.1% vs -0.9%), so only the tail shows it.
         // The win was measured on NVFP4; scope the default to where it was measured.
-        let exact_tiles = match std::env::var("ATLAS_MOE_PREFILL_EXACT_TILES")
+        // The K128W prequant path never reads the tile count (`k128w_prequant`):
+        // a two-half pipelined pass skips the host read there (it would stall
+        // the other half's issue), keeping the worst-case bound for any arm
+        // that would still take it. A whole pass keeps the read: without its
+        // per-layer wait the host queues far ahead, and the chunk measured
+        // ~45% slower in every kernel on the chain (pipe2k-off.sqlite).
+        let k128w = n > 64
+            && crate::layers::glm_sp::pipelined()
+            && self.k128w_prequant(n, h, inter, self.verify_decode_batch(false, ctx, n));
+        let exact_tiles = !k128w
+            && match std::env::var("ATLAS_MOE_PREFILL_EXACT_TILES")
             .ok()
             .as_deref()
         {
@@ -106,8 +128,10 @@ impl MoeLayer {
             num_tokens.div_ceil(64) as u32
         } else if exact_tiles {
             let mut offsets = vec![0u8; (ne + 1) * 4];
+            let read = prefill_offset_read::OffsetRead::start();
             ctx.gpu
                 .copy_d2h_on_stream(expert_offsets, &mut offsets, stream)?;
+            read.finish();
             let eoff: Vec<i32> = offsets
                 .chunks_exact(4)
                 .map(|raw| i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
@@ -121,6 +145,8 @@ impl MoeLayer {
             }
             exact_eoff = Some(eoff);
             max_rows.div_ceil(64).max(1).min(worst_case_m_tiles)
+        } else if k128w {
+            worst_case_m_tiles
         } else {
             std::env::var("ATLAS_MOE_PREFILL_MAX_LOAD_FACTOR")
                 .ok()
@@ -203,6 +229,8 @@ impl MoeLayer {
         // 16 KiB even for a one-row arena: enough for the K=5 gate/up worklist
         // (640 items + counter) without allocations.
         let compact_k5 = std::env::var("ATLAS_GLM_K5_COMPACT_MOE").as_deref() == Ok("1")
+            && !crate::layers::glm_packed_scope::active()
+            && !crate::layers::canonical_verify::enabled()
             && ctx.config.model_type == "glm5_next"
             && n == 5
             && total_expanded == 40
@@ -210,7 +238,7 @@ impl MoeLayer {
             && h == 4096
             && inter == 2048
             && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
-            && self.nvfp4_prequant_moe
+            && self.prequant_moe()
             && self.moe_w4a4_prequant_t_k64.0 != 0
             && self.moe_w4a4_prequant_t_k64_compact.0 != 0
             && self.moe_build_tile_worklist_k.0 != 0;
@@ -242,7 +270,7 @@ impl MoeLayer {
             )?
         {
             prof_step!("grouped_q38");
-            return Ok(());
+            return Ok(None);
         }
         // Host expert_offsets from the CUTLASS gate_up, reused by down to skip
         // a second D2H + host-blocking synchronize.
@@ -337,7 +365,7 @@ impl MoeLayer {
                         max_m_tiles,
                         stream,
                     )?;
-                } else if self.nvfp4_prequant_moe && self.moe_w4a4_prequant_t_k64.0 != 0 {
+                } else if self.prequant_moe() && self.moe_w4a4_prequant_t_k64.0 != 0 {
                     // Verify-decode batches take the M16 row tiles when
                     // selected (ATLAS_GLM_MOE_DECODE_M16), else the compact
                     // M64 worklist; any other batch the K128W grid.
@@ -349,9 +377,14 @@ impl MoeLayer {
                         [n, top_k],
                         [h, inter],
                         num_experts,
+                        prerouted,
                         ctx,
                         stream,
                     )?;
+                    anyhow::ensure!(
+                        wide.is_some() || !prerouted,
+                        "fused MoE routing: {n} rows left the M16 grid it built a worklist for"
+                    );
                     silu_done = self.prequant_fp4_gate_up(
                         expert_input,
                         gp,
@@ -367,6 +400,7 @@ impl MoeLayer {
                         max_m_tiles,
                         compact,
                         wide,
+                        prerouted || quantized,
                         ctx,
                         stream,
                     )?;
@@ -525,6 +559,7 @@ impl MoeLayer {
 
         // 6. Activation+mul for routed experts + grouped down GEMM (K64 pipelined).
         let expert_down_out = ctx.buffers.expert_down_out();
+        let mut e4m3_scales = None;
         if max_m_tiles > 0 {
             if self.nvfp4_mmq_layout {
                 self.run_nvfp4_mmq_silu_down(
@@ -543,7 +578,7 @@ impl MoeLayer {
                     stream,
                 )?;
                 prof_step!("grouped_silu_down");
-                return Ok(());
+                return Ok(None);
             }
             // Feature-1: fold the routed-expert gate/up_proj LoRA deltas onto the
             // sorted `expert_gate_out`/`expert_up_out` BEFORE `silu_mul` consumes
@@ -568,7 +603,7 @@ impl MoeLayer {
                     .cutlass_grouped_host
                     .as_ref()
                     .is_some_and(|t| t.down.is_some());
-            let fused_nvfp4_down = self.nvfp4_prequant_moe
+            let fused_nvfp4_down = self.prequant_moe()
                 && self.nvfp4_fused_silu_quant
                 && self.silu_mul_quant_nvfp4_k.0 != 0
                 && !cutlass_down;
@@ -581,6 +616,7 @@ impl MoeLayer {
                     expert_up_out,
                     total_expanded,
                     inter,
+                    [expert_offsets.0, num_experts as u64],
                     ctx,
                     stream,
                 )?;
@@ -651,8 +687,13 @@ impl MoeLayer {
                         max_m_tiles,
                         stream,
                     )?;
-                } else if self.nvfp4_prequant_moe && self.moe_w4a4_prequant_t_k64.0 != 0 {
+                } else if self.prequant_moe() && self.moe_w4a4_prequant_t_k64.0 != 0 {
                     if !fused_nvfp4_down {
+                        anyhow::ensure!(
+                            self.input_scales.is_none(),
+                            "ATLAS_GLM_FP4L_INPUT_SCALES needs the fused SiLU quantization \
+                             (ATLAS_NVFP4_FUSED_SILU_QUANT=1)"
+                        );
                         let a_packed = expert_up_out;
                         let a_scale = a_packed.offset(total_expanded as usize * inter as usize / 2);
                         ops::quantize_bf16_to_nvfp4(
@@ -666,7 +707,7 @@ impl MoeLayer {
                             stream,
                         )?;
                     }
-                    self.prequant_fp4_down(
+                    e4m3_scales = self.prequant_fp4_down(
                         expert_up_out,
                         dp,
                         expert_down_out,
@@ -815,6 +856,6 @@ impl MoeLayer {
         prof_step!("grouped_silu_down");
         super::forward_prefill_q38::finish_q38_check(ctx, total_expanded, h, stream)?;
 
-        Ok(())
+        Ok(e4m3_scales)
     }
 }

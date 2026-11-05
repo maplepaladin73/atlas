@@ -513,6 +513,24 @@ pub struct ModelConfig {
     #[serde(skip)]
     pub embed_scale: f32,
 
+    // ── Ripple (`ricursive`) specific ──
+    /// SwiGLU activation clamp: `gate.clamp(max=c)`, `up.clamp(-c, c)` before
+    /// `silu(gate) * up`. 0.0 = disabled (every other model).
+    #[serde(skip)]
+    pub ffn_clamp_threshold: f32,
+    /// Value residuals: every attention layer projects V from
+    /// `lerp(scaled layer-0 embeddings, normed hidden, sigmoid(lambda_l))`
+    /// instead of the normed hidden alone.
+    #[serde(skip)]
+    pub value_residual: bool,
+    /// Ripple: which layers are sliding-window (RoPE + window) vs global
+    /// (NoPE, full). `layer_types` itself lists every Ripple layer as
+    /// `FullAttention` — the Gemma-4 convention — because model-level paths
+    /// (verify, capture, decode dispatch) test `== FullAttention` for
+    /// "is an attention layer"; the window is a per-layer attention setting.
+    #[serde(skip)]
+    pub sliding_layers: Vec<bool>,
+
     // ── MiniMax M2 specific ──
     /// MoE routing activation. "" = default softmax. "sigmoid" = DeepSeek-V3
     /// / MiniMax-M2 style: raw gate logits pass through sigmoid to produce
@@ -527,6 +545,12 @@ pub struct ModelConfig {
     /// per MoE layer).
     #[serde(default)]
     pub use_routing_bias: bool,
+    /// The MoE router's logits stay FP32 into top-k (`moe_router_dtype:
+    /// "float32"`, GLM-5): BF16 operands, FP32 accumulation and an unrounded
+    /// FP32 logit, as the reference's `GateLinear(out_dtype=float32)`.
+    /// False: the router stores BF16 logits.
+    #[serde(default)]
+    pub router_logits_f32: bool,
     /// QK normalization granularity. "" = none (Qwen3-Next default).
     /// "per_layer" = each attention layer has its own learned q_layernorm /
     /// k_layernorm weight of shape `[head_dim]`, applied after Q/K projection
@@ -558,6 +582,14 @@ pub struct ModelConfig {
     /// is what the drafter's `fc` projection expects.
     #[serde(default)]
     pub dflash_capture_layers: Vec<usize>,
+
+    /// Prompt positions a bidirectional DFlash drafter's context window keeps
+    /// (the served window, capped at `max_seq_len`); `None` when DFlash is
+    /// off or its window is not that (a causal head). Every rank sets it from
+    /// the same arguments, so it can gate decisions both ranks must agree on
+    /// (sequence-parallel prefill keeps the window on rank 0).
+    #[serde(default)]
+    pub dflash_ctx_window: Option<usize>,
 
     /// LoRA adapter rank ceiling (`--max-lora-rank`). `0` = LoRA disabled.
     /// Set programmatically before model build (never parsed from the HF
@@ -728,14 +760,20 @@ pub struct QuantizationConfig {
 }
 
 /// One `quantized_layers` entry: the algorithm applied to that module path
-/// (`"NVFP4"`, `"FP8"`, `"FP8_PB_WO"`, …) plus its scaling group when given.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// (`"NVFP4"`, `"MXFP8"`, `"W4A16_NVFP4"`, `"FP8_PB_WO"`, …) plus its scaling
+/// group when given.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QuantLayerSpec {
     pub quant_algo: String,
     pub group_size: usize,
-    /// ModelOpt scale-stream encoding, e.g. `"csf"` or `"csf_32x2_v1"`.
-    /// `Some` marks the FP4-Local family (compressed scale streams beside
-    /// `weight_scale`); `None` for plain row scales.
+    /// How the block scales are STORED, when not plainly: `"csf"` means each
+    /// `weight_scale` ships as a compressed `nvfp4_csf_fixed` +
+    /// `nvfp4_csf_exceptions` pair (nvidia Qwen FP4-Local's routed experts);
+    /// `"csf_32x2_v1"` as five `csf32_{bases,codes,page_bases,offsets,
+    /// exceptions}` components (nvidia GLM-5.3-Flash-FP4-Local's). The
+    /// safetensors loaders decode both at upload regardless of this field
+    /// (`spark_runtime::weights::nvfp4_csf`, `nvfp4_csf32`); it is read to
+    /// REPORT the format. `None` for plain row scales.
     pub weight_scale_encoding: Option<String>,
     /// Per-module block-quant tile, e.g. `[1, 32]` (MXFP8's 1×32 group,
     /// spelled as a tile) or `[128, 128]` (FP8_PB_WO). Empty when absent.
@@ -801,8 +839,8 @@ pub use parsers::{
 };
 pub(crate) use parsers::{
     parse_deepseek_v4, parse_gemma4_params, parse_glm5_next, parse_glm5_vision_config,
-    parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_qwen4_exp, parse_step3p7,
-    parse_vision_config,
+    parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_qwen4_exp, parse_ricursive,
+    parse_step3p7, parse_vision_config,
 };
 pub use vision::{OmniVisionConfig, PixelBounds, VisionConfig, VisionTokenBudgets};
 

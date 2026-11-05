@@ -154,20 +154,16 @@ impl TransformerModel {
             "dense_gemv_fp8w_batch2",
         );
         // BF16 dual-GEMV (batch=2) for the K=2 verify lm_head on a BF16 LM
-        // head. HIP only: the strix-hip kernel is bit-identical to two
-        // `dense_gemv_bf16` calls (same 32-lane walk per row, same shuffle
-        // reduction), while the NVIDIA builds use 64 lanes per row plus a
-        // shared-memory reduction, which reorders the sum. Elsewhere the
-        // handle stays 0 and the two-GEMV fallback runs unchanged.
-        let dense_gemv_bf16_batch2_kernel = if cfg!(atlas_hip) {
-            crate::layers::try_kernel(
-                gpu.as_ref(),
-                "dense_gemv_bf16_batch2",
-                "dense_gemv_bf16_batch2",
-            )
-        } else {
-            spark_runtime::gpu::KernelHandle(0)
-        };
+        // head. Every build's kernel is bit-identical to two `dense_gemv_bf16`
+        // calls: the strix-hip pair walks 32 lanes per row, the gb10/strix
+        // (NVIDIA) pair 64 lanes per row with the same smem pair-sum, and in
+        // both the second token is only an extra accumulator. Absent kernel ->
+        // handle 0 -> the two-GEMV fallback.
+        let dense_gemv_bf16_batch2_kernel = crate::layers::try_kernel(
+            gpu.as_ref(),
+            "dense_gemv_bf16_batch2",
+            "dense_gemv_bf16_batch2",
+        );
         let dense_gemm_kernel = gpu.kernel("gemm", "dense_gemm_bf16")?;
         let dense_gemv_batchm_kernel = gpu
             .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
@@ -234,6 +230,7 @@ impl TransformerModel {
         let ssm_snapshots = ssm_pools.snapshots;
         let ssm_tier_store = ssm_pools.tier_store;
         let has_mtp = ssm_pools.has_mtp;
+        let native_glm_mtp = ssm_pools.native_glm_mtp;
         let dflash_kgamma = ssm_pools.dflash_kgamma;
         if ssm_checkpoint_interval > 0 && ssm_cache_slots > 0 {
             tracing::info!(
@@ -459,8 +456,9 @@ impl TransformerModel {
             Some(save)
         };
 
-        // EP command buffer for token broadcast (4 bytes, u32)
-        let ep_cmd_buf = gpu.alloc(4)?;
+        // EP command buffer for token broadcast (a u32 at 0), and one u32
+        // per rank 64 bytes apart for `ep_min_u32`'s gather.
+        let ep_cmd_buf = gpu.alloc(super::types::EP_CMD_BUF_BYTES)?;
 
         // SOLID Incr-4: dedicated fixed-address buffer for the batched-decode MoE
         // per-row fold map. max_batch_size i32 rows (e.g. 32·4 = 128 B). Allocated
@@ -510,11 +508,14 @@ impl TransformerModel {
                     tracing::warn!("bf16_add_inplace kernel not found (send/recv disabled): {e}")
                 }
             }
-            // Graph-capturable RDMA collectives (ATLAS_RDMA_ONESHOT=1); a
-            // backend without them ignores the handle.
-            if let Ok(k) = gpu.kernel("rdma_oneshot", "rdma_oneshot_bf16") {
-                comm.set_oneshot_kernel(k.0);
-            }
+        }
+        // Graph-capturable RDMA collectives (ATLAS_RDMA_ONESHOT=1) over the
+        // pair or the chain; a backend without them ignores the handle.
+        if let Some(ref comm) = comm
+            && comm.world_size() > 1
+            && let Ok(k) = gpu.kernel("rdma_oneshot", comm.oneshot_kernel())
+        {
+            comm.set_oneshot_kernel(k.0);
         }
 
         // Allocate pinned host staging buffer for batched metadata H2D.
@@ -615,12 +616,18 @@ impl TransformerModel {
         };
 
         // Embedding scale (Gemma-4: sqrt(hidden_size)). Only load if model uses it.
+        // A config that asks for a scale and a target that cannot apply it is
+        // a load error: skipping it ran Ripple on unscaled embeddings (the
+        // strix-hip tree had no `embed_scale` module) with nothing but a WARN.
         let embed_scale_kernel = if config.embed_scale > 0.0 {
             gpu.kernel("embed_scale", "bf16_scale_inplace")
-                .unwrap_or_else(|e| {
-                    tracing::warn!("embed_scale kernel not found: {e}");
-                    KernelHandle(0)
-                })
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "config embed_scale {} needs embed_scale::bf16_scale_inplace, \
+                     which this kernel target does not ship: {e}",
+                        config.embed_scale
+                    )
+                })?
         } else {
             KernelHandle(0)
         };
@@ -658,6 +665,15 @@ impl TransformerModel {
             && kv_cache.dtype() == spark_runtime::kv_cache::KvCacheDtype::Fp8;
         // Sharded latents exchange with the peer inside attention (eager only).
         let latent_shard = kv_cache.latent_shard().is_some();
+        // Ripple value residuals: per-row embedding shadow + V-input scratch.
+        let mut layers = layers;
+        if config.value_residual {
+            crate::layers::qwen3_attention::value_residual::install_value_residual(
+                &mut layers,
+                buffers.sizes().hidden_states,
+                gpu.as_ref(),
+            )?;
+        }
         // Feature-2 overlay kernels: resolve before `gpu` is moved into Self.
         let overlay_kernels = crate::layers::ops::token_overlay::OverlayKernels::new(gpu.as_ref());
         let warm = super::warm_turn::WarmTurn::from_env(&config.model_type)?;
@@ -691,6 +707,7 @@ impl TransformerModel {
             lm_head_fp8,
             layers,
             buffers,
+            prefill_pipe: None,
             lora: None,
             lora_install_attempted: false,
             lora_rotatable: false,
@@ -746,6 +763,7 @@ impl TransformerModel {
             profile,
             profile_first_pending: std::sync::atomic::AtomicBool::new(profile_first),
             proposer,
+            native_glm_mtp,
             draft_assist: None,
             lightning_dspark_identity: Default::default(),
             mtp_hidden_save,
@@ -765,10 +783,13 @@ impl TransformerModel {
             mtp_prefill_capture_gen: std::sync::atomic::AtomicU64::new(0),
             dspark_sequence_generation: std::sync::atomic::AtomicU64::new(0),
             mtp_carry: parking_lot::Mutex::new(None),
+            native_mtp_prefix: parking_lot::Mutex::new(Vec::new()),
             mtp_store_range: parking_lot::Mutex::new((0, 0)),
             dflash_hidden_save,
             dflash_hidden_save_rows,
             dflash_hidden_save_nseq,
+            // `build_model` installs the reserved store (`set_dflash_warm_store`).
+            dflash_warm_store: crate::layers::dflash_head::WarmCtxStore::disabled(),
             dflash_capture_layers,
             verify2_graph: Mutex::new(std::collections::HashMap::new()),
             verify3_graph: Mutex::new(std::collections::HashMap::new()),
@@ -796,12 +817,6 @@ impl TransformerModel {
             last_mtp_hidden_idx: std::sync::atomic::AtomicUsize::new(0),
             verify_row_masks: Default::default(),
             vision_encoder,
-            vision_embed_patches: Mutex::new(0),
-            vision_image_grids: Mutex::new(Vec::new()),
-            vision_row_base: Mutex::new(0),
-            vision_grid_base: Mutex::new(0),
-            vision_owned_images: Mutex::new(0),
-            vision_slice_rows: Mutex::new(0),
             pinned_staging,
             ssm_checkpoint_interval,
             ssm_state_norm_kernel: ssm_norm_k,

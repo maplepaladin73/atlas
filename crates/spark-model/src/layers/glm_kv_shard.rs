@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Token-sharded GLM MLA latents over the TP pair (`ATLAS_GLM_KV_SHARD=1`).
+//! Token-sharded GLM MLA latents over the TP ranks (`ATLAS_GLM_KV_SHARD=1`).
 //!
 //! Each KV block's latents live on one rank
 //! (`spark_runtime::kv_cache::LatentShard`): logical block `l` of every
-//! sequence on rank `l % 2`, which the allocator guarantees although the
+//! sequence on rank `l % world`, which the allocator guarantees although the
 //! ranks' physical ids differ; the semantic-index keys stay
-//! replicated, so both ranks still select the same top-k tokens locally with
+//! replicated, so every rank still selects the same top-k tokens locally with
 //! no exchange. Attention then runs in one of two exact forms
-//! (docs/glm-kv-shard.md):
+//! (docs/glm-kv-shard.md), described here for the pair; beyond two ranks (the
+//! TP4 chain) the swaps become all-gathers ([`ChainLayout`], [`gather`]):
 //!
 //! - **merge** (at most [`MERGE_MAX_ROWS`] rows: decode, DFlash verify,
 //!   short prefill tails): the ranks swap their heads' absorbed queries, each
@@ -18,12 +19,14 @@
 //!   whole latent history — its own blocks plus the peer's, exchanged — in a
 //!   scratch view the unchanged kernels read through an identity table.
 //!
-//! Two opt-in refinements of the merge form, both exact:
-//! `ATLAS_GLM_KV_SHARD_COMPACT=1` packs each row's owned IDs to the front so
-//! the attention kernels walk only the tokens this rank stores, and merges
-//! the peer's partial where it landed; `ATLAS_GLM_KV_SHARD_OVERLAP=1` runs
-//! the two exchanges on a side stream beside the compute they do not depend
-//! on ([`overlapped_exchange`]).
+//! The merge form packs each row's owned IDs to the front so the attention
+//! kernels walk only the tokens this rank stores, and merges the peer's
+//! partial where it landed. Its arithmetic is the canonical form's
+//! (`ops::glm_sparse_canonical`), which an unsharded pair runs for the same
+//! owners, so a pair computes the same bits with the shard on or off.
+//! `ATLAS_GLM_KV_SHARD_OVERLAP=1` runs the two exchanges on a side stream
+//! beside the compute they do not depend on ([`overlapped_exchange`]); the
+//! arithmetic is unchanged.
 //!
 //! This module holds the policy, the scratch layout both forms carve from
 //! the shard's one allocation, and the pair exchange.
@@ -32,8 +35,23 @@ use anyhow::{Result, bail, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kv_cache::{ExchangeLane, KvCacheConfig, LatentShard, LatentShardSpec};
 
-/// Heads per rank (GLM-5.3: 64 heads over TP2) = one sparse-kernel launch.
+/// Heads per rank of the pair (GLM-5.3: 64 heads over TP2) = one
+/// sparse-kernel launch's head group.
 pub const HEADS: u32 = 32;
+/// GLM-5.3's attention heads, which a shard spreads over its ranks.
+pub const TOTAL_HEADS: u32 = 64;
+
+/// This rank's heads when `world` ranks share [`TOTAL_HEADS`].
+pub fn local_heads(world: usize) -> u32 {
+    TOTAL_HEADS / world as u32
+}
+
+/// Logical blocks one view-exchange round carries per rank: the pair's
+/// [`PIECE_BLOCKS`], fewer beyond it so the `world` parts of a round fit the
+/// pair's two pieces.
+pub fn piece_blocks(world: usize) -> usize {
+    PIECE_BLOCKS * 2 / world.max(2)
+}
 /// Latent width (`kv_lora_rank`).
 pub const LATENT: u32 = 512;
 /// Selected IDs per row (`index_topk + index_kpool - 1`).
@@ -92,7 +110,10 @@ pub fn requested() -> Result<bool> {
 /// The merge form's opt-in refinements and the shard's self-check, read once.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MergeTuning {
-    /// `ATLAS_GLM_KV_SHARD_COMPACT=1`.
+    /// `ATLAS_GLM_KV_SHARD_COMPACT=1`: accepted for older profiles. The
+    /// merge form is always compact now (the canonical form an unsharded pair
+    /// matches bit for bit is), so the value changes nothing but is still
+    /// held to 0/1, to the shard, and to its peer's.
     pub compact: bool,
     /// `ATLAS_GLM_KV_SHARD_OVERLAP=1`; off under `..._CHECK=1`, whose own
     /// exchange would run inside an overlap window. Decides at boot whether
@@ -203,17 +224,17 @@ fn align(bytes: usize) -> usize {
     bytes.next_multiple_of(256)
 }
 
-/// CTAs (rows x partitions) past which more partitions only cost scratch:
-/// four waves of GB10's 48 SMs.
-const MAX_PARTIAL_CTAS: u32 = 192;
-
-/// Local sparse partitions of a merge-form owner of `rows` rows: the
-/// verify split count, capped so the scratch stays bounded.
-pub fn merge_splits(rows: u32) -> u32 {
-    crate::layers::ops::sparse_split_count(rows, HEADS, WIDTH)
-        .min(MAX_SPLITS)
-        .min((MAX_PARTIAL_CTAS / rows.max(1)).max(1))
-}
+/// Sparse partitions of each token group (the tokens one rank stores, about
+/// half a row's selection) of every merge-form owner, whatever its rows. A
+/// row's partition boundaries then follow only its own selection, so its bits
+/// do not depend on the rows beside it: a DFlash verify's width follows the
+/// drafter's confidence, and a count per width made the target's output
+/// follow the drafter's state. Four fills GB10's 48 SMs in one wave up to six
+/// rows (two groups x rows x 4 CTAs); `scripts/dev/glm_kv_shard_bench.cu`
+/// (`MERGE_SPLITS=n`) times other counts. The shard and the canonical form
+/// both partition with it, which their bitwise equality needs.
+pub const MERGE_SPLITS: u32 = 4;
+const _: () = assert!(MERGE_SPLITS > 1 && MERGE_SPLITS <= MAX_SPLITS);
 
 /// Offsets (from the work region) of one merge-form owner's buffers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -283,6 +304,10 @@ impl MergeLayout {
     }
 }
 
+#[path = "glm_kv_shard_chain.rs"]
+mod chain;
+pub use chain::{ChainLayout, gather, head_slot};
+
 /// The shard scratch carved by both attention forms and the cache write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScratchLayout {
@@ -307,15 +332,24 @@ pub struct ScratchLayout {
 
 impl ScratchLayout {
     pub fn new(view_blocks: usize, write_rows: usize, block_bytes: usize) -> Self {
-        let piece_bytes = PIECE_BLOCKS * block_bytes;
-        // Every sharded attention and cache write asks for the layout.
-        static WIDEST_MERGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let merge = *WIDEST_MERGE.get_or_init(|| {
-            (1..=MERGE_MAX_ROWS as u32)
-                .map(|rows| MergeLayout::new(rows, merge_splits(rows)).total)
-                .max()
-                .unwrap_or(0)
-        });
+        Self::for_world(2, view_blocks, write_rows, block_bytes)
+    }
+
+    /// [`Self::new`] for `world` ranks: `world` view pieces of
+    /// [`piece_blocks`] and, beyond the pair, the [`ChainLayout`] merge.
+    pub fn for_world(
+        world: usize,
+        view_blocks: usize,
+        write_rows: usize,
+        block_bytes: usize,
+    ) -> Self {
+        let piece_bytes = piece_blocks(world) * block_bytes;
+        let rows = MERGE_MAX_ROWS as u32;
+        let merge = if world == 2 {
+            MergeLayout::new(rows, MERGE_SPLITS).total
+        } else {
+            ChainLayout::new(rows, world).total
+        };
         let mut at = 0usize;
         let mut take = |bytes: usize| {
             let offset = at;
@@ -326,9 +360,9 @@ impl ScratchLayout {
         let mine_slot = take(view_blocks * 4);
         let mine_dst = take(view_blocks * 4);
         let peer_dst = take(view_blocks * 4);
-        let check = take(16);
+        let check = take(8 * world.max(2));
         let slots = take(write_rows * 8);
-        let work = take((2 * align(piece_bytes)).max(merge));
+        let work = take((world.max(2) * align(piece_bytes)).max(merge));
         Self {
             view,
             mine_slot,
@@ -345,7 +379,8 @@ impl ScratchLayout {
 
     /// The layout of `shard`'s scratch over `config`'s widest latent block.
     pub fn of(shard: &LatentShard, config: &KvCacheConfig) -> Result<Self> {
-        let layout = Self::new(
+        let layout = Self::for_world(
+            shard.spec.world,
             shard.spec.view_blocks,
             shard.spec.write_rows,
             latent_block_bytes(config),
@@ -366,19 +401,20 @@ pub fn latent_block_bytes(config: &KvCacheConfig) -> usize {
         .unwrap_or(0)
 }
 
-/// The shard spec of `rank` for sequences up to `max_seq_len` tokens and
-/// cache writes of up to `write_rows` rows.
+/// The shard spec of `rank` of `world` for sequences up to `max_seq_len`
+/// tokens and cache writes of up to `write_rows` rows.
 pub fn spec(
-    rank: usize,
+    (rank, world): (usize, usize),
     config: &KvCacheConfig,
     max_seq_len: usize,
     write_rows: usize,
 ) -> LatentShardSpec {
     let view_blocks = (max_seq_len + VIEW_SLACK_TOKENS).div_ceil(config.block_size);
-    let layout = ScratchLayout::new(view_blocks, write_rows, latent_block_bytes(config));
+    let block_bytes = latent_block_bytes(config);
+    let layout = ScratchLayout::for_world(world, view_blocks, write_rows, block_bytes);
     LatentShardSpec {
         rank,
-        world: 2,
+        world,
         scratch_bytes: layout.total,
         view_blocks,
         write_rows,
@@ -410,83 +446,9 @@ pub fn pair_exchange(
     comm.group_end()
 }
 
-/// The communicator inside an [`overlapped_exchange`] window: the pair's
-/// rank and size, and an error from every operation that would use the pair.
-/// The pair orders its sends by stream order and counts landings in one
-/// place, so a second user beside the lane's exchange would corrupt or hang
-/// both ranks without an error of its own.
-pub struct WindowComm<'a>(&'a dyn spark_comm::CommBackend);
-
-impl WindowComm<'_> {
-    fn refuse<T>(&self, what: &str) -> Result<T> {
-        bail!(
-            "{what} inside a GLM KV shard overlap window on rank {}: the pair is carrying the lane's exchange",
-            self.0.rank()
-        )
-    }
-}
-
-impl spark_comm::CommBackend for WindowComm<'_> {
-    fn all_reduce(&self, _: u64, _: usize) -> Result<()> {
-        self.refuse("all-reduce")
-    }
-    fn all_gather(&self, _: u64, _: u64, _: usize) -> Result<()> {
-        self.refuse("all-gather")
-    }
-    fn reduce_scatter(&self, _: u64, _: u64, _: usize) -> Result<()> {
-        self.refuse("reduce-scatter")
-    }
-    fn broadcast(&self, _: u64, _: usize, _: usize) -> Result<()> {
-        self.refuse("broadcast")
-    }
-    fn barrier(&self) -> Result<()> {
-        self.refuse("barrier")
-    }
-    fn peer_exchange_async(&self, _: u64, _: u64, _: usize, _: u64) -> Result<()> {
-        self.refuse("peer exchange")
-    }
-    fn exchange_async(&self, _: u64, _: u64, _: usize, _: bool, _: u64) -> Result<bool> {
-        self.refuse("exchange")
-    }
-    fn send_to(&self, _: u64, _: usize, _: usize, _: u64) -> Result<()> {
-        self.refuse("send")
-    }
-    fn recv_from(&self, _: u64, _: usize, _: usize, _: u64) -> Result<()> {
-        self.refuse("receive")
-    }
-    fn rank(&self) -> usize {
-        self.0.rank()
-    }
-    fn world_size(&self) -> usize {
-        self.0.world_size()
-    }
-}
-
-/// [`pair_exchange`] on the shard's side stream, so the compute stream runs
-/// `during` while the payload is in flight, and waits for it to land after.
-///
-/// `during` must not read `recv` or write `send`, and cannot use the pair:
-/// only this fence orders the side stream against the compute stream, so
-/// the communicator it is handed (give it to whatever `during` calls)
-/// refuses every pair operation. The wait is enqueued even when `during`
-/// fails. Both ranks run the same exchanges in the same order, so an overlap
-/// only moves where each waits.
-pub fn overlapped_exchange<T>(
-    gpu: &dyn GpuBackend,
-    comm: &dyn spark_comm::CommBackend,
-    lane: ExchangeLane,
-    (send, recv, bytes): (DevicePtr, DevicePtr, usize),
-    stream: u64,
-    during: impl FnOnce(&WindowComm) -> Result<T>,
-) -> Result<T> {
-    gpu.record_event(lane.begun, stream)?;
-    gpu.stream_wait_event(lane.stream, lane.begun)?;
-    pair_exchange(comm, send, recv, bytes, lane.stream)?;
-    gpu.record_event(lane.landed, lane.stream)?;
-    let out = during(&WindowComm(comm));
-    gpu.stream_wait_event(stream, lane.landed)?;
-    out
-}
+#[path = "glm_kv_shard_window.rs"]
+mod window;
+pub use window::{WindowComm, overlapped_exchange};
 
 #[cfg(test)]
 #[path = "glm_kv_shard_tests.rs"]

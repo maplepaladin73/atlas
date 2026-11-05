@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! DFlash2 2-tap grouped dynamic causal convolution.
+//! DFlash2 grouped dynamic causal convolution (`conv_kernel_size` taps; 2 on
+//! the Qwen drafters, 4 on Ripple's).
 //!
 //! Wraps attention and MLP sublayers:
 //! - `prepare`: projects input states through `kernel_projection` to generate
@@ -13,12 +14,22 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
-use crate::weight_map::DenseWeight;
+use crate::weight_map::{DenseWeight, Mxfp8Weight, QuantizedWeight};
+
+/// A smaller copy of `kernel_projection` the delta GEMM reads instead
+/// (`ATLAS_DFLASH_CONV_TWIN`, `twins.rs`). It changes drafts only.
+#[derive(Clone, Copy, Debug)]
+pub enum ConvTwin {
+    Nvfp4(QuantizedWeight),
+    Mxfp8(Mxfp8Weight),
+}
 
 #[derive(Clone)]
 pub struct Dflash2Conv {
     pub base_kernel: DenseWeight,
     pub kernel_projection: DenseWeight,
+    /// `kernel_projection`'s twin, when one was installed.
+    pub twin: Option<ConvTwin>,
     pub num_groups: usize,
     pub group_size: usize,
     pub kernel_size: usize,
@@ -37,11 +48,18 @@ impl Dflash2Conv {
         Self {
             base_kernel,
             kernel_projection,
+            twin: None,
             num_groups,
             group_size,
             kernel_size,
             hidden_size,
         }
+    }
+
+    /// Byte offset of the output-side coefficients within one delta row
+    /// (`[input taps | output taps] x num_groups` BF16).
+    pub fn output_delta_offset(&self) -> usize {
+        self.kernel_size * self.num_groups * 2
     }
 
     /// Project input states to dynamic kernel delta and apply input-side convolution.
@@ -127,10 +145,11 @@ impl Dflash2Conv {
                 .arg_u32(h)
                 .arg_u32(self.group_size as u32)
                 .arg_u32(self.num_groups as u32)
+                .arg_u32(self.kernel_size as u32)
                 .launch(stream)?;
         }
 
-        let output_delta = delta_buf.offset(2 * self.num_groups * 2);
+        let output_delta = delta_buf.offset(self.output_delta_offset());
         Ok(output_delta)
     }
 
@@ -146,7 +165,11 @@ impl Dflash2Conv {
         stream: u64,
     ) -> Result<()> {
         let h = self.hidden_size as u32;
-        let output_base_kernel = self.base_kernel.weight.offset(2 * self.hidden_size * 2);
+        // base_kernel is [2 (input, output), kernel_size, hidden] BF16.
+        let output_base_kernel = self
+            .base_kernel
+            .weight
+            .offset(self.kernel_size * self.hidden_size * 2);
 
         if let Some(k) = conv_kernel {
             let total_elems = gamma * h;
@@ -163,6 +186,7 @@ impl Dflash2Conv {
                 .arg_u32(h)
                 .arg_u32(self.group_size as u32)
                 .arg_u32(self.num_groups as u32)
+                .arg_u32(self.kernel_size as u32)
                 .launch(stream)?;
         }
         Ok(())

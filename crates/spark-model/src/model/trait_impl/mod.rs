@@ -26,8 +26,10 @@ mod decode_a3;
 mod decode_a_diag;
 mod decode_b;
 mod decode_b2;
+mod decode_canonical;
 mod decode_checkpoint;
 mod decode_graph_key;
+mod drafter_anchor;
 pub(super) mod drafter_prefill;
 mod entry;
 mod ep_misc;
@@ -36,12 +38,14 @@ mod exact_verify_check;
 pub(crate) mod finish_leaf;
 pub(crate) mod gdn_commit_fuse;
 mod graph_borrow;
+mod kda_commit;
 mod lm_head_batched;
 pub(crate) use lm_head_batched::lm_head_batch_gemv_enabled;
 mod lm_head_dp4a;
 mod meta;
 mod meta_argmax;
 mod mtp_stream_rows;
+mod native_mtp_context;
 mod prefill_a;
 pub(in crate::model) mod prefill_b;
 mod prefill_c;
@@ -64,6 +68,23 @@ pub(in crate::model) mod verify_rows;
 impl Model for TransformerModel {
     fn verify_logits_argmax_only(&self) -> bool {
         self.glm_verify_logits_argmax_only()
+    }
+
+    fn verify_split_sampling(&self) -> bool {
+        self.glm_verify_sample_supported()
+    }
+
+    fn verify_split_candidates(
+        &self,
+        rows: usize,
+        temperature: f32,
+        specials: &[u32],
+    ) -> Result<Vec<crate::model::SplitRow>> {
+        self.glm_verify_candidates(rows, temperature, specials)
+    }
+
+    fn verify_split_full_rows(&self, rows: usize, out: &mut [u8]) -> Result<()> {
+        self.glm_verify_full_rows(rows, out)
     }
 
     fn lightning_dspark_product_policy(
@@ -92,8 +113,22 @@ impl Model for TransformerModel {
         (b.window, b.request)
     }
 
-    fn prepare_vision_embed(&self, images: &[crate::VisionItem]) -> Result<()> {
-        self.prepare_vision_embed_dispatch(images)
+    fn prepare_vision_embed(
+        &self,
+        seq: &mut SequenceState,
+        images: Vec<crate::VisionItem>,
+    ) -> Result<()> {
+        self.prepare_vision_embed_dispatch(seq, images)
+    }
+    fn prepare_vision_embed_for_chunked(
+        &self,
+        seq: &mut SequenceState,
+        images: Vec<crate::VisionItem>,
+    ) -> Result<()> {
+        self.prepare_vision_embed_deferred_dispatch(seq, images)
+    }
+    fn stage_vision_grids(&self, seq: &mut SequenceState, images: &[crate::VisionItem]) {
+        self.stage_vision_grids_dispatch(seq, images);
     }
     fn prepare_vision_embed_batched(
         &self,
@@ -103,15 +138,17 @@ impl Model for TransformerModel {
     }
     fn set_vision_slice_base(
         &self,
+        seq: &mut SequenceState,
         row_base: usize,
         grid_base: usize,
         owned_images: usize,
         slice_rows: usize,
     ) {
-        self.set_vision_slice_base_entry(row_base, grid_base, owned_images, slice_rows);
+        Self::set_vision_slice_base_entry(seq, row_base, grid_base, owned_images, slice_rows);
     }
     fn ep_broadcast_vision_state_for_seq(
         &self,
+        seq: &SequenceState,
         seq_id: u32,
         enabled: bool,
         row_base: usize,
@@ -120,6 +157,7 @@ impl Model for TransformerModel {
         slice_rows: usize,
     ) -> Result<()> {
         self.ep_broadcast_vision_state_for_seq_dispatch(
+            seq,
             seq_id,
             enabled,
             row_base,
@@ -346,6 +384,31 @@ impl Model for TransformerModel {
         self.gdn_fuse_flush_all()?;
         self.normalize_ssm_states_dispatch(seq, stream)
     }
+
+    fn align_prefill_chunk(&self, offset: usize, len: usize, total: usize) -> usize {
+        if self.prefill_grid() == 0
+            || offset + len >= total
+            || std::env::var("ATLAS_PREFILL_CHUNK_ALIGN").as_deref() == Ok("0")
+        {
+            return len;
+        }
+        spark_runtime::prefill_grid::cuts().align_chunk(offset, len, total)
+    }
+
+    fn normalize_after_chunk(&self, seq: &SequenceState, chunk_end: usize) -> bool {
+        // The cold run clamp-normalizes the SSM state at every scheduler chunk
+        // end. A warm run restored at `marconi_skip_to` must not normalize at
+        // chunk ends BELOW the anchor: the restored state already holds those
+        // (it was saved by a cold run that applied them), so normalizing again
+        // changes it. A chunk ending exactly at the anchor still normalizes —
+        // the snapshot there was saved before the cold run's normalize.
+        // `ATLAS_NORM_ALL_CHUNKS=1` restores the old always-normalize.
+        // Only under the grid (`--exact-prefix-cache`); otherwise main's
+        // always-normalize.
+        self.prefill_grid() == 0
+            || chunk_end >= seq.marconi_skip_to
+            || std::env::var("ATLAS_NORM_ALL_CHUNKS").as_deref() == Ok("1")
+    }
     fn bind_gpu_to_thread(&self) -> Result<()> {
         self.bind_gpu_to_thread_dispatch()
     }
@@ -542,6 +605,16 @@ impl Model for TransformerModel {
     ) -> Result<[u32; 2]> {
         self.ssm_pool.require_verify_rollback_supported()?;
         self.mark_gdn_deferred_commit(seq, tokens.len())?;
+        if self.native_glm_mtp_enabled() {
+            let allow = self.take_verify_row_masks(2)?;
+            let rows = self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream, allow)?;
+            anyhow::ensure!(
+                rows.len() == 2,
+                "native GLM K2 verifier returned {} rows",
+                rows.len()
+            );
+            return Ok([rows[0], rows[1]]);
+        }
         self.decode_verify_graphed_dispatch(tokens, seq, _stream)
     }
     fn decode_verify_graphed_k3(
@@ -577,6 +650,23 @@ impl Model for TransformerModel {
     }
     fn has_shared_prompt_capture(&self) -> bool {
         self.has_shared_prompt_capture_impl()
+    }
+    fn packed_prefill_admits(&self, prompt: &[u32], adapter_id: u64) -> bool {
+        self.glm_packed_admits(prompt, adapter_id)
+    }
+    fn packed_prefill_capacity(&self) -> (usize, usize) {
+        if self.glm_packed_supported() {
+            self.glm_packed_capacity()
+        } else {
+            (0, 0)
+        }
+    }
+    fn prefill_packed(
+        &self,
+        prompts: &[&[u32]],
+        seqs: &mut [&mut SequenceState],
+    ) -> Result<Vec<DevicePtr>> {
+        self.prefill_packed_impl(prompts, seqs)
     }
     fn can_fuse_glm_prefill_verify(
         &self,
@@ -719,6 +809,24 @@ impl Model for TransformerModel {
     }
     fn save_hidden_for_mtp(&self, token_idx: usize, _stream: u64) -> Result<()> {
         self.save_hidden_for_mtp_dispatch(token_idx, _stream)
+    }
+    fn native_mtp_bootstrap_enabled(&self) -> bool {
+        self.native_glm_mtp_enabled()
+    }
+    fn native_mtp_enabled(&self) -> bool {
+        self.native_glm_mtp_enabled()
+    }
+    fn native_prefix_admission_blocks(
+        &self,
+        owner: &SequenceState,
+        tokens: &[u32],
+        session_hash: u64,
+        private_blocks: usize,
+    ) -> Result<Option<usize>> {
+        self.native_prefix_admission_blocks_impl(owner, tokens, session_hash, private_blocks)
+    }
+    fn save_native_mtp_prompt_hidden(&self, seq: &SequenceState) -> Result<()> {
+        self.save_native_mtp_prompt_hidden_dispatch(seq)
     }
     fn save_dflash_hidden_for_propose(&self, token_idx: usize, _stream: u64) -> Result<()> {
         self.save_dflash_hidden_dispatch(token_idx, _stream)
@@ -1049,6 +1157,25 @@ impl Model for TransformerModel {
     ) -> Result<()> {
         self.trim_proposer_state_dispatch(seq, num_accepted, _stream)
     }
+    fn repair_mtp_after_verify(
+        &self,
+        accepted_draft: u32,
+        position: usize,
+        seq: &mut SequenceState,
+        stream: u64,
+    ) -> Result<()> {
+        self.repair_mtp_after_verify_dispatch(accepted_draft, position, seq, stream)
+    }
+    fn repair_mtp_after_verify_row(
+        &self,
+        accepted_draft: u32,
+        position: usize,
+        target_row: usize,
+        seq: &mut SequenceState,
+        stream: u64,
+    ) -> Result<()> {
+        self.repair_mtp_after_verify_row_dispatch(accepted_draft, position, target_row, seq, stream)
+    }
     fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<bool> {
         self.gdn_fuse_flush_all()?;
         self.compact_sequence_dispatch(seq, new_slot)
@@ -1110,7 +1237,8 @@ impl Model for TransformerModel {
         num_accepted: usize,
         k: usize,
     ) -> Result<()> {
-        self.commit_accepted_prefix_dispatch(seq, num_accepted, k)
+        self.commit_accepted_prefix_dispatch(seq, num_accepted, k)?;
+        self.capture_native_mtp_committed(seq, num_accepted)
     }
     fn ep_worker_step(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         self.ep_worker_step_dispatch(slots)
@@ -1131,6 +1259,9 @@ impl Model for TransformerModel {
 
     fn kv_block_size(&self) -> Option<usize> {
         Some(self.kv_cache.lock().block_size())
+    }
+    fn prefill_row_multiple(&self) -> usize {
+        self.glm_sp_row_multiple()
     }
     fn pc_inflight_min_tokens(&self) -> Option<usize> {
         self.pc_inflight_min_dispatch()

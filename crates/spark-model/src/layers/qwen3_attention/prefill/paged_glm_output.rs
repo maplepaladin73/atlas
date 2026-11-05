@@ -12,8 +12,9 @@ use crate::layers::ops;
 use crate::weight_map::Mxfp8Weight;
 
 /// The MXFP8 twin `glm_head_gemm` reads for `rows` of the `g`-head weight
-/// `weight` (`[g, n, k]`): only a twin quantized as exactly `[g * n, k]`, for
-/// at most 16 rows, with both grouped tiers resolved. Else BF16.
+/// `weight` (`[g, n, k]`): only a row-major twin quantized as exactly
+/// `[g * n, k]`, for at most 16 rows, with both grouped tiers resolved. Else
+/// BF16.
 fn glm_head_twin<'a>(
     twins: &'a [(DevicePtr, [usize; 2], Mxfp8Weight)],
     tiers: &[KernelHandle; 2],
@@ -21,10 +22,12 @@ fn glm_head_twin<'a>(
     [rows, g, k, n]: [u32; 4],
 ) -> Option<&'a Mxfp8Weight> {
     let shape = [g as usize * n as usize, k as usize];
-    let servable = rows <= ops::MXFP8_GROUPED_MAX_M && tiers.iter().all(|t| t.0 != 0);
+    let servable = rows <= ops::MXFP8_GROUPED_MAX_M
+        && tiers.iter().all(|t| t.0 != 0)
+        && !crate::layers::glm_packed_scope::active();
     twins
         .iter()
-        .find(|&&(w, s, _)| servable && w == weight && s == shape)
+        .find(|&&(w, s, mx)| servable && !mx.tiled && w == weight && s == shape)
         .map(|(.., mx)| mx)
 }
 
@@ -55,7 +58,7 @@ impl Qwen3AttentionLayer {
     /// Per-head MLA GEMM `c[:, h*n..] = a[:, h*k..] · weight_hᵀ` over `g`
     /// heads: its MXFP8 twin (`ATLAS_GLM_MLA_KVB_MXFP8=1`, see
     /// `glm_head_twin`), else the BF16 grouped GEMM.
-    fn glm_head_gemm(
+    pub(super) fn glm_head_gemm(
         &self,
         a: DevicePtr,
         weight: DevicePtr,
@@ -64,6 +67,22 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if ctx.config.model_type == "glm5_next"
+            && rows <= crate::layers::canonical_verify::MAX_ROWS
+            && crate::layers::canonical_verify::enabled()
+        {
+            // One tensor-core family for every verify width (the cuBLASLt
+            // grouped GEMM picks its algorithm per row count; the MXFP8 twin
+            // stops at 16 rows).
+            return crate::layers::canonical_verify::dense_grouped(
+                ctx.gpu,
+                a,
+                weight,
+                c,
+                [rows, g, k, n, a_stride, c_stride],
+                stream,
+            );
+        }
         let tiers = &self.mxfp8_gemv_grouped_k;
         if let Some(mx) = glm_head_twin(&self.mla_mx, tiers, weight, [rows, g, k, n]) {
             return ops::mxfp8_gemv_grouped(
@@ -143,7 +162,16 @@ mod tests {
         ]
         .map(|(w, shape, p)| {
             let (data, scales) = (DevicePtr(p), DevicePtr(p + 0x800));
-            (w, shape, Mxfp8Weight { data, scales })
+            let tiled = false;
+            (
+                w,
+                shape,
+                Mxfp8Weight {
+                    data,
+                    scales,
+                    tiled,
+                },
+            )
         })
         .to_vec()
     }

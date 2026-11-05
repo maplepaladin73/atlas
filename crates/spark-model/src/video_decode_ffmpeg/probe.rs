@@ -39,19 +39,24 @@ fn probe_command(policy: &FfmpegPolicy) -> Command {
 /// otherwise its instantaneous rate — used only to plan coverage, and NOT as a
 /// substitute for a duration that could not be read.
 pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<ClipTiming> {
-    let mut child = probe_command(policy)
+    let input_file = input::SeekableInput::new(bytes)?;
+    let child = probe_command(policy)
         .args([
             "-v",
             "error",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-format_whitelist",
+            "mov,matroska,webm,avi,mpegts,mpeg,ogg,flv",
             "-select_streams",
             "v:0",
             "-show_entries",
             "format=duration:stream=avg_frame_rate,r_frame_rate,nb_frames",
             "-of",
             "default=nw=1",
-            "pipe:0",
         ])
-        .stdin(Stdio::piped())
+        .arg(input_file.path())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -64,18 +69,7 @@ pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<Clip
             )
         })?;
 
-    // Same reason ffmpeg's input is fed on a thread: the child writes its
-    // report while still draining stdin, so a write-then-read sequence can
-    // deadlock on a large container.
-    let mut stdin = child.stdin.take().context("no ffprobe stdin pipe")?;
-    let input = bytes.to_vec();
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&input);
-        drop(stdin);
-    });
-
     let (out, err_text, status) = read_probe(child, policy.timeout_secs)?;
-    let _ = writer.join();
 
     let text = String::from_utf8_lossy(&out);
     let field = |name: &str| -> Option<String> {
@@ -105,8 +99,8 @@ pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<Clip
         .into_iter()
         .find_map(field)
         .and_then(|v| parse_rate(&v))
-        .and_then(crate::video_sample::finite_positive)
-        .unwrap_or(policy.fps);
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .unwrap_or(f64::from(policy.fps));
 
     // Declared source frames (`nb_frames`): the decoder keeps the whole clip
     // verbatim when the cap can hold it, instead of warping a CFR/VFR clip
@@ -124,12 +118,16 @@ pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<Clip
 
 /// Parse ffprobe's `num/den` frame-rate form. Returns `None` for `0/0` and
 /// other degenerate rates rather than dividing by zero.
-fn parse_rate(s: &str) -> Option<f32> {
+pub(super) fn parse_rate(s: &str) -> Option<f64> {
     let (num, den) = s.trim().split_once('/')?;
-    let num: f32 = num.trim().parse().ok()?;
-    let den: f32 = den.trim().parse().ok()?;
+    let num: f64 = num.trim().parse().ok()?;
+    let den: f64 = den.trim().parse().ok()?;
     (den != 0.0).then(|| num / den)
 }
+
+/// Bytes of an ffprobe report on either pipe: a few `key=value` lines, so
+/// anything past this is not one.
+const PROBE_REPORT_BYTES: u64 = 64 * 1024;
 
 /// Read a probe child to completion under the same deadline the decoder
 /// uses: a hung process is killed and reported, never held forever
@@ -166,20 +164,56 @@ pub(super) fn read_probe(
             }
         })
     };
+    // Both pipes are bounded and drained at once: a child filling stderr
+    // while stdout is read would otherwise sit until the watchdog fired.
+    let errors = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr
+            .by_ref()
+            .take(PROBE_REPORT_BYTES)
+            .read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
     let mut out = Vec::new();
-    let read_res = stdout.read_to_end(&mut out);
-    let mut err_text = String::new();
-    let _ = stderr.read_to_string(&mut err_text);
+    let read_res = stdout
+        .by_ref()
+        .take(PROBE_REPORT_BYTES + 1)
+        .read_to_end(&mut out);
+    let oversized = out.len() as u64 > PROBE_REPORT_BYTES;
+    if read_res.is_err() || oversized {
+        let _ = child.lock().unwrap().kill();
+    }
+    let err_text = errors.join().unwrap_or_default();
     let killed = watchdog.join().unwrap_or(true);
     ensure!(
         !killed,
         "probing the clip's duration exceeded {timeout_secs}s and was stopped"
     );
     read_res.context("reading the ffprobe report")?;
+    ensure!(!oversized, "ffprobe report exceeded the 64 KiB bound");
     let status = child
         .lock()
         .unwrap()
         .wait()
         .context("waiting for ffprobe")?;
     Ok((out, err_text, status))
+}
+
+/// Refuse before touching the container when the subprocess decoder is off or
+/// its binary cannot run — the error names the flag or the missing install
+/// rather than letting the failure surface later as a decode error.
+pub(super) fn ensure_decoder(policy: &FfmpegPolicy) -> Result<()> {
+    ensure!(
+        policy.enabled,
+        "this container needs ffmpeg to decode and subprocess decoding is disabled; \
+         pass --video-allow-ffmpeg to enable it, or send an animated GIF"
+    );
+    if let Availability::Missing(detail) = probe(policy) {
+        anyhow::bail!(
+            "the ffmpeg decoder is not usable: {detail} (no ffmpeg installed at that path, or it \
+             could not run) — install ffmpeg with its ffprobe companion, or point \
+             --video-ffmpeg-path at a usable build"
+        );
+    }
+    Ok(())
 }

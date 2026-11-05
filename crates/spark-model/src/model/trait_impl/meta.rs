@@ -28,6 +28,9 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
+mod grid;
+mod kv_cap;
+
 impl TransformerModel {
     pub(super) fn vocab_size_dispatch(&self) -> usize {
         self.config.vocab_size
@@ -150,19 +153,6 @@ impl TransformerModel {
             self.gpu
                 .copy_d2d_async(scratch, s.h_state, f16_bytes, stream)?;
             s.h_is_f16 = true;
-        }
-        if std::env::var("ATLAS_SSM_H_FP16_DEBUG").is_ok() {
-            tracing::info!(
-                "SSM_H_FP16_CONVERT slot={} seq_len={} prompt_len={} hptr={:#x}",
-                seq.slot_idx,
-                seq.seq_len,
-                seq.prompt_len,
-                seq.layer_states
-                    .iter()
-                    .find_map(|l| l.as_any().downcast_ref::<SsmLayerState>())
-                    .map(|x| x.h_state.0)
-                    .unwrap_or(0)
-            );
         }
         Ok(())
     }
@@ -398,6 +388,8 @@ impl TransformerModel {
             cached_prefix_tokens: 0,
             cached_prefix_blocks: 0,
             prefix_ref_tokens: Vec::new(),
+            vision_cache_key: Vec::new(),
+            vision: Default::default(),
             prefix_lookup_applied: false,
             prefix_lookup_skip: false,
             pc_branch_at: None,

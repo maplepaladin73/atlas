@@ -35,6 +35,7 @@ mod radio_encoder_pipe_tests;
 mod radio_encoder_tests;
 pub mod radio_preprocess;
 pub mod radio_tower;
+pub mod request_local;
 pub mod speculative;
 pub mod ssm_reserve;
 pub mod tp_shard;
@@ -72,7 +73,10 @@ pub fn ships_vanilla_norm_weights(config: &atlas_core::config::ModelConfig) -> b
 /// The dispatch predicate itself, on the bare `model_type`, so it is unit-testable
 /// without constructing a full `ModelConfig`.
 pub fn model_type_ships_vanilla_norm_weights(model_type: &str) -> bool {
-    matches!(model_type, "deepseek_v4" | "glm5_next" | "laguna")
+    matches!(
+        model_type,
+        "deepseek_v4" | "glm5_next" | "laguna" | "ricursive"
+    )
 }
 
 #[cfg(test)]

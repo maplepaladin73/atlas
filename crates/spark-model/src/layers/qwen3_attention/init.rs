@@ -150,6 +150,14 @@ impl Qwen3AttentionLayer {
             v_norm_weight: None,
             head_gate_weight: None,
             head_gate_activation: HeadGateActivation::Sigmoid,
+            valres_blend: None,
+            valres: None,
+            valres_vin: std::sync::atomic::AtomicU64::new(0),
+            valres_lerp_k: if config.value_residual {
+                gpu.kernel("ripple_ops", "ripple_valres_lerp")?
+            } else {
+                KernelHandle(0)
+            },
             sigmoid_gate_head_broadcast_k: super::super::try_kernel(
                 gpu,
                 "residual_add",
@@ -181,6 +189,7 @@ impl Qwen3AttentionLayer {
             mla: None,
             mla_mx: Vec::new(),
             mla_q4: Vec::new(),
+            mla_native: Default::default(),
             // ── DeepSeek-V4 Manifold-Constrained Hyper-Connections (mHC) ──
             // `hc` stays None for non-V4 models; the V4 loader attaches real
             // HcWeights after this constructor. Kernel handles are lazy (null
@@ -314,7 +323,7 @@ impl Qwen3AttentionLayer {
                 .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
                 .unwrap_or(KernelHandle(0)),
             dense_gemv_batch5_k: gate(
-                probes.glm_series,
+                probes.glm_mla,
                 gpu,
                 "dense_gemv_bf16_batchm",
                 "dense_gemv_bf16_batch5",
@@ -613,10 +622,10 @@ impl Qwen3AttentionLayer {
             ),
             dense_gemm_tc_k: super::super::try_kernel(gpu, "gemm_tc", "dense_gemm_tc"),
             mxfp8_gemv_k: ["mxfp8_gemv_tc8", "mxfp8_gemv_tc16", "mxfp8_gemv_tc32"]
-                .map(|name| gate(probes.glm_series, gpu, "mxfp8_gemv", name)),
+                .map(|name| gate(probes.glm_mla, gpu, "mxfp8_gemv", name)),
             mxfp8_gemv_grouped_k: ["mxfp8_gemv_tc8_grouped", "mxfp8_gemv_tc16_grouped"]
-                .map(|name| gate(probes.glm_series, gpu, "mxfp8_gemv", name)),
-            mxfp8_quantize_k: gate(probes.glm_series, gpu, "mxfp8_gemv", "mxfp8_quantize_bf16"),
+                .map(|name| gate(probes.glm_mla, gpu, "mxfp8_gemv", name)),
+            mxfp8_quantize_k: gate(probes.glm_mla, gpu, "mxfp8_gemv", "mxfp8_quantize_bf16"),
             paged_decode_splitk_k: match kv_dtype {
                 KvCacheDtype::Nvfp4 => {
                     Some(gpu.kernel("paged_decode_nvfp4", "paged_decode_attn_splitk_nvfp4")?)

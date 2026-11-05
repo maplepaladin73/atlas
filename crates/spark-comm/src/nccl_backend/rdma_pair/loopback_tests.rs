@@ -353,3 +353,10 @@ fn oneshot_loopback_timing() {
         assert!(os.poisoned().is_none());
     }
 }
+
+/// A comma-separated list of sizes from `key`, else `default`.
+#[path = "loopback_sm_stage_tests.rs"]
+mod sm_stage;
+
+#[path = "chain_loopback_tests.rs"]
+mod chain_loopback;

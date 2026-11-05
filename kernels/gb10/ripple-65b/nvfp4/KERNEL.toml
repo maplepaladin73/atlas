@@ -1,0 +1,15 @@
+[build]
+# Ripple's head_dim is 128. gb10's common paged_decode_attn.cu defaults
+# HDIM 256, so the flag is required (same remedy as gb10/laguna-s-2.1, whose
+# KERNEL.toml these merge over via kernel_source). `--fmad=false` is the gb10
+# bit-parity convention. Duplicated flags from the merged laguna KERNEL.toml
+# are benign.
+extra_nvcc_flags = ["--fmad=false", "-DHDIM=128"]
+
+# The overlay's w4a4_gemm.cu (from glm-5.3-flash) must compile as module
+# `w4a4` — that is the module name dense_ffn looks up
+# (`w4a4::w4a4_gemm_mfast`). Without this mapping the file stem
+# (`w4a4_gemm`) would be used and the lookup would resolve to handle 0,
+# which the startup audit refuses.
+[modules]
+w4a4_gemm = "w4a4"

@@ -23,7 +23,7 @@ fn stream_for_app(
     tools: bool,
     tokens: Vec<u32>,
 ) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
-    super::stream_tokens_with_state(state, tools, tokens, request())
+    super::stream_for_request(state, tools, tokens, request())
 }
 
 fn setup(glm: bool) -> (StreamCtx, StreamState) {
@@ -152,6 +152,37 @@ fn tool_guard_incomplete_or_oversized_calls_never_release() {
         handle_tool_call_args_fragment(&mut s, &c, "x".repeat(100), 0, &mut out);
         assert!(out.is_empty());
         assert_blocked(&finish(&mut s, &c));
+    }
+}
+
+#[test]
+fn tool_guard_refuses_raw_tool_syntax_past_its_bound_before_buffering_more() {
+    use crate::api::chat_stream::tool_security::check_pending;
+    for glm in [false, true] {
+        let (mut c, mut s) = setup(glm);
+        Arc::get_mut(&mut c.state).unwrap().tool_guard.max_bytes = 16;
+        // Nothing pending: ordinary content is never refused, whatever its size.
+        assert!(!check_pending(&mut s, &c, 1 << 20));
+        let text = xml(glm, "Oslo");
+        s.detector
+            .as_mut()
+            .unwrap()
+            .process(&text[..text.len() - "</tool_call>".len()]);
+        let pending = s.detector.as_ref().unwrap().pending_tool_bytes();
+        if pending > 0 {
+            assert!(check_pending(&mut s, &c, 16));
+            assert_eq!(s.guard_stop, Some(atlas_tool_guard::GUARD_STOP));
+            assert!(s.cancel_flag.load(Ordering::Acquire));
+        }
+        // Off: never refused.
+        let (mut c, mut s) = setup(glm);
+        let guard = &mut Arc::get_mut(&mut c.state).unwrap().tool_guard;
+        (guard.enabled, guard.max_bytes) = (false, 1);
+        s.detector
+            .as_mut()
+            .unwrap()
+            .process(&text[..text.len() - "</tool_call>".len()]);
+        assert!(!check_pending(&mut s, &c, 1 << 20));
     }
 }
 
