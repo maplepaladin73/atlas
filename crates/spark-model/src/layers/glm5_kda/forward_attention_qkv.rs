@@ -19,6 +19,9 @@ impl Glm5KdaLayer {
         h: u32,
         decode: bool,
         capture_verify_intermediates: bool,
+        // `normed`'s MXFP8 image is already in the activation scratch
+        // (`sp_quant_gather.rs`): no projection casts it again.
+        cast_done: bool,
         profile_timer: &mut Option<std::time::Instant>,
         ctx: &ForwardContext,
         stream: u64,
@@ -26,7 +29,21 @@ impl Glm5KdaLayer {
         let fused_qkv = capture_verify_intermediates
             && m == 5
             && self.w4a16_gemv_batch5_qkv_k.0 != 0
-            && verify_fused_qkv_enabled();
+            && verify_fused_qkv_enabled()
+            && !crate::layers::canonical_verify::enabled()
+            && !self.has_mxfp8_projections();
+        // ATLAS_GLM_FP4L_KDA_MXFP8_DECODE: Q, K and V of a decode or verify
+        // block in one MXFP8 launch (`projection_mx`), bit-identical to three.
+        if (decode || capture_verify_intermediates)
+            && self.try_project_qkv_mxfp8(normed, projected, plane_bytes, m, p, h, ctx, stream)?
+        {
+            profile::step(ctx, stream, profile_timer, "q_proj")?;
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !cast_done || (!decode && !capture_verify_intermediates && self.qkv_w8a8()),
+            "GLM KDA: a pre-cast input needs the W8A8 prefill projections"
+        );
         // Whether Q took the Lt FP8 route, leaving `normed` cast in scratch.
         let mut q_fp8 = false;
         if fused_qkv {
@@ -64,7 +81,7 @@ impl Glm5KdaLayer {
                 p as u32,
                 h,
                 decode,
-                true,
+                !cast_done,
                 ctx,
                 stream,
             )?;

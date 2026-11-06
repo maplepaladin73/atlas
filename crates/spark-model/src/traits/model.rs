@@ -145,6 +145,32 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// Whether a sampled verify on that argmax-only head can still pick from
+    /// the target's distribution: [`Self::verify_split_candidates`] and
+    /// [`Self::verify_split_full_rows`] serve.
+    fn verify_split_sampling(&self) -> bool {
+        false
+    }
+
+    /// Head only, between a verify's forward and its verdict word: every
+    /// rank's best logits of verify rows `[0, rows)` at `temperature`, with
+    /// the logits of `specials` (the tokens the host pipeline may mask) and
+    /// what the rest of each row adds up to (`spark_model::model::SplitRow`).
+    fn verify_split_candidates(
+        &self,
+        _rows: usize,
+        _temperature: f32,
+        _specials: &[u32],
+    ) -> Result<Vec<crate::model::SplitRow>> {
+        bail!("this model has no split verify head")
+    }
+
+    /// Head only, like [`Self::verify_split_candidates`]: verify rows
+    /// `[0, rows)` whole, `rows * vocab` BF16 logits into `out`.
+    fn verify_split_full_rows(&self, _rows: usize, _out: &mut [u8]) -> Result<()> {
+        bail!("this model has no split verify head")
+    }
+
     /// Run beam search to completion for each request, returning each one's
     /// winning hypothesis token ids (EOS-terminated). Called from the prefill
     /// path for `num_beams > 1` requests, bypassing the token-by-token decode
@@ -350,6 +376,19 @@ pub trait Model: Send + Sync {
             decode_logits,
             prefill_logits,
         })
+    }
+
+    /// R11 fix 5: shrink a NON-last scheduler prefill chunk so it ends on the
+    /// model's prefill cut grid (no stray 1-token passes where a chunk end and
+    /// a grid cut sit one token apart). Default: unchanged.
+    fn align_prefill_chunk(&self, _offset: usize, len: usize, _total: usize) -> usize {
+        len
+    }
+
+    /// R11 fix 4: whether the scheduler should run `normalize_ssm_states`
+    /// after a prefill chunk ending at `chunk_end`. Default: always.
+    fn normalize_after_chunk(&self, _seq: &SequenceState, _chunk_end: usize) -> bool {
+        true
     }
 
     /// Normalize SSM h_state norms to prevent catastrophic state explosion
@@ -807,6 +846,30 @@ pub trait Model: Send + Sync {
         true
     }
 
+    /// Packed multi-prompt prefill (`ATLAS_GLM_PACKED_PREFILL`): whether
+    /// `prompt` (for adapter `adapter_id`) may be packed with other new
+    /// prompts. Decided on rank 0 only; the worker follows the packing.
+    fn packed_prefill_admits(&self, _prompt: &[u32], _adapter_id: u64) -> bool {
+        false
+    }
+
+    /// `(rows, prompts)` one packed prefill may hold.
+    fn packed_prefill_capacity(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
+    /// Prefill every `prompts[i]` (a whole new prompt) into the fresh
+    /// `seqs[i]` in one traversal (EP-coherent). Returns each prompt's
+    /// last-row logits; the caller normalizes and samples as after a
+    /// single-chunk prefill.
+    fn prefill_packed(
+        &self,
+        _prompts: &[&[u32]],
+        _seqs: &mut [&mut SequenceState],
+    ) -> Result<Vec<DevicePtr>> {
+        bail!("prefill_packed: unsupported by this model")
+    }
+
     /// Whether a prefill chunk of `chunk_len` rows of `prompt` may carry
     /// `owners` DFlash verify owners of `rows` rows each after its own rows.
     fn can_fuse_glm_prefill_verify(
@@ -991,6 +1054,42 @@ pub trait Model: Send + Sync {
     /// overwrites shared buffers including `norm_output`.
     fn save_hidden_for_mtp(&self, token_idx: usize, stream: u64) -> Result<()>;
 
+    /// True when this model uses native GLM MTP bootstrap. Native GLM starts
+    /// from the first token already sampled by prefill, so it must not run the
+    /// ordinary standalone decode bootstrap. Existing proposer families keep
+    /// the default false behavior.
+    fn native_mtp_bootstrap_enabled(&self) -> bool {
+        false
+    }
+
+    /// True when this model admits the native GLM MTP verifier/proposer lane.
+    /// This is separate from the bootstrap hook so scheduler routing cannot
+    /// accidentally infer native target semantics from a generic bootstrap.
+    fn native_mtp_enabled(&self) -> bool {
+        false
+    }
+
+    /// Confirm one native follower can immediately acquire this live owner's
+    /// target/predictor prefix. Returns target blocks shared with the owner;
+    /// `private_blocks` includes every live continuation and the follower's
+    /// replay, writable tail and speculative reserve. No default credit.
+    fn native_prefix_admission_blocks(
+        &self,
+        _owner: &SequenceState,
+        _tokens: &[u32],
+        _session_hash: u64,
+        _private_blocks: usize,
+    ) -> Result<Option<usize>> {
+        Ok(None)
+    }
+
+    /// Stage the final prompt hidden for native GLM's first proposal. The
+    /// proposal writes the `(first_generated_token, prompt_hidden)` pair at
+    /// `seq.seq_len`; default models do not need this hook.
+    fn save_native_mtp_prompt_hidden(&self, _seq: &SequenceState) -> Result<()> {
+        bail!("native MTP bootstrap is unsupported by this model")
+    }
+
     /// Move verify row `row` of the mHC stream highway into row 0, so a
     /// drafter that consumes the PRE-mixer residual reads the accepted
     /// position rather than the first verify row.
@@ -1163,16 +1262,46 @@ pub trait Model: Send + Sync {
     /// Each tuple is `(pixels: Vec<f32>, grid_h: usize, grid_w: usize)`.
     /// Pixels are laid out [P, C×T×Hp×Wp] matching `vision_preprocess::preprocess_image`.
     /// Must be called before `prefill_chunk` when the prompt contains `<|image_pad|>` tokens.
+    /// The embeddings, grids and hashes land on `seq` (per-sequence vision
+    /// state) — the model holds none between requests.
     ///
     /// Default: no-op (text-only models).
-    /// `(window, request)`: the merged vision rows one encode may write and
+    fn prepare_vision_embed(
+        &self,
+        _seq: &mut crate::traits::SequenceState,
+        _images: Vec<crate::VisionItem>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// `(window, request)`: the merged vision rows one encode may write (the
+    /// encoder output window, which one prefill chunk's items must fit) and
     /// the rows one request may carry (`vision_limits`). Default `(0, 0)`.
     fn vision_row_limits(&self) -> (usize, usize) {
         (0, 0)
     }
 
-    fn prepare_vision_embed(&self, _images: &[crate::VisionItem]) -> Result<()> {
-        Ok(())
+    /// `prepare_vision_embed` for a request whose chunk 0 goes through
+    /// `prefill_chunk`: a model that prefix-caches vision prompts may stage
+    /// the images on `seq` and encode, inside the chunk-0 prefix lookup, only
+    /// those the cache does not cover. Default: encode now.
+    fn prepare_vision_embed_for_chunked(
+        &self,
+        seq: &mut crate::traits::SequenceState,
+        images: Vec<crate::VisionItem>,
+    ) -> Result<()> {
+        self.prepare_vision_embed(seq, images)
+    }
+
+    /// Derive `seq`'s per-item post-merge grids and content hashes from
+    /// `images` WITHOUT encoding: the co-dispatch path's rows are already in
+    /// the shared `buf_out` slice, but MRoPE, the cache key and the worker's
+    /// wire state need the geometry. Default: no-op (text models).
+    fn stage_vision_grids(
+        &self,
+        _seq: &mut crate::traits::SequenceState,
+        _images: &[crate::VisionItem],
+    ) {
     }
 
     /// Batched vision encode across N requests' images in ONE `forward_batched`
@@ -1187,12 +1316,13 @@ pub trait Model: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Set the co-dispatched batched-ViT slice for the NEXT prefill_chunk
-    /// (row offset into buf_out, grid index offset, image count and row count
-    /// owned). Pass all zeroes to reset to the legacy single-request
+    /// Set the co-dispatched batched-ViT slice for the NEXT prefill_chunk of
+    /// `seq` (row offset into buf_out, grid index offset, image count and row
+    /// count owned). Pass all zeroes to reset to the legacy single-request
     /// behaviour. Default: no-op.
     fn set_vision_slice_base(
         &self,
+        _seq: &mut crate::traits::SequenceState,
         _row_base: usize,
         _grid_base: usize,
         _owned_images: usize,
@@ -1209,6 +1339,7 @@ pub trait Model: Send + Sync {
     /// packed slice. Text-only models keep the default no-op implementation.
     fn ep_broadcast_vision_state_for_seq(
         &self,
+        _seq: &crate::traits::SequenceState,
         _seq_id: u32,
         _enabled: bool,
         _row_base: usize,
@@ -1301,6 +1432,13 @@ pub trait Model: Send + Sync {
         None
     }
 
+    /// Rows a long final prefill chunk is cut to a multiple of so it runs
+    /// sequence-parallel (GLM-5 over the four-rank chain); the few rows past
+    /// the cut run as one more chunk. 1 when nothing asks.
+    fn prefill_row_multiple(&self) -> usize {
+        1
+    }
+
     /// EP broadcast: send a command (u32) to all worker ranks.
     ///
     /// Called by rank 0 before each model operation to synchronize workers.
@@ -1379,6 +1517,36 @@ pub trait Model: Send + Sync {
         num_accepted: usize,
         stream: u64,
     ) -> Result<()>;
+
+    /// Append the accepted draft pair needed by native MTP before the next
+    /// proposal. The default is deliberately empty for DFlash and all other
+    /// existing proposer families.
+    fn repair_mtp_after_verify(
+        &self,
+        _accepted_draft: u32,
+        _position: usize,
+        _seq: &mut SequenceState,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Native row-indexed repair variant. `target_row` names the row in the
+    /// just-completed canonical verify forward whose post-norm hidden belongs
+    /// to `accepted_draft`. Existing proposers only have row-zero repair.
+    fn repair_mtp_after_verify_row(
+        &self,
+        accepted_draft: u32,
+        position: usize,
+        target_row: usize,
+        seq: &mut SequenceState,
+        stream: u64,
+    ) -> Result<()> {
+        if target_row != 0 {
+            bail!("row-indexed MTP repair is unsupported for target row {target_row}");
+        }
+        self.repair_mtp_after_verify(accepted_draft, position, seq, stream)
+    }
 
     /// Launch SSM state checkpoint D2D copies on a secondary CUDA stream.
     ///

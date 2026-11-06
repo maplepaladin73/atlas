@@ -4,11 +4,11 @@
 //! tail of `forward_block` walked as pieces and swaps, with each run of
 //! pieces between two swaps captured as one CUDA graph.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use spark_comm::CommBackend;
 use spark_runtime::gpu::GraphHandle;
 
-use super::forward_block_layer_paged::PagedLayerArgs;
+use super::forward_block_layer_paged::{AttnPhases, PagedLayerArgs};
 use super::rank_split::{Frame, Graphs, Piece, RankSplit, SplitOps, Step, Swap, run_count, walk};
 use super::{BlockDiffusionDraftHead, DflashGraphIdentity, DflashScratch};
 use crate::layer::ForwardContext;
@@ -40,6 +40,20 @@ impl SplitOps for HeadWalk<'_> {
                 let (k, v) = head.forward_block_layer_pre_attn(layer, &args, ctx, scratch)?;
                 head.forward_block_layer_attention(&args, ctx, k, v, scratch)
             }
+            Piece::AttnPre(l) => {
+                let (layer, args) = layer(l);
+                head.pre_attn_phases(layer, &args, ctx, scratch, AttnPhases::BEFORE)
+                    .map(|_| ())
+            }
+            Piece::AttnCore(l) => {
+                let (layer, args) = layer(l);
+                let (k, v) = head.pre_attn_phases(layer, &args, ctx, scratch, AttnPhases::AFTER)?;
+                head.forward_block_layer_attention(&args, ctx, k, v, scratch)
+            }
+            Piece::ProjectRest(l) => {
+                let (layer, args) = layer(l);
+                head.post_attn_phases(layer, &args, ctx, scratch, AttnPhases::AFTER)
+            }
             Piece::Post(l) => {
                 let (layer, args) = layer(l);
                 head.forward_block_layer_post_attn(layer, &args, ctx, scratch)
@@ -69,9 +83,27 @@ impl SplitOps for HeadWalk<'_> {
             Piece::CtxFc(_) | Piece::CtxNorm(_) | Piece::CtxKv(_) => {
                 anyhow::bail!("rank-split propose: {piece:?} walks with its context append")
             }
-            Piece::GateUp(_) | Piece::Down(_) | Piece::Vocab => {
+            Piece::GateUp(_) | Piece::Down(_) | Piece::Vocab | Piece::Qkv(_) | Piece::OProj(_) => {
                 let frame = Frame::serial(scratch);
                 head.split_piece(self.split, piece, 0, ctx.gpu, &frame, self.stream)
+            }
+            // The head's lists, then the selector's hidden rows while the
+            // worker finishes its share.
+            Piece::TopK => {
+                let frame = Frame::serial(scratch);
+                head.split_piece(self.split, piece, 0, ctx.gpu, &frame, self.stream)?;
+                let selector = head
+                    .candidate_selector
+                    .as_ref()
+                    .context("rank-split candidate swap without a DFlash2 selector")?;
+                selector.project_hidden(
+                    scratch.norm_buf,
+                    scratch.dflash2_projected_hidden,
+                    head.gamma,
+                    &|src, w, dst, m, n, k| {
+                        head.drafter_dense_gemm(ctx.gpu, src, w, dst, m, n, k, self.stream)
+                    },
+                )
             }
         }
     }

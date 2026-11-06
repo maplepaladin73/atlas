@@ -18,10 +18,18 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 /// Names this wire format; bump the digit when the head or layout changes.
-const MAGIC: [u8; 8] = *b"ATLPAIR4";
+const MAGIC: [u8; 8] = *b"ATLPAIR5";
+/// Rails a link may have (a flag line each in the one-shot control page,
+/// `ONESHOT_MAX_RAILS` in its kernel), and ranks the longest chain may have
+/// (`ONESHOT_MAX_RANKS`).
+pub(in crate::nccl_backend) const MAX_RAILS: usize = 8;
+pub(in crate::nccl_backend) const MAX_RANKS: usize = 4;
+/// Identity: the region base, then per rail QPN, PSN, GID and region rkey.
+pub(in crate::nccl_backend) const BASE_WIRE: usize = 8;
+pub(in crate::nccl_backend) const RAIL_WIRE: usize = 4 + 4 + 16 + 4;
 /// What both ranks must agree on, in wire order, and where to look when
 /// they do not.
-const FIELDS: [(&str, &str); 7] = [
+const FIELDS: [(&str, &str); 8] = [
     ("rail count", "check ATLAS_RDMA_RAILS on both nodes"),
     ("PAIR_CHAIN", "check ATLAS_RDMA_PAIR_CHAIN on both nodes"),
     (
@@ -37,6 +45,10 @@ const FIELDS: [(&str, &str); 7] = [
         "one-shot stripe min",
         "check ATLAS_RDMA_ONESHOT_STRIPE_MIN on both nodes",
     ),
+    (
+        "one-shot SM staging",
+        "check ATLAS_RDMA_ONESHOT_SM_STAGE on both nodes",
+    ),
     ("command ring", "check ATLAS_GLM_CMD_RDMA on both nodes"),
 ];
 /// The rank, then the [`FIELDS`].
@@ -44,8 +56,8 @@ const WORDS: usize = 1 + FIELDS.len();
 /// Magic, then the words as little-endian u64.
 const HEAD_WIRE: usize = 8 * (1 + WORDS);
 /// Between rank 0's accept polls, and between the worker's connect attempts.
-const POLL: Duration = Duration::from_millis(10);
-const RETRY: Duration = Duration::from_millis(500);
+pub(super) const POLL: Duration = Duration::from_millis(10);
+pub(super) const RETRY: Duration = Duration::from_millis(500);
 
 /// What a rank's use of the pair depends on, besides its own identity.
 pub(super) struct Head {
@@ -54,8 +66,8 @@ pub(super) struct Head {
     pub(super) chain: bool,
     pub(super) segments: usize,
     pub(super) capacity: usize,
-    /// One-shot `max` and `stripe_min`, zero when off.
-    pub(super) oneshot: [u64; 2],
+    /// One-shot `max`, `stripe_min` and `sm_stage`, zero when off.
+    pub(super) oneshot: [u64; 3],
     /// Command ring words, zero when off.
     pub(super) cmd: u64,
 }
@@ -70,6 +82,7 @@ impl Head {
             self.capacity as u64,
             self.oneshot[0],
             self.oneshot[1],
+            self.oneshot[2],
             self.cmd,
         ]
     }
@@ -88,6 +101,11 @@ impl Head {
 /// hang-up as the rejection it is (the wire has no error frame): an EOF, or
 /// a reset when the peer dropped the connection with bytes unread.
 pub(super) fn io(what: &str) -> impl Fn(std::io::Error) -> anyhow::Error {
+    io_of("RDMA pair", what)
+}
+
+/// [`io`] for the transport named `who`.
+pub(super) fn io_of(who: &'static str, what: &str) -> impl Fn(std::io::Error) -> anyhow::Error {
     move |e| {
         let why = match e.kind() {
             ErrorKind::WouldBlock | ErrorKind::TimedOut => "timed out".into(),
@@ -99,7 +117,7 @@ pub(super) fn io(what: &str) -> impl Fn(std::io::Error) -> anyhow::Error {
             }
             _ => e.to_string(),
         };
-        anyhow!("RDMA pair: {what}: {why}")
+        anyhow!("{who}: {what}: {why}")
     }
 }
 
@@ -228,7 +246,7 @@ fn elsewhere(master_addr: &str, bound: IpAddr) -> bool {
 /// Whether the peer process has exited. Nothing is sent on its lifeline
 /// after the NCCL ID, so only its end is readable. The connection is left
 /// blocking: its watcher reads it for the life of the process.
-fn gone(lifeline: &TcpStream) -> std::io::Result<bool> {
+pub(super) fn gone(lifeline: &TcpStream) -> std::io::Result<bool> {
     lifeline.set_nonblocking(true)?;
     let peeked = lifeline.peek(&mut [0u8]);
     lifeline.set_nonblocking(false)?;
@@ -247,13 +265,13 @@ fn lost(link: &Link) -> std::io::Result<bool> {
 /// however slowly the peer feeds them.
 pub(super) struct Bounded {
     stream: TcpStream,
-    deadline: Instant,
+    pub(super) deadline: Instant,
 }
 
 impl Bounded {
     /// Blocking (an accepted socket can inherit the listener's non-blocking
     /// mode) and unbuffered.
-    fn new(stream: TcpStream, deadline: Instant) -> std::io::Result<Self> {
+    pub(super) fn new(stream: TcpStream, deadline: Instant) -> std::io::Result<Self> {
         stream.set_nonblocking(false)?;
         stream.set_nodelay(true)?;
         Ok(Self { stream, deadline })
@@ -290,7 +308,7 @@ impl Write for Bounded {
 /// `ATLAS_RDMA_PAIR_BOOT_TIMEOUT_S`, from a second to a day. Zero does not
 /// mean "no deadline" (the boot must end); it and a value that is not a
 /// number of seconds are said.
-fn boot_timeout(secs: Option<String>) -> Duration {
+pub(super) fn boot_timeout(secs: Option<String>) -> Duration {
     const NAME: &str = "ATLAS_RDMA_PAIR_BOOT_TIMEOUT_S";
     let secs = match secs.as_deref().map(str::parse::<u64>) {
         None => 120,
@@ -323,7 +341,7 @@ pub(super) fn open(head: &Head, ident: &[u8], link: &Link) -> Result<(Bounded, V
 
 /// Rank 0's listener, on `at` only: a failure is the error, never a wider
 /// bind.
-fn bind(at: SocketAddr) -> Result<TcpListener> {
+pub(super) fn bind(at: SocketAddr) -> Result<TcpListener> {
     let listener = TcpListener::bind(at).with_context(|| format!("RDMA pair: bind {at}"))?;
     // std has no accept timeout: poll.
     listener.set_nonblocking(true)?;
@@ -413,6 +431,9 @@ fn dial(head: &Head, ident: &[u8], link: &Link, timeout: Duration) -> Result<(Bo
     let remote = exchange(&mut stream, head, ident)?;
     Ok((stream, remote))
 }
+
+#[path = "chain/bootstrap.rs"]
+pub(in crate::nccl_backend) mod chain;
 
 #[cfg(test)]
 #[path = "bootstrap_tests.rs"]

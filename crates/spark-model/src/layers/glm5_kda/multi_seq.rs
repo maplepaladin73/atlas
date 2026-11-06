@@ -91,15 +91,6 @@ impl Glm5KdaLayer {
         let p = self.heads * self.dim;
         let p_u32 = p as u32;
         let bf16 = 2usize;
-        let profile = std::env::var("ATLAS_GLM_KDA_MS_PROFILE").ok().as_deref() == Some("1")
-            && !ctx.graph_capture;
-        let mixer_t0 = if profile {
-            ctx.gpu.synchronize(stream)?;
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
         // mHC is batch-aware. Keeping the highway in [N, hc, H] layout also
         // fixes the generic fallback's scratch reuse between distinct rows.
         if self.layer_idx == 0 {
@@ -114,7 +105,7 @@ impl Glm5KdaLayer {
                 stream,
             )?;
         }
-        self.hc_pre(&self.hc.attn, hidden, m, ctx, stream)?;
+        self.hc_pre(&self.hc.attn, hidden, m, None, ctx, stream)?;
 
         let normed = ctx.buffers.norm_output();
         ops::rms_norm(
@@ -134,36 +125,28 @@ impl Glm5KdaLayer {
         // the NVFP4 weights once.
         let projected = ctx.buffers.qkv_output();
         let plane_bytes = n * p * bf16;
-        self.project_hot_multi_decode(
-            normed,
-            &self.weights.q_proj,
-            projected,
-            m,
-            p_u32,
-            h_u32,
-            ctx,
-            stream,
-        )?;
-        self.project_hot_multi_decode(
-            normed,
-            &self.weights.k_proj,
-            projected.offset(plane_bytes),
-            m,
-            p_u32,
-            h_u32,
-            ctx,
-            stream,
-        )?;
-        self.project_hot_multi_decode(
-            normed,
-            &self.weights.v_proj,
-            projected.offset(2 * plane_bytes),
-            m,
-            p_u32,
-            h_u32,
-            ctx,
-            stream,
-        )?;
+        // MXFP8 twins: Q, K, V in one launch (`try_project_qkv_mxfp8`).
+        if !self.try_project_qkv_mxfp8(normed, projected, plane_bytes, m, p, h_u32, ctx, stream)? {
+            for (i, w) in [
+                &self.weights.q_proj,
+                &self.weights.k_proj,
+                &self.weights.v_proj,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                self.project_hot_multi_decode(
+                    normed,
+                    w,
+                    projected.offset(i * plane_bytes),
+                    m,
+                    p_u32,
+                    h_u32,
+                    ctx,
+                    stream,
+                )?;
+            }
+        }
 
         let beta = projected.offset(3 * plane_bytes);
         self.project_dense_multi_decode(
@@ -304,22 +287,10 @@ impl Glm5KdaLayer {
         }
         self.hc_post(normed, m, ctx, stream)?;
 
-        let mixer_us = if let Some(t0) = mixer_t0 {
-            ctx.gpu.synchronize(stream)?;
-            t0.elapsed().as_micros()
-        } else {
-            0
-        };
-        let ffn_t0 = if profile {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
         // Keep mixer and FFN batching independently switchable for diagnosis.
         // Atlas's K=3 FFN path emits a contiguous [N,H] result, so mHC can
         // consume the entire batch once.
-        self.hc_pre(&self.hc.ffn, hidden, m, ctx, stream)?;
+        self.hc_pre(&self.hc.ffn, hidden, m, None, ctx, stream)?;
         ops::rms_norm(
             ctx.gpu,
             self.rms_norm_k,
@@ -392,15 +363,6 @@ impl Glm5KdaLayer {
             )?;
         }
 
-        if let Some(t0) = ffn_t0 {
-            ctx.gpu.synchronize(stream)?;
-            tracing::info!(
-                "ATLAS_GLM_KDA_MS_PROFILE n={n} layer={} mixer={}us ffn={}us",
-                self.layer_idx,
-                mixer_us,
-                t0.elapsed().as_micros(),
-            );
-        }
         Ok(())
     }
 }

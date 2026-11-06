@@ -18,7 +18,7 @@ use super::block_mgmt::{
 };
 use super::ssm_pool::SsmStatePool;
 use super::ssm_snapshot::SsmSnapshotPool;
-use super::types::{PinnedMetaStaging, TransformerModel};
+use super::types::{EP_CMD_BUF_BYTES, EP_MIN_STRIDE, PinnedMetaStaging, TransformerModel};
 use crate::layer::{
     AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
 };
@@ -224,10 +224,41 @@ impl TransformerModel {
     /// most 2 NCCL ops per chunk-0 cache hit (negligible vs the prefill
     /// compute it unblocks).
     pub(super) fn ep_min_u32(&self, val: u32) -> Result<u32> {
+        self.ep_min_u32_with(val, false)
+    }
+
+    /// [`Self::ep_min_u32`] where rank 0 may arrive long after the others
+    /// (it encoded vision items they only receive: about 20 s per 2048^2
+    /// image). The others take rank 0's word as an idle receive, which the
+    /// slow-collective latch does not count, so a long encode does not mark
+    /// the communicator unhealthy. Same collectives, same order.
+    pub(super) fn ep_min_u32_head_late(&self, val: u32) -> Result<u32> {
+        self.ep_min_u32_with(val, true)
+    }
+
+    fn ep_min_u32_with(&self, val: u32, head_late: bool) -> Result<u32> {
         let Some(comm) = self.comm.as_ref() else {
             return Ok(val);
         };
         let stream = self.gpu.default_stream();
+        // One gather of every rank's value where the transport has one (the
+        // chain), instead of a broadcast, sync and copy back per rank: the
+        // same minimum, one round.
+        let world = comm.world_size();
+        if world * EP_MIN_STRIDE <= EP_CMD_BUF_BYTES && comm.supports_gather_async(4) {
+            let base = self.ep_cmd_buf;
+            self.gpu
+                .copy_h2d(&val.to_le_bytes(), base.offset(comm.rank() * EP_MIN_STRIDE))?;
+            if comm.gather_async(base.0, EP_MIN_STRIDE as i64, 4, stream)? {
+                self.gpu.synchronize(stream)?;
+                let mut buf = vec![0u8; world * EP_MIN_STRIDE];
+                self.gpu.copy_d2h(base, &mut buf)?;
+                return Ok((0..world)
+                    .map(|r| u32::from_le_bytes(buf[r * EP_MIN_STRIDE..][..4].try_into().unwrap()))
+                    .min()
+                    .unwrap_or(val));
+            }
+        }
         // Loop over the ranks of the ACTUAL communicator: under pure TP
         // (`--tp-size 2 --ep-size 1`) `ep_world_size` is 1 but the comm
         // spans `tp_world_size` ranks — looping only `0..1` would leave
@@ -243,7 +274,11 @@ impl TransformerModel {
                 comm.broadcast(self.ep_cmd_buf.0, 4, root)?;
                 val
             } else {
-                comm.broadcast(self.ep_cmd_buf.0, 4, root)?;
+                if head_late && root == 0 {
+                    comm.receive_idle_command_word(self.ep_cmd_buf.0)?;
+                } else {
+                    comm.broadcast(self.ep_cmd_buf.0, 4, root)?;
+                }
                 self.gpu.synchronize(stream)?;
                 let mut buf = [0u8; 4];
                 self.gpu.copy_d2h(self.ep_cmd_buf, &mut buf)?;
@@ -285,13 +320,27 @@ impl TransformerModel {
     /// in `sample_first_token` D2H, worker in the next cmd recv, both
     /// GPUs spinning in NCCL kernels).
     /// `(window, request)` vision-row bounds the API admits against
-    /// (`vision_limits`). Enntity/atlas b060f987.
+    /// (`vision_limits`) and both ranks apply to the vision wire state.
+    /// Derived from the shared configuration only, so the head and the
+    /// worker agree. Enntity/atlas b060f987.
+    ///
+    /// The native GLM tower on a multi-rank world keeps a deferred request
+    /// inside its window: that is what the rank protocol admitted before
+    /// (the header was checked against the window), and the per-chunk
+    /// encode past it is not measured on GLM. A single GLM rank never checked
+    /// the header, so it keeps the context bound (its chunks are still
+    /// checked against the window). Enntity/atlas ab1823c8.
     pub(crate) fn vision_row_bounds(&self) -> crate::model::vision_transport::VisionRowBounds {
         let ve = self.vision_encoder.as_ref();
         let window = ve.map_or(0, |ve| ve.output_rows());
+        let glm = ve.is_some_and(|ve| ve.is_glm());
         crate::model::vision_transport::VisionRowBounds {
             window,
-            request: self.config.max_seq_len,
+            request: if glm && self.multi_rank_protocol_active() {
+                window
+            } else {
+                self.config.max_seq_len
+            },
         }
     }
 
@@ -409,6 +458,7 @@ impl TransformerModel {
     /// - 0xFFFFFFF2/3/4: verify K=2/3/4 → K tokens, then accept/num_accepted
     /// - 0xFFFFFFF5/6/7, 0xFFFFFFE1, 0xFFFFFFEB/EC: GLM/vision extensions (`impl_a2_ep_worker`)
     /// - 0xFFFFFFE6: batched multi-sequence verify (`trait_impl/ep_verify_batch.rs`)
+    /// - 0xFFFFFFE8: packed multi-prompt prefill (`glm_packed_prefill`)
     /// - 0xFFFFFFF8: cache this slot's sequence (`trait_impl::finish_leaf`)
     /// - 0xFFFFFFED: plant a prefix checkpoint → position (`prefill_b::pc_inflight`)
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored; applies to the whole worker)
@@ -500,7 +550,9 @@ impl TransformerModel {
         let stream = self.gpu.default_stream();
 
         match cmd {
-            super::vision_transport::EP_CMD_VISION_STATE => self.ep_worker_recv_vision_state()?,
+            super::vision_transport::EP_CMD_VISION_STATE => {
+                self.ep_worker_recv_vision_state(seq)?
+            }
             super::glm_long_verify::EP_CMD_GLM_LONG_TAIL => self.glm_long_receive_tail(seq)?,
             0xFFFFFFF6 => self.ep_worker_set_native_fence(seq)?,
             crate::traits::EP_CMD_PC_PLANT => self.pc_plant_receive(seq)?,
