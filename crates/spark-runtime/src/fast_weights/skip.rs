@@ -54,7 +54,7 @@ impl FastSafetensorsLoader {
     /// keeps its own replication rules, and the scalars load as usual.
     fn is_expert_tp_slice(&self, name: &str) -> bool {
         self.expert_tp
-            && !name.starts_with("mtp.")
+            && !(name.starts_with("mtp.") || name.starts_with("model.mtp."))
             && (name.ends_with(".weight") || name.ends_with(".weight_scale"))
             && parse_expert_index(name).is_some()
             && ![
@@ -100,7 +100,7 @@ impl FastSafetensorsLoader {
             return true;
         }
         // MTP head weights for a model whose loader does not build one.
-        if self.skip_mtp && name.starts_with("mtp.") {
+        if self.skip_mtp && (name.starts_with("mtp.") || name.starts_with("model.mtp.")) {
             return true;
         }
         // Dead namespaces the model's loader never reads (e.g. the omni
@@ -124,7 +124,7 @@ impl FastSafetensorsLoader {
         if self.ep_world_size <= 1 {
             return false;
         }
-        if name.starts_with("mtp.") {
+        if name.starts_with("mtp.") || name.starts_with("model.mtp.") {
             return false;
         }
         if let Some(idx) = parse_expert_index(name) {
@@ -172,7 +172,7 @@ fn debug_layer_dropped(name: &str) -> bool {
     }) else {
         return false;
     };
-    if name.starts_with("mtp.") {
+    if name.starts_with("mtp.") || name.starts_with("model.mtp.") {
         return false;
     }
     let Some(at) = name.find(".layers.") else {
@@ -181,4 +181,18 @@ fn debug_layer_dropped(name: &str) -> bool {
     let rest = &name[at + ".layers.".len()..];
     let digits = rest.split('.').next().unwrap_or("");
     digits.parse::<usize>().is_ok_and(|i| i >= keep)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FastSafetensorsLoader;
+
+    #[test]
+    fn model_mtp_namespace_is_covered_by_skip_mtp() {
+        let mut loader = FastSafetensorsLoader::new();
+        loader.skip_mtp = true;
+        assert!(loader.should_skip_tensor("model.mtp.layers.0.enorm.weight"));
+        assert!(loader.should_skip_tensor("mtp.layers.0.enorm.weight"));
+        assert!(!loader.should_skip_tensor("model.layers.0.enorm.weight"));
+    }
 }
