@@ -55,6 +55,13 @@ INTHINK_ENV=""
 if [ -n "${ATLAS_INTHINK_TOOL_LEAK_OPENERS+x}" ]; then
   INTHINK_ENV="-e ATLAS_INTHINK_TOOL_LEAK_OPENERS=$ATLAS_INTHINK_TOOL_LEAK_OPENERS"
 fi
+TIMING_ENV=""
+if [ -n "${ATLAS_DFLASH_LAYER_TIMING+x}" ]; then
+  TIMING_ENV="-e ATLAS_DFLASH_LAYER_TIMING=$ATLAS_DFLASH_LAYER_TIMING"
+fi
+if [ -n "${ATLAS_GLM_VERIFY_PROFILE+x}" ]; then
+  TIMING_ENV="$TIMING_ENV -e ATLAS_GLM_VERIFY_PROFILE=$ATLAS_GLM_VERIFY_PROFILE"
+fi
 DFLASH="${DFLASH:-0}"
 # Block size 8 (7 drafts per step) and the trained 1024-token sliding window.
 DFLASH_GAMMA="${DFLASH_GAMMA:-4}"  # γ sweep 3/4/5/6/8 on GB10: 4 fastest
@@ -123,6 +130,7 @@ sudo docker run -d \
   $SWA_EVICT_ENV \
   $MOE_ROWS_ENV \
   $INTHINK_ENV \
+  $TIMING_ENV \
   ${ATLAS_PROFILE_FIRST:+-e ATLAS_PROFILE_FIRST=$ATLAS_PROFILE_FIRST} \
   -v "${HOME}/.cache/huggingface:/root/.cache/huggingface" \
   "$IMAGE" serve "$MODEL" \
@@ -155,6 +163,7 @@ ssh "$WORKER_IP" "sudo docker run -d \
   $SWA_EVICT_ENV \
   $MOE_ROWS_ENV \
   $INTHINK_ENV \
+  $TIMING_ENV \
   ${ATLAS_PROFILE_FIRST:+-e ATLAS_PROFILE_FIRST=$ATLAS_PROFILE_FIRST} \
   -v \"\${HOME}/.cache/huggingface:/root/.cache/huggingface\" \
   $IMAGE serve $MODEL \

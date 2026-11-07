@@ -572,7 +572,11 @@ impl TransformerModel {
                 );
 
             let mut ssm_idx = 0usize;
+            let mut t_attn = 0u64;
+            let mut t_moe = 0u64;
+            let mut t_other = 0u64;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let layer_t0 = time_layers.then(std::time::Instant::now);
                 if let Some(key) = piece_key.as_deref()
                     && self.verify_batch_piece_run(
                         layer_idx,
@@ -664,6 +668,27 @@ impl TransformerModel {
                         "K4_DIAG(batched): CUDA error after layer {layer_idx} ({layer_type:?}): {e:#}"
                     );
                 }
+
+                if let Some(t0) = layer_t0 {
+                    self.gpu.synchronize(stream)?;
+                    let dt = t0.elapsed().as_micros() as u64;
+                    match layer_type {
+                        LayerType::FullAttention | LayerType::SlidingAttention => {
+                            t_attn += dt
+                        }
+                        LayerType::Moe => t_moe += dt,
+                        _ => t_other += dt,
+                    }
+                }
+            }
+
+            if time_layers {
+                tracing::info!(
+                    "DFLASH LAYER_TIMING rows={r_total}: attn={:.1}ms moe={:.1}ms other={:.1}ms",
+                    t_attn as f64 / 1000.0,
+                    t_moe as f64 / 1000.0,
+                    t_other as f64 / 1000.0
+                );
             }
 
             if wide {
