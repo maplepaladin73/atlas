@@ -339,9 +339,7 @@ impl TransformerModel {
                     self.gpu.synchronize(stream)?;
                     let dt = t0.elapsed().as_micros() as u64;
                     match layer_type {
-                        LayerType::FullAttention | LayerType::SlidingAttention => {
-                            t_attn += dt
-                        }
+                        LayerType::FullAttention | LayerType::SlidingAttention => t_attn += dt,
                         LayerType::Moe => t_moe += dt,
                         _ => t_other += dt,
                     }
