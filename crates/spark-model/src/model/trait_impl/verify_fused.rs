@@ -204,12 +204,14 @@ impl TransformerModel {
         let glm_tp_graphs = self.config.model_type == "glm5_next"
             && self.config.tp_world_size == 2
             && crate::model::graph_flags::glm_tp_verify_graph();
+        let time_layers = std::env::var("ATLAS_DFLASH_LAYER_TIMING").ok().as_deref() == Some("1");
         let use_graphs = (self.comm.is_none() || glm_tp_graphs)
             && !self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
             && !hss_engaged
-            && !lora_eager;
+            && !lora_eager
+            && !time_layers;
 
         crate::layers::moe::validate_shared_fp8_cache_graphs(&self.config.model_type, use_graphs)?;
 
@@ -263,7 +265,11 @@ impl TransformerModel {
                 self.gpu.begin_capture(stream)?;
             }
 
+            let mut t_attn = 0u64;
+            let mut t_moe = 0u64;
+            let mut t_other = 0u64;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let layer_t0 = time_layers.then(std::time::Instant::now);
                 let layer_type = self.config.layer_type(layer_idx);
 
                 if matches!(
@@ -328,6 +334,27 @@ impl TransformerModel {
                 // always conditions on an accepted token's per-layer hidden, never
                 // on a potentially-rejected draft's hidden.
                 self.try_dflash_capture(layer_idx, 0, stream)?;
+
+                if let Some(t0) = layer_t0 {
+                    self.gpu.synchronize(stream)?;
+                    let dt = t0.elapsed().as_micros() as u64;
+                    match layer_type {
+                        LayerType::FullAttention | LayerType::SlidingAttention => {
+                            t_attn += dt
+                        }
+                        LayerType::Moe => t_moe += dt,
+                        _ => t_other += dt,
+                    }
+                }
+            }
+
+            if time_layers {
+                tracing::info!(
+                    "DFLASH LAYER_TIMING fused m={m}: attn={:.1}ms moe={:.1}ms other={:.1}ms",
+                    t_attn as f64 / 1000.0,
+                    t_moe as f64 / 1000.0,
+                    t_other as f64 / 1000.0
+                );
             }
 
             // Final norm over all M rows.
