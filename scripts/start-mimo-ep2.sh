@@ -62,6 +62,9 @@ fi
 if [ -n "${ATLAS_GLM_VERIFY_PROFILE+x}" ]; then
   TIMING_ENV="$TIMING_ENV -e ATLAS_GLM_VERIFY_PROFILE=$ATLAS_GLM_VERIFY_PROFILE"
 fi
+if [ -n "${ATLAS_DFLASH_DEBUG_NO_GRAPH+x}" ]; then
+  TIMING_ENV="$TIMING_ENV -e ATLAS_DFLASH_DEBUG_NO_GRAPH=$ATLAS_DFLASH_DEBUG_NO_GRAPH"
+fi
 DFLASH="${DFLASH:-0}"
 # Block size 8 (7 drafts per step) and the trained 1024-token sliding window.
 DFLASH_GAMMA="${DFLASH_GAMMA:-4}"  # γ sweep 3/4/5/6/8 on GB10: 4 fastest
