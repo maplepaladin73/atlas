@@ -30,7 +30,7 @@ pub(in crate::scheduler) fn raw_argmax_is_pick(a: &ActiveSeq) -> bool {
         && a.frequency_penalty == 0.0
         && a.lz_penalty == 0.0
         && a.dry_multiplier == 0.0
-        && a.logit_bias.is_empty()
+        && crate::scheduler::min_tokens_ban::bias_is_hard_bans_only(&a.logit_bias)
         && !tool_pin_armed(a)
 }
 
@@ -47,6 +47,9 @@ pub(in crate::scheduler) fn raw_pick_masked(a: &ActiveSeq, tok: u32) -> bool {
     Some(tok) == a.think_end_token
         || Some(tok) == a.think_start_token
         || (a.suppress_tool_call && Some(tok) == a.tool_call_start_token)
+        || a.logit_bias
+            .iter()
+            .any(|&(id, delta)| id == tok && delta == f32::NEG_INFINITY)
 }
 
 /// One row's pick as plain decode makes it: the GPU argmax where
@@ -92,4 +95,31 @@ pub(in crate::scheduler) fn pick_row(
             &row, fp32, vocab, a, ctx,
         ),
     )
+}
+
+/// Bootstrap scores come from the same processed row that selected the token.
+/// Requests without scores retain the raw-argmax fast path unchanged.
+pub(in crate::scheduler) fn pick_row_scored(
+    model: &dyn Model,
+    logits: DevicePtr,
+    a: &mut ActiveSeq,
+    ctx: &LogitsContext,
+    gpu_argmax: Option<u32>,
+) -> anyhow::Result<(u32, Option<crate::api::TokenLogprobs>)> {
+    let Some(k) = a.top_logprobs else {
+        return pick_row(model, logits, a, ctx, gpu_argmax).map(|tok| (tok, None));
+    };
+    crate::scheduler::emit_step::PickEffects::clear(a);
+    let fp32 = model.decode_logits_fp32();
+    let vocab = model.vocab_size();
+    let mut bytes = crate::scheduler::verify_pipeline_helper::HostRows::take(
+        &ctx.scratch.host_bytes,
+        vocab * if fp32 { 4 } else { 2 },
+    );
+    model.copy_logits_to_host(logits, &mut bytes)?;
+    let mut row = Vec::with_capacity(vocab);
+    crate::scheduler::verify_pipeline_helper::dequant_into(&bytes, fp32, vocab, &mut row);
+    let tok = crate::scheduler::verify_pipeline_helper::pick_dequantized(&mut row, vocab, a, ctx);
+    let lp = crate::scheduler::logprobs::extract_logprobs_from_f32(&row, tok, k as usize);
+    Ok((tok, Some(lp)))
 }

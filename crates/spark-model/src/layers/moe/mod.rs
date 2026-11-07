@@ -19,6 +19,8 @@ pub(crate) use btile_model_owners::{
 };
 #[cfg(test)]
 pub(crate) use gate_up_repack::model_fixture as btile_model_fixture;
+#[cfg(test)]
+pub(crate) use gate_up_repack::recording as kernel_recording;
 
 /// Device-side pointer table for one projection across all experts.
 ///
@@ -215,6 +217,8 @@ mod forward_prefill_bf16;
 mod forward_prefill_finish;
 mod forward_prefill_fp8;
 mod forward_prefill_phase;
+mod prefill_offset_read;
+pub(crate) use prefill_offset_read::take_offset_read_wait;
 mod forward_prefill_q38;
 pub(crate) use forward_prefill_q38::{q38_requested, sp_shared_requested, w2_requested};
 mod forward_prefill_q38_nodup;
@@ -234,6 +238,10 @@ mod forward_prefill_w4a4;
 pub(crate) use forward_prefill_w4a4::requested as w4a4_requested;
 mod w4a4_scales;
 pub(crate) use w4a4_scales::W4a4Scales;
+mod decode_a16;
+pub(crate) use decode_a16::{DecodeRows, PromptRows, requested as decode_a16_requested};
+mod input_scales;
+pub(crate) use input_scales::{InputScales, requested as input_scales_requested};
 mod forward_rows;
 mod forward_rows_t;
 mod forward_token_major;
@@ -247,6 +255,7 @@ mod helpers_c;
 mod helpers_shared;
 mod shared_mxfp8;
 pub(crate) use shared_mxfp8::{Mxfp8SharedExpert, requested as shared_mxfp8_requested};
+mod helpers_shared_only;
 mod route_dump;
 mod shared_fp8_cache;
 mod shared_fp8_cache_load;
@@ -254,6 +263,7 @@ mod shared_fp8_cache_output;
 #[cfg(test)]
 mod shared_fp8_cache_test_gpu;
 mod shared_fp8_origin;
+pub(crate) mod shared_native;
 pub(crate) use gate_up_m16::validate_m16_gate_up_graphs;
 pub(crate) use shared_fp8_cache::SharedFp8Reserve;
 pub(crate) use shared_fp8_cache::validate_shared_fp8_cache_factory_reserve;
@@ -263,12 +273,17 @@ mod init;
 mod init_batched;
 mod init_ctor;
 mod init_optional;
+mod init_router;
 mod init_t_rows;
 mod inplace_transpose;
 mod m5_projection_oracle;
 mod m5_projections;
 mod mmq_layout;
+mod route_fuse;
 mod router_bn4;
+mod sp_quant_gather;
+pub(crate) use init_optional::down_e4m3_requested;
+pub(crate) use route_fuse::route_fuse_requested;
 mod router_prefill_bn32;
 mod shared_fp8_cache_bytes;
 mod shared_m16;
@@ -281,7 +296,8 @@ mod mxfp8_exact_tests;
 mod prequant_fp4;
 mod prequant_fp4_c3;
 mod prequant_fp4_down;
-pub(crate) use prequant_fp4::with_owner_rows;
+pub(crate) use prequant_fp4::{glm_tp_ep, with_owner_rows};
+pub(crate) use route_fuse::DeadRows;
 mod ptr_table_build;
 mod qwen4exp_fast;
 pub(crate) mod union_stats;

@@ -2,7 +2,11 @@
 
 use anyhow::Result;
 
+use super::dflash_ctx_window;
 use super::types::TransformerModel;
+
+#[path = "impl_b3_dflash/ctx_len.rs"]
+mod ctx_len;
 
 impl TransformerModel {
     /// Copy `rows` target hidden rows, starting at forward row `row0`, into
@@ -10,7 +14,7 @@ impl TransformerModel {
     /// (GLM-5) keep the residual in the FP32 highway and `hidden_states` holds
     /// only the next sublayer's mixed input, so they contract the highway by
     /// stream mean — the reference DFlash target hidden — instead.
-    fn dflash_capture_rows(
+    pub(super) fn dflash_capture_rows(
         &self,
         row0: usize,
         rows: usize,
@@ -23,7 +27,8 @@ impl TransformerModel {
             return Ok(());
         }
         let trace = std::env::var("ATLAS_DFLASH_CAPTURE_TRACE").as_deref() == Ok("1");
-        let result = self.dflash_capture_rows_inner(row0, rows, dst, dst_stride, stream);
+        let result =
+            self.dflash_capture_rows_inner(&self.buffers, row0, rows, dst, dst_stride, stream);
         if trace && result.is_ok() {
             // Debug only: synchronous readback of the first captured row.
             self.gpu.synchronize(stream)?;
@@ -40,8 +45,11 @@ impl TransformerModel {
         result
     }
 
-    fn dflash_capture_rows_inner(
+    /// [`Self::dflash_capture_rows`] from the rows of `arena` (the model's,
+    /// or a pipelined half-chunk's).
+    pub(in crate::model) fn dflash_capture_rows_inner(
         &self,
+        arena: &spark_runtime::buffers::BufferArena,
         row0: usize,
         rows: usize,
         dst: spark_runtime::gpu::DevicePtr,
@@ -50,6 +58,18 @@ impl TransformerModel {
     ) -> Result<()> {
         let h = self.config.hidden_size;
         let hc = self.config.hc_mult;
+        if let Some(src) = crate::layers::glm_sp::capture_source() {
+            // The chunk's rows, contracted and gathered already.
+            return self.gpu.copy_d2d_2d_async(
+                src.offset(row0 * h * 2),
+                h * 2,
+                dst,
+                dst_stride,
+                h * 2,
+                rows,
+                stream,
+            );
+        }
         if hc > 1 {
             static KERNEL: std::sync::OnceLock<spark_runtime::gpu::KernelHandle> =
                 std::sync::OnceLock::new();
@@ -78,7 +98,7 @@ impl TransformerModel {
             return spark_runtime::kernel_args::KernelLaunch::new(self.gpu.as_ref(), kernel)
                 .grid([rows as u32, 1, 1])
                 .block([256, 1, 1])
-                .arg_ptr(self.buffers.hc_streams().offset(
+                .arg_ptr(arena.hc_streams().offset(
                     row0 * hc * h * crate::layers::ops::hc_elem_bytes(&self.config.model_type),
                 ))
                 .arg_ptr(dst)
@@ -87,7 +107,7 @@ impl TransformerModel {
                 .arg_u32((dst_stride / 2) as u32)
                 .launch(stream);
         }
-        let src = self.buffers.hidden_states();
+        let src = arena.hidden_states();
         for t in 0..rows {
             self.gpu.copy_d2d_async(
                 src.offset((row0 + t) * h * 2),
@@ -123,6 +143,21 @@ impl TransformerModel {
         proc_count: usize,
         stream: u64,
     ) -> Result<()> {
+        self.try_dflash_prefill_capture_layer_at(seq, layer_idx, chunk_start, proc_count, 0, stream)
+    }
+
+    /// [`Self::try_dflash_prefill_capture_layer`] for a pass whose rows sit
+    /// at arena row `row_base` (a packed prefill's prompt,
+    /// `glm_packed_prefill`): the same capture plan, read `row_base` rows on.
+    pub(super) fn try_dflash_prefill_capture_layer_at(
+        &self,
+        seq: &mut crate::traits::SequenceState,
+        layer_idx: usize,
+        chunk_start: usize,
+        proc_count: usize,
+        row_base: usize,
+        stream: u64,
+    ) -> Result<()> {
         if self.dflash_capture_layers.is_empty() {
             return Ok(());
         }
@@ -149,27 +184,110 @@ impl TransformerModel {
             },
             None => return Ok(()),
         };
+        if dstate.max_ctx_len == 0 {
+            return Ok(()); // ctx conditioning disabled
+        }
+        if self.config.model_type == "glm5_next" {
+            if dstate.ctx_hidden_acc.0 == 0
+                && let Some(ref proposer) = self.proposer
+            {
+                proposer.acquire_ctx_acc(self.gpu.as_ref(), dstate)?;
+            }
+            let h = self.config.hidden_size;
+            let bf16 = 2usize;
+            let n_capture = self.dflash_capture_layers.len();
+            let acc_base = dstate.ctx_hidden_acc;
+            let own_row = dstate.own_row;
+            // A sequence-parallel chunk keeps only this rank's rows (rank 0: the
+            // upper half, compacted at row 0) in the highway.
+            // Gathered over a chain (`glm_sp::capture_source`), every row is here.
+            let sp_row0 = crate::layers::glm_sp::current()
+                .filter(|_| crate::layers::glm_sp::capture_source().is_none())
+                .map_or(0, |sp| sp.row0);
+            // Enntity/atlas 5573f4d5 + d3953211 (`ATLAS_DFLASH_WARM_CTX`):
+            // the accumulator holds the LAST `max_ctx_len` prompt positions
+            // (slot 0 = position `window_start`); `capture_plan` decides the
+            // anchoring under the switch — legacy reproduces the old math
+            // byte for byte.
+            let pass = crate::layers::dflash_head::warm_ctx::Pass {
+                tokens_len: seq.tokens.len(),
+                prompt_len: seq.prompt_len,
+                start: chunk_start,
+                rows: proc_count,
+                sp_row0,
+                branch_at: seq.pc_branch_at,
+            };
+            let plan = crate::layers::dflash_head::warm_ctx::capture_plan(
+                dstate.warm_ctx,
+                dstate.max_ctx_len,
+                dstate.ctx_floor,
+                &pass,
+            );
+            // Non-legacy `ATLAS_DFLASH_FIRST_APPEND`: keep this pass's last row —
+            // after the final chunk, the last prompt position — in the sequence's
+            // own spare row, whatever the window below keeps.
+            if let Some(own_row) = own_row
+                && let Some(row) = crate::layers::dflash_head::own_capture_row(proc_count, sp_row0)
+            {
+                self.dflash_capture_rows(
+                    row_base + row,
+                    1,
+                    own_row.offset(slot_idx * h * bf16),
+                    n_capture * h * bf16,
+                    stream,
+                )?;
+            }
+            let Some(plan) = plan else {
+                return Ok(());
+            };
+            dstate.note_capture(&plan);
+            return self.dflash_capture_rows(
+                row_base + plan.src_row(&pass),
+                plan.rows(),
+                acc_base.offset(plan.dst_slot() * n_capture * h * bf16 + slot_idx * h * bf16),
+                n_capture * h * bf16,
+                stream,
+            );
+        }
+        // ATLAS_DFLASH_CTX_CARRY + first-chunk bookkeeping. Adopt BEFORE the
+        // first capture write (rather than in
+        // update_dflash_ctx_len_after_prefill, which the chunked path calls
+        // only after the LAST chunk) so that:
+        //   1. The carried accumulator install happens before any writes —
+        //      captures already in the fresh buffer would be orphaned when
+        //      adopt frees it.
+        //   2. Captures append AFTER the carried window — no row is ever
+        //      claimed by two positions.
+        //   3. `ctx_prefill_origin`/`ctx_prefill_base` snapshot where the
+        //      window's own coverage begins, so every chunk's capture rows
+        //      derive as base + (chunk_start - origin) even though ctx_len
+        //      only advances at the last chunk's update.
+        if dstate.ctx_prefill_origin.is_none() {
+            if let Some(ref proposer) = self.proposer {
+                proposer.adopt_dflash_ctx(self.gpu.as_ref(), dstate, &seq.tokens, chunk_start);
+            }
+            dstate.ctx_prefill_origin = Some(chunk_start);
+            dstate.ctx_prefill_base = dstate.ctx_len;
+        }
+        // Lazy accumulator: adopt may have installed the carried buffer
+        // (ctx_hidden_acc != 0 → no-op); a rejected carry just pooled its
+        // buffer, which this pops right back — either way zero device
+        // allocations on the warm path.
+        if dstate.ctx_hidden_acc.0 == 0
+            && let Some(ref proposer) = self.proposer
+        {
+            proposer.acquire_ctx_acc(self.gpu.as_ref(), dstate)?;
+        }
         let h = self.config.hidden_size;
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();
         let acc_base = dstate.ctx_hidden_acc;
-        let max_ctx = dstate.max_ctx_len;
-        let own_row = dstate.own_row;
-        // The accumulator holds the LAST `max_ctx` prompt positions (the
-        // drafter's context window), not the first: slot 0 is position
-        // `window_start`. Earlier rows of this chunk are dropped.
-        let end = chunk_start + proc_count;
-        let window_start = seq.tokens.len().max(end).saturating_sub(max_ctx);
-        let mut first = window_start.max(chunk_start);
-        // A sequence-parallel chunk keeps only this rank's rows (rank 0: the
-        // upper half, compacted at row 0) in the highway.
-        let sp_row0 = crate::layers::glm_sp::current().map_or(0, |sp| sp.row0);
-        first = first.max(chunk_start + sp_row0);
-        // Non-legacy `ATLAS_DFLASH_FIRST_APPEND`: keep this pass's last row —
-        // after the final chunk, the last prompt position — in the sequence's
-        // own spare row, whatever the window below keeps.
-        if let Some(own_row) = own_row
-            && let Some(row) = crate::layers::dflash_head::own_capture_row(proc_count, sp_row0)
+        let acc_rows = dstate.ctx_acc_rows;
+        let src_base = self.buffers.hidden_states();
+        // First-append policy is shared by every target, independently of
+        // the compacted/carry window's retention policy below.
+        if let Some(own_row) = dstate.own_row
+            && let Some(row) = crate::layers::dflash_head::own_capture_row(proc_count, 0)
         {
             self.dflash_capture_rows(
                 row,
@@ -179,41 +297,61 @@ impl TransformerModel {
                 stream,
             )?;
         }
-        if first >= end {
-            return Ok(());
+        // Dense-window append: the ctx accumulator is a compacted array of
+        // rows [0..ctx_len) with per-row absolute positions in
+        // ctx_positions — NOT a position-indexed buffer. Carried rows sit in
+        // [0..ctx_prefill_base); captures land at base + (chunk_start -
+        // origin). Overflow → plan_capture slides to the newest
+        // max_ctx_len/2 rows; a chunk bigger than keep gets move_rows = 0
+        // and its leading `skip` tokens drop (the old inline code truncated
+        // at acc_rows, then the NEXT chunk's slide read ~200 MB past the
+        // accumulator — the GB10 crash).
+        let plan = dflash_ctx_window::plan_capture(
+            dstate.ctx_prefill_base,
+            dstate.ctx_prefill_origin.unwrap_or(chunk_start),
+            chunk_start,
+            proc_count,
+            acc_rows,
+            dstate.max_ctx_len,
+        );
+        if let Some(slide) = plan.slide {
+            let slot = dstate.ctx_slot_bytes;
+            if slide.move_rows > 0 {
+                self.gpu.copy_d2d_async(
+                    acc_base.offset(slide.drop_n * slot),
+                    acc_base,
+                    slide.move_rows * slot,
+                    stream,
+                )?;
+            }
+            // The plan advanced ctx_prefill_origin past the dropped captures
+            // so positions stay aligned with the rows.
+            let pos = slide.drop_n.min(dstate.ctx_positions.len());
+            dstate.ctx_positions.drain(..pos);
+            dstate.ctx_prefill_base = plan.base;
+            dstate.ctx_prefill_origin = Some(plan.origin);
+            // Rows moved; their drafter-KV slot mapping is stale.
+            dstate.ctx_committed = 0;
+            let keep = dstate.max_ctx_len / 2;
+            let skipped = if plan.skip > 0 {
+                format!(", skipped {} chunk tokens", plan.skip)
+            } else {
+                String::new()
+            };
+            tracing::info!(
+                "DFlash ctx prefill slide: dropped {} oldest rows{skipped} (mid-prefill overflow, keep {keep})",
+                slide.drop_n,
+            );
         }
-        self.dflash_capture_rows(
-            first - chunk_start - sp_row0,
-            end - first,
-            acc_base.offset((first - window_start) * n_capture * h * bf16 + slot_idx * h * bf16),
-            n_capture * h * bf16,
-            stream,
-        )
-    }
-
-    /// After prefill completes, advance the seq's DFlash `ctx_len` to
-    /// `chunk_start + proc_count` so the drafter sees all captured prompt
-    /// positions on the first propose() call.
-    pub(super) fn update_dflash_ctx_len_after_prefill(
-        &self,
-        seq: &mut crate::traits::SequenceState,
-        chunk_start: usize,
-        proc_count: usize,
-    ) -> Result<()> {
-        if self.dflash_capture_layers.is_empty() {
-            return Ok(());
-        }
-        if let Some(ref c) = self.comm
-            && c.rank() != 0
-        {
-            return Ok(());
-        }
-        if let Some(ps) = seq.proposer_state.as_mut()
-            && let Some(dstate) = ps
-                .as_any_mut()
-                .downcast_mut::<crate::layers::DflashProposerState>()
-        {
-            dstate.seed_prefill_ctx(seq.tokens.len(), chunk_start + proc_count, seq.seq_len);
+        for t in plan.skip..proc_count {
+            let row = plan.first_row + (t - plan.skip);
+            if row >= acc_rows {
+                break; // accumulator capacity; retention is enforced by the slide
+            }
+            let src = src_base.offset(t * h * bf16);
+            let dst_offset = row * n_capture * h * bf16 + slot_idx * h * bf16;
+            self.gpu
+                .copy_d2d_async(src, acc_base.offset(dst_offset), h * bf16, stream)?;
         }
         Ok(())
     }
@@ -269,223 +407,5 @@ impl TransformerModel {
             self.try_dflash_capture(layer_idx, token_idx, stream)?;
         }
         Ok(())
-    }
-
-    /// K=gamma EAGLE capture: copy the per-layer hidden of ALL `k` verify rows into
-    /// the row-major `dflash_hidden_save` ([row0 | row1 | ... ], each row =
-    /// n_capture * hidden_size * bf16). Called once per capture layer inside the
-    /// verify graph (k is fixed per captured graph). After verify, the scheduler
-    /// appends rows 0..=num_accepted to ctx so every committed position gets its
-    /// target hidden (fixes the ctx-undercount) and the bonus generator (row
-    /// num_accepted) is the freshest slot (EAGLE). No-op unless DFlash is on,
-    /// this layer is a capture layer, and rank 0.
-    pub(super) fn try_dflash_capture_all(
-        &self,
-        layer_idx: usize,
-        k: usize,
-        stream: u64,
-    ) -> Result<()> {
-        let dst = match self.dflash_hidden_save {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-        if let Some(ref c) = self.comm
-            && c.rank() != 0
-        {
-            return Ok(());
-        }
-        let slot = match self
-            .dflash_capture_layers
-            .iter()
-            .position(|&l| l == layer_idx)
-        {
-            Some(s) => s,
-            None => return Ok(()),
-        };
-        let h = self.config.hidden_size;
-        let bf16 = 2usize;
-        let ctx_slot_bytes = self.dflash_capture_layers.len() * h * bf16;
-        let kmax = self.dflash_hidden_save_rows;
-        debug_assert!(
-            k <= kmax,
-            "try_dflash_capture_all: k={k} exceeds dflash_hidden_save_rows={kmax}"
-        );
-        self.dflash_capture_rows(
-            0,
-            k.min(kmax),
-            dst.offset(slot * h * bf16),
-            ctx_slot_bytes,
-            stream,
-        )
-    }
-
-    /// Batched UNIFIED_CTX capture: seq i owns rows
-    /// `[i * kmax, i * kmax + ks[i])` of `dflash_hidden_save`.
-    pub(super) fn try_dflash_capture_batched(
-        &self,
-        layer_idx: usize,
-        ks: &[usize],
-        off: &[usize],
-        stream: u64,
-    ) -> Result<()> {
-        Self::try_dflash_capture_batched_at(self, layer_idx, ks, off, None, stream)
-    }
-
-    /// Slot-indexed variant: `slots[i]` is sequence i's STABLE SSM slot. The
-    /// capture region is `slots[i] * kmax`, not the batch position — after
-    /// any mid-batch finish (churn/EOS/max_tokens) the pending set reorders,
-    /// and a batch-position region would hand the re-propose another (or a
-    /// dead) sequence's hiddens, poisoning the drafter ctx accumulator (the
-    /// release-binary churn ILA; see the wave-12 session evidence). `None`
-    /// keeps the historical batch-position layout for the single-seq path.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn try_dflash_capture_batched_at(
-        &self,
-        layer_idx: usize,
-        ks: &[usize],
-        off: &[usize],
-        slots: Option<&[usize]>,
-        stream: u64,
-    ) -> Result<()> {
-        let dst = match self.dflash_hidden_save {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-        if let Some(ref c) = self.comm
-            && c.rank() != 0
-        {
-            return Ok(());
-        }
-        let slot = match self
-            .dflash_capture_layers
-            .iter()
-            .position(|&l| l == layer_idx)
-        {
-            Some(s) => s,
-            None => return Ok(()),
-        };
-        let h = self.config.hidden_size;
-        let bf16 = 2usize;
-        let ctx_slot_bytes = self.dflash_capture_layers.len() * h * bf16;
-        let kmax = self.dflash_hidden_save_rows;
-        let nseq = self.dflash_hidden_save_nseq;
-        if let Some(slots) = slots {
-            anyhow::ensure!(
-                slots.len() == ks.len(),
-                "DFlash batched capture owner-slot width {} != batch width {}",
-                slots.len(),
-                ks.len()
-            );
-        }
-        for (i, &k) in ks.iter().enumerate() {
-            let region = slots.map(|s| s[i]).unwrap_or(i);
-            anyhow::ensure!(
-                region < nseq,
-                "DFlash batched capture owner slot {region} exceeds capacity {nseq}"
-            );
-            let seq_base = dst.offset(region * kmax * ctx_slot_bytes);
-            self.dflash_capture_rows(
-                off[i],
-                k.min(kmax),
-                seq_base.offset(slot * h * bf16),
-                ctx_slot_bytes,
-                stream,
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Preserve the current C=1 front before any slot-addressed batch region is
-    /// packed over it. The preserve area is the extra sequence-sized region
-    /// allocated after all owner slots.
-    pub(super) fn preserve_dflash_save_front(&self, k: usize, _stream: u64) -> Result<()> {
-        let dst = match self.dflash_hidden_save {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-        let ctx_slot_bytes = self.dflash_capture_layers.len() * self.config.hidden_size * 2;
-        if ctx_slot_bytes == 0 {
-            return Ok(());
-        }
-        let kmax = self.dflash_hidden_save_rows;
-        let n = k.min(kmax);
-        if n == 0 {
-            return Ok(());
-        }
-        // default_stream, not the caller arg: the front is written by the
-        // capture and read by commit_ctx on the model's (non-blocking)
-        // default stream. The scheduler boundary passes the legacy 0 —
-        // honoring it would leave this copy unordered with both sides.
-        let stream = self.gpu.default_stream();
-        let preserve = dst.offset(self.dflash_hidden_save_nseq * kmax * ctx_slot_bytes);
-        self.gpu
-            .copy_d2d_async(dst, preserve, n * ctx_slot_bytes, stream)
-    }
-
-    /// Compact a slot-addressed capture region to the C=1 front for the
-    /// commit_ctx reader. The slot-0 region already is the front; its original
-    /// rows are preserved once before the batch and restored after the loop.
-    pub(super) fn pack_dflash_save_seq(&self, seq_i: usize, k: usize, stream: u64) -> Result<()> {
-        Self::pack_dflash_save_region(self, seq_i, k, stream)
-    }
-
-    /// Slot-addressed pack: copies the sequence's slot-indexed capture
-    /// region to the front for the commit_ctx reader.
-    pub(super) fn pack_dflash_save_region(
-        &self,
-        slot: usize,
-        k: usize,
-        _stream: u64,
-    ) -> Result<()> {
-        let dst = match self.dflash_hidden_save {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-        let h = self.config.hidden_size;
-        let ctx_slot_bytes = self.dflash_capture_layers.len() * h * 2;
-        if ctx_slot_bytes == 0 {
-            return Ok(());
-        }
-        let kmax = self.dflash_hidden_save_rows;
-        anyhow::ensure!(
-            slot < self.dflash_hidden_save_nseq,
-            "DFlash hidden-save owner slot {slot} exceeds capacity {}",
-            self.dflash_hidden_save_nseq
-        );
-        let n = k.min(kmax);
-        if slot == 0 || n == 0 {
-            return Ok(());
-        }
-        // See preserve_dflash_save_front: must be ordered with the capture
-        // (writer) and commit_ctx (reader), both on the default stream.
-        let stream = self.gpu.default_stream();
-        let src = dst.offset(slot * kmax * ctx_slot_bytes);
-        self.gpu
-            .copy_d2d_async(src, dst, n * ctx_slot_bytes, stream)
-    }
-
-    /// Restore the original C=1 front after the batched commit loop packed
-    /// owner regions over it. The scheduler calls this only when owner slot 0
-    /// was present and therefore was explicitly preserved before the loop.
-    pub(super) fn restore_dflash_save_front(&self, k: usize, _stream: u64) -> Result<()> {
-        let dst = match self.dflash_hidden_save {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-        let ctx_slot_bytes = self.dflash_capture_layers.len() * self.config.hidden_size * 2;
-        if ctx_slot_bytes == 0 {
-            return Ok(());
-        }
-        let kmax = self.dflash_hidden_save_rows;
-        let n = k.min(kmax);
-        if n == 0 {
-            return Ok(());
-        }
-        // See preserve_dflash_save_front: must be ordered with the capture
-        // (writer) and commit_ctx (reader), both on the default stream.
-        let stream = self.gpu.default_stream();
-        let preserve = dst.offset(self.dflash_hidden_save_nseq * kmax * ctx_slot_bytes);
-        self.gpu
-            .copy_d2d_async(preserve, dst, n * ctx_slot_bytes, stream)
     }
 }

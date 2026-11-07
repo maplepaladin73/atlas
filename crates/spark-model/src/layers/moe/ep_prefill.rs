@@ -13,13 +13,17 @@ fn unpermute_vec_eligible(flag: bool, hidden_size: usize, top_k: usize) -> bool 
 }
 
 /// The EP unpermute-reduce kernel: `moe_unpermute_reduce_indexed_ep`, or its
-/// `_vec8` twin (same launch, same bytes) where eligible and shipped. A
-/// target that ships neither (only glm-5.3-flash does) gets a null handle,
-/// which `use_sparse_ep_reduce` reads as "take the dense EP reduce".
+/// `_vec8` twin (same launch, same bytes) where eligible and shipped.
+/// GLM requires the scalar kernel; other model families use their dense reduce.
 pub(super) fn unpermute_ep_kernel(
     gpu: &dyn GpuBackend,
     config: &atlas_core::config::ModelConfig,
 ) -> Result<KernelHandle> {
+    // Only the GLM target ships this sparse EP reduction. Other MoE families
+    // retain the dense reduction and its zero-fill for remote expert rows.
+    if config.model_type != "glm5_next" {
+        return Ok(KernelHandle(0));
+    }
     let max_top_k = config
         .num_experts_per_toks
         .iter()
@@ -45,21 +49,68 @@ pub(super) fn unpermute_ep_kernel(
             return Ok(vec);
         }
     }
-    Ok(super::super::try_kernel_gated(
-        config.model_type == "glm5_next",
-        gpu,
-        "moe",
-        "moe_unpermute_reduce_indexed_ep",
-    ))
+    gpu.kernel("moe", "moe_unpermute_reduce_indexed_ep")
 }
 
 impl MoeLayer {
+    /// The sparse EP reduce over the routed down rows: the E4M3 one when
+    /// they are E4M3 (`e4m3_scales`).
+    pub(super) fn ep_reduce_kernel(&self, e4m3_scales: Option<DevicePtr>) -> KernelHandle {
+        match (e4m3_scales, self.down_e4m3) {
+            (Some(_), Some(e4m3)) => e4m3.unpermute,
+            _ => self.moe_unpermute_reduce_ep,
+        }
+    }
+
     fn use_sparse_ep_reduce(&self, ctx: &ForwardContext) -> bool {
         sparse_ep_reduce_enabled(
             ctx.config.ep_world_size,
             ctx.comm.is_some(),
             self.moe_unpermute_reduce_ep.0 != 0,
         )
+    }
+
+    /// The row blocks of an SP prefill's output seam that this layer leaves
+    /// to the next attention seam (`layers::glm_sp_moe_seam`): on the chain
+    /// with overlapped seams, when the unpermute is the sparse EP reduce (a
+    /// row of it reads only that token's routes) and the blend covers this
+    /// rank's rows after the reduce. `flags`: the shared-expert TP split,
+    /// the shared/routed stream overlap and the deferred K=5 shared blend,
+    /// none of which it takes. `shared_n`: the blend's rows, when blended.
+    pub(super) fn output_seam_blocks(
+        &self,
+        sp: Option<crate::layers::glm_sp::SpRows>,
+        (split, use_overlap, defer_shared_hc): (bool, bool, bool),
+        shared_n: Option<u32>,
+        hidden: u32,
+        ctx: &ForwardContext,
+    ) -> Option<(crate::layers::glm_sp::SpRows, Vec<(usize, usize)>)> {
+        let sp = sp.filter(|&sp| {
+            crate::layers::glm_sp_moe_seam::enabled(sp)
+                && !sp.full_shared
+                && shared_n.is_none_or(|n| n as usize == sp.rows)
+        })?;
+        let inter = ctx.config.routed_inter_local() as u32;
+        // Another lane's seam, a capture or a profile, or a reduce this
+        // seam does not serve.
+        let elsewhere = split
+            || use_overlap
+            || defer_shared_hc
+            || ctx.graph_capture
+            || ctx.profile
+            || self.q38_routed_serves(hidden, inter, ctx);
+        let eligible = !elsewhere && self.use_sparse_ep_reduce(ctx);
+        eligible
+            .then(|| crate::layers::glm_sp_overlap::blocks_or_whole(sp, ctx))
+            .flatten()
+            .map(|blocks| (sp, blocks))
+    }
+
+    /// Whether [`Self::prepare_ep_prefill_outputs`] zeroes the expert
+    /// buffers (remote rows read by a dense reduce, or forced).
+    pub(super) fn ep_prefill_zeroes(&self, ctx: &ForwardContext) -> bool {
+        let force_zero = std::env::var("ATLAS_MOE_PREFILL_ZERO").ok().as_deref() == Some("1");
+        force_zero || (ctx.comm.is_some() && !self.use_sparse_ep_reduce(ctx))
     }
 
     pub(super) fn prepare_ep_prefill_outputs(
@@ -70,16 +121,10 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let force_zero = std::env::var("ATLAS_MOE_PREFILL_ZERO").ok().as_deref() == Some("1");
-        if self.use_sparse_ep_reduce(ctx) && !force_zero {
-            return Ok(());
-        }
-        // The q38 chain reduces local routes only (`moe_q38_unpermute_local`),
-        // so nothing reads the remote rows these clears exist for.
-        if self.q38_routed_serves(hidden, inter, ctx) && !force_zero {
-            return Ok(());
-        }
-        if ctx.comm.is_none() && !force_zero {
+        let force_zero = std::env::var("ATLAS_MOE_PREFILL_ZERO").as_deref() == Ok("1");
+        if !self.ep_prefill_zeroes(ctx)
+            || (self.q38_routed_serves(hidden, inter, ctx) && !force_zero)
+        {
             return Ok(());
         }
         let rows = total_expanded as usize;
@@ -103,6 +148,7 @@ impl MoeLayer {
     pub(super) fn unpermute_ep_prefill(
         &self,
         expert_output: DevicePtr,
+        e4m3_scales: Option<DevicePtr>,
         output: DevicePtr,
         token_to_perm: DevicePtr,
         topk_ids: DevicePtr,
@@ -114,6 +160,32 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        if e4m3_scales.is_some() {
+            // Only the sparse EP reduce reads E4M3 rows (`down_e4m3`
+            // resolves with it).
+            anyhow::ensure!(
+                self.use_sparse_ep_reduce(ctx),
+                "E4M3 down rows need the sparse EP reduce"
+            );
+            let (local_start, local_end) = ctx.config.local_expert_range();
+            ops::moe_unpermute_reduce_indexed_ep(
+                ctx.gpu,
+                self.ep_reduce_kernel(e4m3_scales),
+                expert_output,
+                output,
+                token_to_perm,
+                topk_ids,
+                topk_weights,
+                hidden,
+                tokens,
+                topk,
+                local_start as u32,
+                local_end as u32,
+                e4m3_scales,
+                stream,
+            )?;
+            return Ok(false);
+        }
         if self.try_q38_unpermute(
             expert_output,
             output,
@@ -158,6 +230,7 @@ impl MoeLayer {
                 topk,
                 local_start,
                 local_end,
+                None,
                 stream,
             )?;
             return Ok(false);
@@ -180,7 +253,54 @@ impl MoeLayer {
 
 #[cfg(test)]
 mod tests {
-    use super::{sparse_ep_reduce_enabled, unpermute_vec_eligible};
+    use super::{sparse_ep_reduce_enabled, unpermute_ep_kernel, unpermute_vec_eligible};
+    use crate::layers::moe::MoeLayer;
+    use crate::layers::moe::gate_up_repack::recording::{Event, Gpu};
+    use crate::weight_map::MoeWeights;
+    use atlas_core::config::ModelConfig;
+
+    #[test]
+    fn qwen_moe_constructor_does_not_require_glm_ep_kernels() {
+        for ep_world_size in [1, 2] {
+            let gpu = Gpu::new();
+            *gpu.missing.lock().unwrap() = vec![
+                "moe_unpermute_reduce_indexed_ep".into(),
+                "moe_unpermute_reduce_indexed_ep_vec8".into(),
+            ];
+            let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+            config.model_type = "qwen3_5_moe".into();
+            config.ep_world_size = ep_world_size;
+            let layer = MoeLayer::new(
+                MoeWeights::empty(config.num_experts),
+                config.num_experts,
+                None,
+                &gpu,
+                &config,
+            )
+            .expect("generic MoE uses its existing dense unpermute kernel");
+            assert_eq!(layer.moe_unpermute_reduce_ep.0, 0);
+            assert!(!gpu.trace().iter().any(|event| matches!(
+                event,
+                Event::Lookup(_, name) if name.starts_with("moe_unpermute_reduce_indexed_ep")
+            )));
+        }
+    }
+
+    #[test]
+    fn glm_still_requires_its_ep_kernel() {
+        for ep_world_size in [1, 2] {
+            let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+            config.model_type = "glm5_next".into();
+            config.ep_world_size = ep_world_size;
+            let gpu = Gpu::new();
+            assert_ne!(unpermute_ep_kernel(&gpu, &config).unwrap().0, 0);
+            *gpu.missing.lock().unwrap() = vec![
+                "moe_unpermute_reduce_indexed_ep".into(),
+                "moe_unpermute_reduce_indexed_ep_vec8".into(),
+            ];
+            assert!(unpermute_ep_kernel(&gpu, &config).is_err());
+        }
+    }
 
     #[test]
     fn sparse_reduce_requires_real_ep_communication_and_kernel() {
@@ -198,3 +318,7 @@ mod tests {
         assert!(!unpermute_vec_eligible(true, 4096, 9));
     }
 }
+
+#[cfg(test)]
+#[path = "ep_prefill_test_gpu.rs"]
+mod gpu_tests;

@@ -115,9 +115,7 @@ pub(crate) fn load_weight_store(
         && config.tp_world_size <= 1
         && config.ep_world_size <= 1;
 
-    let use_fast_load =
-        !args.no_fast_load && std::env::var("ATLAS_FAST_LOAD").ok().as_deref() != Some("0");
-    let store = if use_fast_load {
+    let store = if use_fast_load(args) {
         #[cfg(unix)]
         {
             tracing::info!("Using fast weight loader (O_DIRECT + pipelined read/copy)");
@@ -154,7 +152,7 @@ pub(crate) fn load_weight_store(
                 );
             }
             loader.host_decode_modules =
-                spark_model::weight_map::modelopt_local::host_decode_modules(config);
+                spark_model::weight_map::modelopt_local::deferred_modules(config);
             if !loader.host_decode_modules.is_empty() {
                 tracing::info!(
                     "Host-decoded at build, never resident: {} MXFP8 / vision-NVFP4 modules",
@@ -225,6 +223,10 @@ pub(crate) fn load_weight_store(
     Ok(store)
 }
 
+fn use_fast_load(args: &cli::ServeArgs) -> bool {
+    !args.no_fast_load && std::env::var("ATLAS_FAST_LOAD").ok().as_deref() != Some("0")
+}
+
 pub(crate) fn load_dflash_drafter(
     args: &cli::ServeArgs,
     ptx_set: &atlas_kernels::TargetPtxSet,
@@ -251,15 +253,8 @@ pub(crate) fn load_dflash_drafter(
     let drafter_dir =
         crate::model_resolver::resolve_model_dir(&drafter_id, args.cache_dir.as_deref())
             .context("Failed to resolve DFlash drafter checkpoint")?;
-    let drafter_config_json = std::fs::read_to_string(drafter_dir.join("config.json"))
-        .with_context(|| {
-            format!(
-                "Failed to read drafter config.json at {}",
-                drafter_dir.display()
-            )
-        })?;
     let drafter_config =
-        spark_model::weight_loader::dflash_loader::parse_dflash_config(&drafter_config_json)?;
+        spark_model::weight_loader::dflash_mask_embedding::load_drafter_config(&drafter_dir)?;
     // Only the head proposes. A worker keeps the drafter's config (its target
     // capture layers shape the verify rows and SSM pools) but no weights, so
     // no proposer is built there and its memory goes to the KV pool. Under
@@ -276,11 +271,22 @@ pub(crate) fn load_dflash_drafter(
             drafter_config,
         )));
     }
-    let mut loader = spark_runtime::weights::SafetensorsLoader::new();
-    loader.peak_memory_multiplier = None;
-    let mut drafter_store = loader
-        .load(&drafter_dir, gpu, 0)
-        .context("Failed to load DFlash drafter weights")?;
+    // Same tensors and bytes, 0.6 s vs 5.3 s (`dflash_fast_load_check`).
+    let mut drafter_store = if use_fast_load(args) {
+        #[cfg(unix)]
+        {
+            spark_runtime::fast_weights::FastSafetensorsLoader::new().load(&drafter_dir, gpu, 0)
+        }
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("--fast-load requires a Unix host (needs O_DIRECT / posix_fadvise)");
+        }
+    } else {
+        let mut loader = spark_runtime::weights::SafetensorsLoader::new();
+        loader.peak_memory_multiplier = None;
+        loader.load(&drafter_dir, gpu, 0)
+    }
+    .context("Failed to load DFlash drafter weights")?;
     // Before the KV pool is sized, so the freed BF16 bytes become KV blocks.
     if spark_model::weight_loader::dflash_preshrink::requested() {
         spark_model::weight_loader::dflash_preshrink::preshrink(
@@ -391,8 +397,7 @@ fn skip_activation_scales(config: &ModelConfig) -> bool {
     matches!(config.model_type.as_str(), "qwen4_exp")
 }
 
-/// Whether this model's loader builds no MTP head, so `mtp.*` need not be
-/// uploaded at all.
+/// Whether this model's loader builds no MTP head, so `mtp.*` need not be uploaded.
 ///
 /// Measured, not estimated: `mtp.*` on this checkpoint is 5.21 GB (31 tensors,
 /// 5.03 GB of which is the stacked BF16 expert pair) — not the ~1.5 GB an
@@ -400,12 +405,9 @@ fn skip_activation_scales(config: &ModelConfig) -> bool {
 /// against, and on a box where 0.90 utilization is already near the boot floor
 /// it is the difference between a usable KV cache and none.
 fn skip_mtp(config: &ModelConfig, args: &cli::ServeArgs) -> bool {
-    // qwen4_exp now BUILDS an MTP head, but only under `--speculative`
-    // (`weight_loader/qwen4_exp/mtp.rs`). Without the flag the `mtp.*` upload is
-    // 5.21 GB of BF16 held resident for nothing, which on a 119.6 GB unified box
-    // comes straight out of the KV cache. With the flag it is the drafter, on
-    // rank 0 only (`factory::build`): every other rank skips it as well.
-    matches!(config.model_type.as_str(), "qwen4_exp") && (!args.speculative || config.ep_rank != 0)
+    // Both have rank-0-only MTP loaders (`mtp.*` / `model.mtp.*` tensors).
+    matches!(config.model_type.as_str(), "qwen4_exp" | "mimo_v2")
+        && (!args.speculative || config.ep_rank != 0)
 }
 
 #[cfg(test)]
@@ -424,6 +426,22 @@ mod tests {
         };
         let mut config = ModelConfig::qwen3_next_80b_nvfp4();
         config.model_type = "qwen4_exp".to_string();
+        assert!(skip_mtp(&config, &args(&[])));
+        assert!(!skip_mtp(&config, &args(&["--speculative"])));
+        config.ep_rank = 1;
+        assert!(skip_mtp(&config, &args(&["--speculative"])));
+    }
+
+    /// MiMo's `model.mtp.*` (three draft bodies) has the same rank-0-only /
+    /// flag-gated upload policy, with a different tensor namespace.
+    #[test]
+    fn mimo_mtp_is_uploaded_on_the_drafting_rank_only() {
+        let args = |more: &[&str]| {
+            let argv = ["spark", "some/model"].iter().chain(more);
+            crate::cli::ServeArgs::parse_from(argv)
+        };
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "mimo_v2".to_string();
         assert!(skip_mtp(&config, &args(&[])));
         assert!(!skip_mtp(&config, &args(&["--speculative"])));
         config.ep_rank = 1;

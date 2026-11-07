@@ -5,16 +5,27 @@
 mod components;
 mod dense;
 mod expert_tp;
+mod ffn;
+mod fp4l;
+pub(crate) use fp4l::release_expanded;
+mod kda_mx;
+mod kda_side_pack;
 mod layers;
+mod mla_native;
 mod mla_twins;
+pub mod mode;
+mod mtp;
+pub use mtp::Glm5MtpModule;
+pub(crate) use mtp::{glm5_mtp_draft_config, glm5_mtp_marker_names, load_glm5_mtp_module};
 pub(crate) mod retirement;
+mod shared_native;
 mod tp;
 mod vision;
 
 #[cfg(test)]
 mod nvidia_dense_tests;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::KvCacheDtype;
@@ -22,13 +33,24 @@ use spark_runtime::weights::WeightStore;
 
 use super::ModelWeightLoader;
 use crate::layer::TransformerLayer;
-use crate::weight_map::{DenseWeight, MtpWeights, dense, dense_auto};
+use crate::weight_map::{DenseWeight, MtpWeights, dense_auto};
 
 pub struct Glm5WeightLoader;
 
 impl ModelWeightLoader for Glm5WeightLoader {
     fn supports_tp(&self) -> bool {
         true
+    }
+
+    /// A rank that only receives vision rows never reads the tower.
+    fn dead_namespaces(&self, config: &ModelConfig) -> Vec<String> {
+        if crate::layers::vision_encoder::vision_receive_only(config) {
+            ["model.visual.", "model.language_model.visual."]
+                .map(String::from)
+                .to_vec()
+        } else {
+            Vec::new()
+        }
     }
 
     fn load_layers(
@@ -60,7 +82,7 @@ impl ModelWeightLoader for Glm5WeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
-        dense_auto(store, &format!("{}.norm.weight", config.weight_prefix), gpu)
+        fp4l::norm_bf16(store, &format!("{}.norm.weight", config.weight_prefix), gpu)
     }
 
     fn load_lm_head(
@@ -69,14 +91,9 @@ impl ModelWeightLoader for Glm5WeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
-        crate::model::glm_k3_head::initialize_from_weight(
-            gpu,
-            config,
-            store
-                .get("lm_head.weight")
-                .context("GLM-5: missing lm_head.weight")?,
-        )?;
-        dense(store, "lm_head.weight").context("GLM-5: missing lm_head.weight")
+        let head = fp4l::lm_head_bf16(store, gpu)?;
+        crate::model::glm_k3_head::initialize_from_weight(gpu, config, &head)?;
+        Ok(DenseWeight { weight: head.ptr })
     }
 
     fn load_mtp_weights(

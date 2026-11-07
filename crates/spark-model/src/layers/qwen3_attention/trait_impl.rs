@@ -15,6 +15,7 @@ mod diag;
 mod multi_seq;
 pub(crate) use multi_seq::{
     grouped_routed_decode_enabled, grouped_routed_decode_min, pairwise_moe_decode_enabled,
+    rows_moe_decode_enabled,
 };
 mod prefill_inner;
 mod prefill_inner_glm;
@@ -50,6 +51,18 @@ impl TransformerLayer for Qwen3AttentionLayer {
         stream: u64,
     ) -> Result<()> {
         self.prefill_glm_passengers_mla(num_tokens, seq_len_start, passengers, cache, ctx, stream)
+    }
+
+    fn prefill_glm_packed(
+        &self,
+        _hidden: DevicePtr,
+        total: usize,
+        owners: &mut [crate::layer::glm_packed::GlmPackedOwner<'_>],
+        cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.prefill_glm_packed_mla(total, owners, cache, ctx, stream)
     }
 
     fn uses_local_mla_prefill(&self) -> bool {
@@ -451,22 +464,8 @@ impl TransformerLayer for Qwen3AttentionLayer {
         packed_ptrs_t: DevicePtr,
         scale_ptrs_t: DevicePtr,
     ) {
-        if let FfnComponent::Moe(moe) = &mut self.ffn {
-            moe.set_down_transpose_scratch(
-                scratch_packed,
-                scratch_scale,
-                packed_ptrs_t,
-                scale_ptrs_t,
-            );
-        }
-        if let Some(FfnComponent::Moe(moe)) = self.moe_ffn.as_mut() {
-            moe.set_down_transpose_scratch(
-                scratch_packed,
-                scratch_scale,
-                packed_ptrs_t,
-                scale_ptrs_t,
-            );
-        }
+        let scratch = [scratch_packed, scratch_scale, packed_ptrs_t, scale_ptrs_t];
+        moe_transpose::set_moe_down_transpose_scratch_inner(self, scratch);
     }
 
     fn transpose_moe_for_prefill_unified(

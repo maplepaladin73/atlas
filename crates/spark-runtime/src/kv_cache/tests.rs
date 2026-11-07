@@ -8,11 +8,14 @@ use super::*;
 use crate::gpu::GpuBackend;
 use crate::gpu::mock::MockGpuBackend;
 
+mod allocation_failure;
 mod latent_shard;
 mod nvme_bench;
 mod nvme_fast;
+mod nvme_shard;
 mod nvme_spill;
 mod sparse_index;
+mod swa_slots;
 mod zero_alias;
 
 fn test_config() -> KvCacheConfig {
