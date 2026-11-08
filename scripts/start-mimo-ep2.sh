@@ -139,6 +139,14 @@ if [ -n "${NSYS:-}" ]; then
   NSYS_ENV="--entrypoint /wrap/nsys-entry.sh -v /opt/nvidia/nsight-systems/2025.3.2:/opt/nsys:ro -v ${HOME}/profwrap:/wrap:ro"
 fi
 
+NSYS_RANK1_ENV=""
+if [ -n "${NSYS_RANK1:-}" ]; then
+  ssh "$WORKER_IP" "mkdir -p ~/profwrap"
+  scp -q "${HOME}/profwrap/nsys-entry-profile.sh" "$WORKER_IP:~/profwrap/nsys-entry.sh"
+  ssh "$WORKER_IP" "chmod +x ~/profwrap/nsys-entry.sh"
+  NSYS_RANK1_ENV="--entrypoint /wrap/nsys-entry.sh -v /opt/nvidia/nsight-systems/2025.3.2:/opt/nsys:ro -v \${HOME}/profwrap:/wrap:ro"
+fi
+
 # Start rank 0 (head) — HTTP server + scheduler
 echo "Starting rank 0 on $HEAD_IP..."
 sudo docker run -d \
@@ -180,6 +188,7 @@ ssh "$WORKER_IP" "sudo docker run -d \
   --gpus all \
   --ipc=host \
   --network host \
+  $NSYS_RANK1_ENV \
   $RDMA_FLAGS \
   $NCCL_ENV \
   -e RUST_LOG=info \
