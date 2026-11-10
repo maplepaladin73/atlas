@@ -1,7 +1,33 @@
 # HANDOFF: PR #336 `ATLAS_STRICT_SPEC` hardware A/B
 
-**As of 2026-11-10.** Test plan for the agent with access to the two-GB10 pair. Nothing here has
-been run on hardware yet; the code has only passed CPU unit tests.
+**As of 2026-11-10.** Test plan for the agent with access to the two-GB10 pair.
+
+This file lives on the fork-only branch `devin/strict-spec-notes`. The code under test is the head
+of `devin/strict-spec-full-logits`; the two branches differ only under `docs/notes/`. Results are
+committed to this branch (§6). Do not comment on PR #336 and do not push to its branch.
+
+## 0. Where things stand
+
+One single-stream run exists (reported by the local agent, n=4 per arm, temperature 0, replies of
+about 220 tokens, upstream `1f6de550` plus the PR commit, a reduced test profile). It did not use
+this plan or its harness.
+
+| decode tok/s | plain | `json_object` | `json_schema` |
+|---|---|---|---|
+| lever off | 63.0 | 37.4 | 37.5 |
+| lever on | 63.2 | 57.2 | 59.7 |
+
+The same morning, on the previous image (upstream `a523a07f`) with the production profile and an
+idle pair, plain measured 85.9 / 88.8 and `json_object` 35.3 / 37.1.
+
+Two things follow:
+
+- The lever engages and is a single-stream win (`serial=1.00` off, `mtp=1.00 tok_step=2.5-2.7` on).
+- Plain lost about 27% between the two runs while serial structured decode did not move. Other
+  traffic would have slowed both, so the cause is the test profile or the newer base image. It is
+  not known which. §3a settles it and comes first.
+
+The goal is structured output at 80 tok/s or more, at or above the plain rate. 57-60 is not there.
 
 ## 1. What is under test
 
@@ -11,7 +37,8 @@ verify writes full logits, instead of decoding serially. The PR body reports rou
 (structured, serial) against roughly 32 tok/s (plain) from one live observation.
 
 CONTRIBUTING ("Opt-in switches: a neutral result doesn't merge") requires an A/B showing a win
-before an opt-in arm merges, so this run decides the PR. Three questions:
+before an opt-in arm merges, so this run decides the PR. Question 1 is answered (§0); it is
+re-measured here on the production profile. Three questions:
 
 1. Does the lever engage, and is structured output faster with it at one stream?
 2. Is it still faster, or at least not slower, at 2 / 4 / 8 concurrent structured requests? Review
@@ -30,15 +57,30 @@ Follow `.agents/skills/measurement-discipline/SKILL.md`. In short:
 - Record the fingerprint: build commit, checkpoint id and revision, full serve flags, the env
   difference, harness arguments, date.
 - Three repetitions per case (the harness default). Label the result "single session, n=3".
-- Nothing posted publicly may contain host names, IP addresses, interface names or user paths.
+- An idle pair. If other traffic reaches the pair during a run, discard that run and repeat it.
+- Nothing committed may contain host names, IP addresses, interface names, user paths, profile or
+  image file names, or credentials. Name the `ATLAS_*` variables and serve flags themselves.
 
 ## 3. Setup
 
-- Build this branch head (`devin/strict-spec-full-logits`) and note `git rev-parse HEAD`.
-- Serve Qwen3.8-Flash-Next on the pair with the usual TP2 profile
-  (`docs/checkpoints/qwen3.8-flash-next-fp4-local-tp2.md` §7). It must include `--speculative`
-  and `--max-num-seqs=8` or more; without `--speculative` neither arm speculates.
+- Build the head of `devin/strict-spec-full-logits` and note `git rev-parse HEAD`.
+- Serve Qwen3.8-Flash-Next on the pair with the **production profile**, unchanged: the same serve
+  flags and the same `ATLAS_*` variables as daily use. Not a reduced test profile.
 - Add `ATLAS_MTP_ACCEPT_DEBUG=1` in both arms and keep the server log of each boot.
+- List every `ATLAS_*` variable the profile sets, with its value, in the results file. Whether
+  `ATLAS_MTP_DYNAMIC_DEPTH`, `ATLAS_MTP_DEEP_START` and `ATLAS_QWEN_COPY_DRAFTS` are set matters
+  for reading the result.
+
+### 3a. Baseline check, before any A/B
+
+With the lever off, on the new build, measure plain decode speed the way the 85.9 / 88.8 figure
+was measured (same script, same prompts, `max_tokens`, idle pair).
+
+- Plain back at about 86-89: the earlier 63 came from the test profile. Continue with §4.
+- Plain still near 63: stop. Boot the previous image (upstream `a523a07f`) with the same profile
+  and measure again. If that reads 86-89, the newer base lost plain speed; report it (§6) with a
+  plain `Done:` line from each image, and do not run the A/B until it is understood. Compare
+  `tok_step` and `mean_na` between the two lines: they show whether plain speculates as deeply.
 
 ## 4. Steps
 
@@ -104,7 +146,11 @@ three repetitions and writes a JSON record.
 
 ## 6. Reporting
 
-Write one PR-ready comment for PR #336 and hand it to Robert, who decides what is posted. It contains:
+Write `docs/notes/RESULTS_PR336_strict_spec.md` on this branch, commit it as
+Robert Anderson <anderson.rw@gmail.com> and push to `devin/strict-spec-notes` on the fork. Nothing
+goes to PR #336: no comment, and no push to `devin/strict-spec-full-logits`. The file contains:
+
+- the §3a baseline numbers and which case applied;
 
 - the fingerprint (§2), with the env difference between arms;
 - the two tables printed by `compare` (noise floor and A/B);
