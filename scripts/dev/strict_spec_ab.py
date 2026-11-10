@@ -178,11 +178,13 @@ def run(args):
     with urllib.request.urlopen(args.url + "/v1/models", timeout=30) as r:
         model = args.model or json.load(r)["data"][0]["id"]
     levels = [int(c) for c in args.concurrency.split(",")]
+    wanted = args.cases.split(",")
     plan = []
     for case, (_, _, _, own) in CASES.items():
-        for c in own or levels:
+        for c in (own or levels) if case in wanted else []:
             plan.append((f"{case}@c{c}", [(case, i) for i in range(c)]))
-    plan.append((f"{MIXED}@c4", [("schema", 0), ("plain", 1), ("plain", 2), ("plain", 3)]))
+    if MIXED in wanted:
+        plan.append((f"{MIXED}@c4", [("schema", 0), ("plain", 1), ("plain", 2), ("plain", 3)]))
     # One discarded request so the first measured one is not a cold start.
     post(args.url, body(model, "plain", 7, 32))
     rows = {}
@@ -278,7 +280,10 @@ def main():
     r.add_argument("--reps", type=int, default=3)
     r.add_argument("--concurrency", default="1,2,4,8",
                    help="levels for the json_schema case; keep within --max-num-seqs")
-    r.add_argument("--max-tokens", type=int, default=800)
+    r.add_argument("--cases", default=",".join([*CASES, MIXED]),
+                   help="comma-separated subset of: " + ", ".join([*CASES, MIXED]))
+    r.add_argument("--max-tokens", type=int, default=2400,
+                   help="room for the 12-item reply to end on its own (800 truncates it)")
     r.add_argument("--commit", default="unknown", help="build commit, recorded")
     r.add_argument("--note", default="", help="serve flags and env, recorded (no host names)")
     c = sub.add_parser("compare")

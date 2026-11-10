@@ -12,8 +12,10 @@ strict `response_format` json_schema with tool_choice unset (auto):
      validates against the schema (jsonschema when installed, else key /
      type / enum checks).
 
+The final turn sends `tool_choice: "none"` unless `--final-tool-choice auto`.
+
 Usage: tools_rfmt_probe.py [--url http://127.0.0.1:8081] [--model M]
-                           [--runs N] [--thinking]
+                           [--runs N] [--thinking] [--final-tool-choice auto]
 Exit status: 0 when every run's final answer is schema-valid JSON.
 """
 import argparse
@@ -131,11 +133,12 @@ def run_once(args, model):
         for c in calls:
             messages.append({"role": "tool", "tool_call_id": c["id"],
                              "content": json.dumps(TOOL_RESULT)})
-        # tool_choice "none" pins the response_format grammar on the final
-        # answer; with tool grammar disabled the auto union would leave the
-        # answer unconstrained.
-        final = post(args.url, {**base, "messages": messages,
-                                "tool_choice": "none"})["choices"][0]
+        # "none" pins the response_format grammar on the final answer: with
+        # the tool grammar disabled (--disable-tool-grammar) an auto request
+        # is left unconstrained. "auto" keeps tool_choice unset, which is the
+        # tool-call-or-JSON union where the tool grammar is on.
+        pin = {} if args.final_tool_choice == "auto" else {"tool_choice": "none"}
+        final = post(args.url, {**base, "messages": messages, **pin})["choices"][0]
     else:
         print("  turn 1: answered without a tool call; checking that answer")
         final = r1
@@ -157,6 +160,8 @@ def main():
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=None,
                     help="send chat_template_kwargs.enable_thinking (default: server's)")
+    ap.add_argument("--final-tool-choice", choices=["none", "auto"], default="none",
+                    help="tool_choice of the final turn: none (default) or auto (unset)")
     args = ap.parse_args()
     args.url = args.url.rstrip("/")
     model = args.model or first_model(args.url)
