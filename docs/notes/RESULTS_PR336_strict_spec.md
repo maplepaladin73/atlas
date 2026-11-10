@@ -347,3 +347,48 @@ Done: 538 tokens (stop) 50.6 tok/s, TTFT=130.7ms, serial=0.00 mtp=1.00 p1=0.627 
 Note the `on` schema@c1 lines run deeper drafts (`depth=k7`, `tok_step=3.629`)
 than `serial` (`depth=k4`, `tok_step=3.162`) at the same wall rate — the
 batched path converts draft depth into throughput at concurrency.
+
+## Merge-regime replication (the #336 merge A/B, run on the Spark pair)
+
+#336 was merged upstream after an A/B on one GB10 (27B target, DFlash2 γ=8
+profile): 6 `json_object` + 6 strict `json_schema` requests, greedy, thinking
+off, 400 max tokens, at C1 then C8, scoring per-request decode tok/s and
+byte-identity. That run flagged the switch as *slower at C8* (per-request
+median 9.5 → 6.2 tok/s). This section replays the same regime against the
+three arms on the pair build (`f62215013`, production profile, fresh boot per
+arm, idle pair). Probe: `scripts/dev/strict_spec_c8_probe.py`; decode rate is
+the server-attested `usage.response_token/s` from the streamed reply.
+
+### Per-request decode, median (tok/s)
+
+| phase | kind | off | serial (#336 as merged) | on (#343) |
+|---|---|---|---|---|
+| C1 | json_object | 36.2 | 64.1 | 64.4 |
+| C1 | json_schema | 37.0 | 58.3 | 59.3 |
+| C1 | all 12 | 36.7 | 59.6 | 60.5 |
+| C8 | json_object | 16.8 | 9.0 | 25.8 |
+| C8 | json_schema | 18.0 | 7.4 | 21.8 |
+| C8 | all 12 | 17.5 | 8.1 | 24.0 |
+
+### Aggregate (713 completion tokens per phase in every arm)
+
+| phase | off | serial | on |
+|---|---|---|---|
+| C1 (sequential) | 30.7 | 44.8 | 53.2 |
+| C8 (12 via pool of 8) | 155.0 | 77.1 | 197.2 |
+
+- **The C8 regression reproduces for `serial`** (#336 alone): per-request
+  median 17.5 → 8.1 tok/s, aggregate 155 → 77. Same shape as the merge A/B's
+  9.5 → 6.2 on the 27B profile.
+- **`on` removes it**: C8 per-request median 24.0 (1.37× off, 2.96× serial);
+  aggregate 197 tok/s (1.27× off, 2.56× serial). C1 is unchanged vs serial
+  (60.5 vs 59.6, within noise).
+- **Validity**: 12/12 valid JSON and 6/6 schema keys in every arm and phase;
+  every reply `finish_reason=stop`; 0 request errors.
+- **Byte-identity**: all 12 replies byte-identical across off / serial / on at
+  C1 and at C8, and C1 ≡ C8 within each arm. Identical `completion_tokens`
+  (713) in every arm/phase.
+- **Engagement** (`Done:` lines this boot): serial-arm C8 requests show
+  `mtp=1.00 tok_step≈2.2–3.4` at 6.6–10 tok/s — speculation is accepted but
+  each strict row pays its own verify forward; `MTP accept` batches are all
+  `n=1`. The `on` arm's C8 rows ran at 19–35 tok/s with shared verifies.
