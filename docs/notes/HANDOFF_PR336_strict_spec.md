@@ -44,8 +44,8 @@ idle pair, plain measured 85.9 / 88.8 and `json_object` 35.3 / 37.1.
 
 - The lever engages (`serial=1.00` off, `mtp=1.00 tok_step=2.5-2.7` on) and wins at one stream.
 - Plain lost about 27% between the two runs while serial structured decode did not move. Other
-  traffic would have slowed both, so the cause is the test profile or the newer base image. It is
-  not known which. §3a settles it and comes first.
+  traffic would have slowed both. Candidate causes: the test profile, the newer base image, or a
+  different thermal cap on the GB10s (§3b). It is not known which. §3a and §3b come first.
 
 ### Open questions
 
@@ -66,6 +66,8 @@ Follow `.agents/skills/measurement-discipline/SKILL.md`. In short:
 - One build, one profile, one checkpoint for every arm. Arms differ only in the variables of §4.
 - A fresh boot per arm, the variables set on both ranks. `ATLAS_GLM_STRICT_SPEC` stays unset.
 - An idle pair. If other traffic reaches the pair during a run, discard that run and repeat it.
+- The same thermal cap on both GB10s for every arm, recorded (§3b). A cap changed between arms,
+  or thermal throttling in one arm only, voids the comparison.
 - Record the fingerprint: build commit, checkpoint id and revision, full serve flags, every
   `ATLAS_*` variable the profile sets, harness arguments, date.
 - Three repetitions per case (the harness default). Label the result "single session, n=3".
@@ -83,14 +85,50 @@ Follow `.agents/skills/measurement-discipline/SKILL.md`. In short:
 
 ### 3a. Baseline check, before any A/B
 
-With the lever off, on the new build, measure plain decode speed the way the 85.9 / 88.8 figure
-was measured (same script, same prompts, `max_tokens`, idle pair).
+Record the thermal cap first (§3b, items 1-3). Then, with the lever off, on the new build, measure
+plain decode speed the way the 85.9 / 88.8 figure was measured (same script, same prompts,
+`max_tokens`, idle pair), with the §3b per-run readings.
 
 - Plain back at about 86-89: the earlier 63 came from the test profile. Continue with §4.
 - Plain still near 63: stop. Boot the previous image (upstream `a523a07f`) with the same profile
   and measure again. If that reads 86-89, the newer base lost plain speed; report it (§6) with a
   plain `Done:` line from each image, and do not run the A/B until it is understood. Compare
   `tok_step` and `mean_na` between the two lines: they show whether plain speculates as deeply.
+
+### 3b. Thermal cap (Robert's request: it affects results)
+
+The GB10s run under a cap that keeps them from overheating: a clock limit or a power limit set
+through `nvidia-smi`. Report, for each of the two nodes:
+
+1. **Which cap is in force and its value**: a locked clock range (MHz) or a power limit (W), and
+   how it is applied (the command or service that sets it, and whether it survives a reboot).
+   If nothing is set, say so.
+2. **What the driver reports**, taken before the first arm:
+   ```bash
+   nvidia-smi --query-gpu=power.limit,enforced.power.limit,power.draw,temperature.gpu,clocks.current.sm,clocks.max.sm --format=csv
+   nvidia-smi -q -d PERFORMANCE
+   ```
+   A field that reads `[N/A]` on GB10 is reported as `[N/A]`. If this driver refuses a field name,
+   `nvidia-smi --help-query-gpu` lists the ones it has.
+3. **Whether the cap was the same** when the 85.9 / 88.8 plain figure was measured and during the
+   63 tok/s run, if that is known. If it differed, §3a is re-read with that in mind.
+
+Then, for every arm (and for each §3a measurement), on both nodes:
+
+- Save `nvidia-smi -q -d PERFORMANCE` immediately before and after the harness run. The
+  `Clocks Event Reasons Counters` block counts microseconds per reason; the difference is how
+  long each was asserted during the arm. Report the four deltas: `SW Power Capping`,
+  `SW Thermal Slowdown`, `HW Thermal Slowdown`, `HW Power Braking`.
+- Sample during the run:
+  ```bash
+  nvidia-smi --query-gpu=timestamp,temperature.gpu,power.draw,clocks.current.sm,clocks_throttle_reasons.active --format=csv -l 5
+  ```
+  Report the median, minimum and maximum of clock, temperature and power per arm.
+- Note the GPU temperature when the harness starts. Later arms start hotter; let the pair settle
+  to about the first arm's starting temperature before each run, and report the values.
+
+Do not change the cap for this test. Commit the values only, not raw dumps: `nvidia-smi -q`
+output carries serial numbers and UUIDs.
 
 ## 4. Steps
 
@@ -164,6 +202,15 @@ three repetitions and writes a JSON record.
   show is a finding: report the first differing position the harness prints.
 - **Control.** `plain@c1` must be within the noise floor in all three arms. If it moved, the boots
   are not comparable; repeat them.
+- **Thermals (§3b).** Arms compare only under the same cap, with similar clocks and similar
+  throttle deltas.
+  - `SW Power Capping` is the normal steady state of a GB10 (the repo's hardware monitor treats it
+    as healthy), so a non-zero delta is expected. It should be of similar size in every arm.
+  - A `SW Thermal Slowdown`, `HW Thermal Slowdown` or `HW Power Braking` delta in one arm and not
+    the others means that arm was throttled: repeat it once the pair has cooled.
+  - An arm that speculates draws more power than serial decode may, so a power cap can hold back
+    the `serial` and `on` arms more than `off`. If the median clock or power differs between
+    arms, report it beside the speed ratios; it is part of the result, not noise.
 - **Speed.** Report every ratio next to the noise floor.
   - `schema@c1` and `object@c1`, `on` against `off`: the headline, to hold against the plain rate
     and the 80 tok/s goal.
@@ -185,6 +232,8 @@ Robert Anderson <anderson.rw@gmail.com> and push to `devin/strict-spec-notes` on
 goes to PR #336: no comment, and no push to `devin/strict-spec-full-logits`. The file contains:
 
 - the §3a baseline numbers and which case applied;
+- the thermal cap in force on each node, and per arm the clock, temperature and power summary and
+  the four throttle deltas (§3b);
 - the fingerprint (§2), with the variables of each arm;
 - the four tables printed by `compare`;
 - the probe results for each arm;
