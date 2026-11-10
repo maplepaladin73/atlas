@@ -131,7 +131,11 @@ def run_once(args, model):
         for c in calls:
             messages.append({"role": "tool", "tool_call_id": c["id"],
                              "content": json.dumps(TOOL_RESULT)})
-        final = post(args.url, {**base, "messages": messages})["choices"][0]
+        # tool_choice "none" pins the response_format grammar on the final
+        # answer; with tool grammar disabled the auto union would leave the
+        # answer unconstrained.
+        final = post(args.url, {**base, "messages": messages,
+                                "tool_choice": "none"})["choices"][0]
     else:
         print("  turn 1: answered without a tool call; checking that answer")
         final = r1
