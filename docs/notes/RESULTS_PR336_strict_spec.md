@@ -174,3 +174,176 @@ Under fingerprint: build `f62215013`, FP4-Local checkpoint, production
 - Open item: harness `max_tokens=800` truncates structured replies
   symmetrically; a confirming run with a larger budget (or shorter workload)
   is needed to satisfy the literal "zero invalid" gate.
+
+## Validity re-run: `on` arm, `max_tokens=2400`
+
+Same build, checkpoint, profile, and arm env as the `on` arm above; only the
+output budget changed (2400 vs 800) so structured replies can complete.
+Harness record `on-valid.json`, commit `d3ec45df2` (docs-only delta vs the
+tested tree `f62215013`), 3 reps per case, 0 request errors.
+
+Invalid structured replies per case — **all zero**:
+
+| case | tok/s | invalid |
+|---|---|---|
+| schema@c1 | 70.5 | 0 |
+| schema@c2 | 101.4 | 0 |
+| schema@c4 | 145.2 | 0 |
+| schema@c8 | 201.9 | 0 |
+| object@c1 | 69.3 | 0 |
+| plain@c1 | 50.0 | 0 |
+| sampled@c1 | 64.3 | 0 |
+| sampled@c4 | 122.7 | 0 |
+| think@c1 | 66.1 | 0 |
+| logprobs@c1 | 63.7 | 0 |
+| mixed@c4 | 122.3 | 0 |
+
+Every reply in the record has `finish_reason=stop`; no invalid reply exists,
+so none reports `(length)`. The earlier "invalid" counts were purely the
+800-token truncation and are now cleared for the batched arm. Rates match the
+800-token run within noise (schema@c1 70.5 vs 70.8, schema@c8 201.9 vs 207.4).
+
+## Production-profile `ATLAS_*` environment (complete list)
+
+All variables set by the serve profile used in every arm (alphabetical;
+`ATLAS_STRICT_SPEC=1` and `ATLAS_MTP_ACCEPT_DEBUG=1` are the only arm/profile
+deltas on top of the base production env — `off` unsets `ATLAS_STRICT_SPEC`,
+`serial` adds `ATLAS_GRAMMAR_SERIAL_VERIFY=1`):
+
+```
+ATLAS_CONTENT_LOOP_MIN_REPEATS=32
+ATLAS_CONTENT_LOOP_WATCHDOG=1
+ATLAS_EP_PROTOCOL=v2
+ATLAS_GLM_CMD_RDMA=1
+ATLAS_GLM_ZERO_ROWS=1
+ATLAS_LOOP_STEER=1
+ATLAS_LT_KCHAIN_PIN=1
+ATLAS_MTP_ACCEPT_DEBUG=1
+ATLAS_MTP_DEEP_MAX_SEQS=2
+ATLAS_MTP_DFLASH_CTX_SCOPED=1
+ATLAS_MTP_DYNAMIC_DEPTH=1
+ATLAS_MTP_GATE_FORCE=1
+ATLAS_MTP_MAX_SEQS=8
+ATLAS_MTP_SINGLE_DEPTH_ADAPT=1
+ATLAS_NO_MTP_DCUT=1
+ATLAS_PLE_FAULT_POOL=1
+ATLAS_PLE_NVME_KEEPALIVE_MS=10
+ATLAS_PLE_PACKED_DIR=/atlas-ple
+ATLAS_PLE_WARM_BG=1
+ATLAS_PREFILL_CODISPATCH=1
+ATLAS_PREFILL_CODISPATCH_SETTLE_MS=3
+ATLAS_PREFILL_CODISPATCH_WINDOW_MS=20
+ATLAS_QWEN4EXP_AUX_PINNED=1
+ATLAS_QWEN4EXP_BATCH_FAST=1
+ATLAS_QWEN4EXP_BATCH_SMALL=1
+ATLAS_QWEN4EXP_CKPT_AUX_SHARE=1
+ATLAS_QWEN4EXP_DECODE_FUSE=1
+ATLAS_QWEN4EXP_DECODE_GRAPH=1
+ATLAS_QWEN4EXP_DECODE_GRAPH_COLLECTIVES=1
+ATLAS_QWEN4EXP_DECODE_GRAPH_WIDE=1
+ATLAS_QWEN4EXP_DRAFT_HEAD_NVFP4=1
+ATLAS_QWEN4EXP_EOS_BAN=1
+ATLAS_QWEN4EXP_EXACT_DEFER=1
+ATLAS_QWEN4EXP_EXACT_VERIFY=1
+ATLAS_QWEN4EXP_FINISH_LEAF=1
+ATLAS_QWEN4EXP_GDN_COMMIT_FUSE=1
+ATLAS_QWEN4EXP_HC_FAST=1
+ATLAS_QWEN4EXP_HC_MMA=1
+ATLAS_QWEN4EXP_HC_STAGE_FIT=1
+ATLAS_QWEN4EXP_HC_WIDE=1
+ATLAS_QWEN4EXP_KV_LOOKAHEAD=64
+ATLAS_QWEN4EXP_LMHEAD_BATCHM=1
+ATLAS_QWEN4EXP_LMHEAD_SPLIT=1
+ATLAS_QWEN4EXP_LMHEAD_SPLIT_VERIFY=1
+ATLAS_QWEN4EXP_MOE_FAST=1
+ATLAS_QWEN4EXP_MOE_NO_CLAMP=1
+ATLAS_QWEN4EXP_MOE_TC=1
+ATLAS_QWEN4EXP_MTP_DEPTH=7
+ATLAS_QWEN4EXP_MTP_DRAFT_TP=1
+ATLAS_QWEN4EXP_MTP_GROUPED_NORM=1
+ATLAS_QWEN4EXP_MTP_KV_KEEP=1
+ATLAS_QWEN4EXP_PREFILL_BA_ROWS=1
+ATLAS_QWEN4EXP_PREFILL_FP8_W2=1
+ATLAS_QWEN4EXP_PREFILL_GDN=1
+ATLAS_QWEN4EXP_PREFILL_GEMM_RASTER=1
+ATLAS_QWEN4EXP_PREFILL_HC=1
+ATLAS_QWEN4EXP_PREFILL_HOST_IDS=1
+ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1
+ATLAS_QWEN4EXP_PREFILL_MOE=1
+ATLAS_QWEN4EXP_PREFILL_MOE_NODUP=1
+ATLAS_QWEN4EXP_PREFILL_MOE_W2=1
+ATLAS_QWEN4EXP_PREFILL_MULTI=1
+ATLAS_QWEN4EXP_PREFILL_MULTI_CACHED=1
+ATLAS_QWEN4EXP_PREFILL_QSA_SCORE=1
+ATLAS_QWEN4EXP_PREFILL_QSA_SPLIT=1
+ATLAS_QWEN4EXP_PREFILL_ROWINV=1
+ATLAS_QWEN4EXP_PREFILL_SP=1
+ATLAS_QWEN4EXP_PREFILL_SP_PIPE=1
+ATLAS_QWEN4EXP_PREFILL_SP_ROUTE=1
+ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE=1
+ATLAS_QWEN4EXP_PREFILL_SP_SHARED=1
+ATLAS_QWEN4EXP_QKV_ROWS_2D=1
+ATLAS_QWEN4EXP_QSA_COMMIT_ROWS=1
+ATLAS_QWEN4EXP_QSA_COMMIT_TABLE=1
+ATLAS_QWEN4EXP_QSA_DECODE_ROWS=1
+ATLAS_QWEN4EXP_QSA_KEY_ONLY=1
+ATLAS_QWEN4EXP_QSA_REUSE=1
+ATLAS_QWEN4EXP_QSA_TOPK_WIDE=1
+ATLAS_QWEN4EXP_ROWS32_TILE=1
+ATLAS_QWEN4EXP_SNAPSHOT_AUX_MB=2048
+ATLAS_QWEN4EXP_SP_PREALLOC=1
+ATLAS_QWEN4EXP_VERIFY_BT_PINNED=1
+ATLAS_QWEN4EXP_W4_ROWS=1
+ATLAS_QWEN4EXP_W4_ROWS_WIDE=1
+ATLAS_RDMA_ALLREDUCE=1
+ATLAS_RDMA_ONESHOT=1
+ATLAS_RDMA_ONESHOT_MAX=8388608
+ATLAS_RDMA_PAIR_CHAIN=1
+ATLAS_STRICT_SPEC=1
+ATLAS_VERIFY_PICK_PAR=1
+```
+
+(`ATLAS_GLM_STRICT_SPEC` remains unset — Qwen full-logits path only.)
+
+## Representative `Done:` lines (rank-0 logs, `ATLAS_MTP_ACCEPT_DEBUG=1`)
+
+Case attribution: `schema@c1` is the first harness case (three sequential
+800-token reps right after the warmup request); `plain@c1` is the only case
+producing 538-token `stop` replies at ~50 tok/s. Lines are verbatim minus the
+log prefix.
+
+### `serial` arm — schema@c1
+
+```
+Done: 800 tokens (length) 68.0 tok/s, TTFT=166.8ms, serial=0.00 mtp=1.00 p1=0.870 mean_na=2.162 tok_step=3.162 regime_reprobes=0 depth=k4 depth_switches=1 acc=0.87,0.72,0.58,-,-,-,- surv=0.87,0.72,0.58,0.00,0.00,0.00,0.00
+Done: 800 tokens (length) 69.6 tok/s, TTFT=168.3ms, serial=0.00 mtp=1.00 p1=0.870 mean_na=2.162 tok_step=3.162 regime_reprobes=0 depth=k4 depth_switches=1 acc=0.87,0.72,0.58,-,-,-,- surv=0.87,0.72,0.58,0.00,0.00,0.00,0.00
+Done: 800 tokens (length) 69.5 tok/s, TTFT=167.7ms, serial=0.00 mtp=1.00 p1=0.870 mean_na=2.162 tok_step=3.162 regime_reprobes=0 depth=k4 depth_switches=1 acc=0.87,0.72,0.58,-,-,-,- surv=0.87,0.72,0.58,0.00,0.00,0.00,0.00
+```
+
+### `serial` arm — plain@c1
+
+```
+Done: 538 tokens (stop) 48.6 tok/s, TTFT=133.9ms, serial=0.00 mtp=1.00 p1=0.627 mean_na=1.157 tok_step=2.157 regime_reprobes=0 depth=k4 depth_switches=0 acc=0.63,0.37,0.17,-,-,-,- surv=0.63,0.37,0.16,0.00,0.00,0.00,0.00
+Done: 538 tokens (stop) 50.4 tok/s, TTFT=131.6ms, serial=0.00 mtp=1.00 p1=0.627 mean_na=1.157 tok_step=2.157 regime_reprobes=0 depth=k4 depth_switches=0 acc=0.63,0.37,0.17,-,-,-,- surv=0.63,0.37,0.16,0.00,0.00,0.00,0.00
+Done: 538 tokens (stop) 50.5 tok/s, TTFT=134.2ms, serial=0.00 mtp=1.00 p1=0.627 mean_na=1.157 tok_step=2.157 regime_reprobes=0 depth=k4 depth_switches=0 acc=0.63,0.37,0.17,-,-,-,- surv=0.63,0.37,0.16,0.00,0.00,0.00,0.00
+```
+
+### `on` arm — schema@c1
+
+```
+Done: 800 tokens (length) 70.6 tok/s, TTFT=167.9ms, serial=0.00 mtp=1.00 p1=0.819 mean_na=2.629 tok_step=3.629 regime_reprobes=0 depth=k7 depth_switches=3 acc=0.82,0.66,0.54,0.47,0.39,0.30,- surv=0.82,0.66,0.53,0.36,0.22,0.04,0.00
+Done: 800 tokens (length) 72.1 tok/s, TTFT=171.9ms, serial=0.00 mtp=1.00 p1=0.819 mean_na=2.629 tok_step=3.629 regime_reprobes=0 depth=k7 depth_switches=3 acc=0.82,0.66,0.54,0.47,0.39,0.30,- surv=0.82,0.66,0.53,0.36,0.22,0.04,0.00
+Done: 800 tokens (length) 72.0 tok/s, TTFT=168.1ms, serial=0.00 mtp=1.00 p1=0.819 mean_na=2.629 tok_step=3.629 regime_reprobes=0 depth=k7 depth_switches=3 acc=0.82,0.66,0.54,0.47,0.39,0.30,- surv=0.82,0.66,0.53,0.36,0.22,0.04,0.00
+```
+
+### `on` arm — plain@c1
+
+```
+Done: 538 tokens (stop) 48.8 tok/s, TTFT=130.3ms, serial=0.00 mtp=1.00 p1=0.627 mean_na=1.157 tok_step=2.157 regime_reprobes=0 depth=k4 depth_switches=0 acc=0.63,0.37,0.17,-,-,-,- surv=0.63,0.37,0.16,0.00,0.00,0.00,0.00
+Done: 538 tokens (stop) 50.7 tok/s, TTFT=132.4ms, serial=0.00 mtp=1.00 p1=0.627 mean_na=1.157 tok_step=2.157 regime_reprobes=0 depth=k4 depth_switches=0 acc=0.63,0.37,0.17,-,-,-,- surv=0.63,0.37,0.16,0.00,0.00,0.00,0.00
+Done: 538 tokens (stop) 50.6 tok/s, TTFT=130.7ms, serial=0.00 mtp=1.00 p1=0.627 mean_na=1.157 tok_step=2.157 regime_reprobes=0 depth=k4 depth_switches=0 acc=0.63,0.37,0.17,-,-,-,- surv=0.63,0.37,0.16,0.00,0.00,0.00,0.00
+```
+
+Note the `on` schema@c1 lines run deeper drafts (`depth=k7`, `tok_step=3.629`)
+than `serial` (`depth=k4`, `tok_step=3.162`) at the same wall rate — the
+batched path converts draft depth into throughput at concurrency.
