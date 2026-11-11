@@ -392,3 +392,115 @@ the server-attested `usage.response_token/s` from the streamed reply.
   `mtp=1.00 tok_step≈2.2–3.4` at 6.6–10 tok/s — speculation is accepted but
   each strict row pays its own verify forward; `MTP accept` batches are all
   `n=1`. The `on` arm's C8 rows ran at 19–35 tok/s with shared verifies.
+
+## PR #343 follow-up boots (`HANDOFF_PR343_followup.md`)
+
+Same image/build as above (Rust tree unchanged; docs commit `1f2c89b90`),
+production profile, fresh boot per arm, idle pair, 2200 MHz cap, no throttle
+events. `max_tokens=2400`.
+
+### Boot `T` — step timing (`ATLAS_STRICT_SPEC=1 ATLAS_MTP_TIMING=1`)
+
+Rates with the timing switch armed: schema@c1 **70.5**, object@c1 **69.7**,
+plain@c1 **50.3** tok/s. schema@c1 was 70.8 without the switch — timing
+overhead is within noise.
+
+`Done:` per case:
+
+```
+schema : Done: 872 tokens (stop) 71.6 tok/s, TTFT=185.7ms, serial=0.00 mtp=1.00 p1=0.808 mean_na=2.629 tok_step=3.629 depth=k7 depth_switches=3 acc=0.81,0.65,0.53,0.47,0.37,0.26,-
+object : Done: 868 tokens (stop) 70.9 tok/s, TTFT=167.4ms, serial=0.00 mtp=1.00 p1=0.833 mean_na=2.360 tok_step=3.360 depth=k5 depth_switches=1 acc=0.84,0.67,0.53,0.41,-,-,-
+plain  : Done: 538 tokens (stop) 51.1 tok/s, TTFT=131.8ms, serial=0.00 mtp=1.00 p1=0.627 mean_na=1.157 tok_step=2.157 depth=k4 depth_switches=0 acc=0.63,0.37,0.17,-,-,-,-
+```
+
+`MTP verify timing [25 steps]` — five consecutive from mid-reply, verbatim
+minus the log prefix (zero-valued `loop_*`/`GAP` fields elided for width):
+
+schema@c1:
+```
+[seq_len=369]: fwd=40.69ms fast_greedy=1.20ms pipeline=1.20ms commit=0.01ms save_hidden=0.01ms propose=5.95ms step_mtp=48.05ms TOTAL=47.85ms
+[seq_len=457]: fwd=43.38ms fast_greedy=1.31ms d2h=0.01ms(x0.1) dequant=0.24ms(x0.1) pipeline=1.99ms(x1.7) penalties=0.00ms argmax=0.04ms commit=0.01ms save_hidden=0.01ms propose=7.44ms step_mtp=52.35ms TOTAL=52.64ms
+[seq_len=557]: fwd=42.82ms fast_greedy=1.55ms d2h=0.01ms(x0.1) dequant=0.13ms(x0.1) pipeline=2.29ms(x1.7) penalties=0.00ms argmax=0.04ms commit=0.01ms save_hidden=0.01ms propose=7.47ms step_mtp=52.38ms TOTAL=52.32ms
+[seq_len=661]: fwd=43.22ms fast_greedy=1.53ms pipeline=1.53ms commit=0.01ms save_hidden=0.01ms propose=7.50ms step_mtp=52.23ms TOTAL=52.26ms
+[seq_len=774]: fwd=43.89ms fast_greedy=1.48ms d2h=0.01ms(x0.1) dequant=0.13ms(x0.1) pipeline=1.84ms(x1.5) penalties=0.00ms argmax=0.02ms commit=0.01ms save_hidden=0.01ms propose=7.76ms step_mtp=53.30ms TOTAL=53.43ms
+```
+
+object@c1:
+```
+[seq_len=332]: fwd=40.63ms fast_greedy=1.43ms d2h=0.00ms dequant=0.05ms pipeline=1.62ms(x1.2) penalties=0.00ms argmax=0.01ms commit=0.01ms save_hidden=0.01ms propose=5.94ms step_mtp=47.97ms TOTAL=48.14ms
+[seq_len=423]: fwd=40.52ms fast_greedy=1.52ms d2h=0.00ms dequant=0.05ms pipeline=1.75ms(x1.2) penalties=0.00ms argmax=0.01ms commit=0.01ms save_hidden=0.01ms propose=5.96ms step_mtp=48.24ms TOTAL=48.17ms
+[seq_len=506]: fwd=40.76ms fast_greedy=1.37ms d2h=0.00ms(x0.1) dequant=0.08ms(x0.1) pipeline=1.78ms(x1.4) penalties=0.00ms argmax=0.02ms commit=0.01ms save_hidden=0.01ms propose=5.97ms step_mtp=48.43ms TOTAL=48.37ms
+[seq_len=585]: fwd=40.45ms fast_greedy=1.47ms d2h=0.00ms(x0.1) dequant=0.09ms(x0.1) pipeline=1.97ms(x1.4) penalties=0.00ms argmax=0.02ms commit=0.01ms save_hidden=0.01ms propose=6.00ms step_mtp=48.22ms TOTAL=48.24ms
+[seq_len=676]: fwd=41.06ms fast_greedy=1.32ms pipeline=1.32ms commit=0.01ms save_hidden=0.00ms propose=6.02ms step_mtp=48.45ms TOTAL=48.40ms
+```
+
+plain@c1:
+```
+[seq_len=123]: fwd=37.67ms fast_greedy=0.00ms propose=4.44ms step_mtp=42.15ms TOTAL=42.12ms
+[seq_len=182]: fwd=37.31ms fast_greedy=0.00ms propose=4.44ms step_mtp=41.78ms TOTAL=41.77ms
+[seq_len=235]: fwd=37.71ms fast_greedy=0.00ms propose=4.46ms step_mtp=42.12ms TOTAL=42.18ms
+[seq_len=289]: fwd=37.37ms fast_greedy=0.00ms propose=4.48ms step_mtp=41.87ms TOTAL=41.86ms
+[seq_len=342]: fwd=37.92ms fast_greedy=0.00ms propose=4.48ms step_mtp=42.45ms TOTAL=42.41ms
+```
+
+Reading: a strict schema step is ~52 ms vs ~42 ms plain. Of the ~10 ms
+difference, ~5–6 ms is `fwd` (deeper draft window → more verify positions:
+k7 vs k4) and ~3 ms is `propose` (7.5 vs 4.5 ms, again depth). The grammar
+host work itself — `fast_greedy` + `pipeline` (mask, d2h, dequant, argmax) —
+is **1.2–2.3 ms per step**, i.e. 3–4% of the step. The remaining cost is
+draft depth, which the deeper window converts into `tok_step` 3.6 vs 2.2. The
+mask path is not the bottleneck; a lighter mask would buy ≤2 ms/step.
+
+### Boots `U-off` / `U-on` — tool grammar enabled (tool-call-or-JSON union)
+
+Production profile **without** `--disable-tool-grammar`; `U-on` adds
+`ATLAS_STRICT_SPEC=1`.
+
+Probe results (`tools_rfmt_probe.py --runs 5`):
+
+| probe | U-off exit / valid | U-on exit / valid | turn 1 called tool? | run-1 final text identical U-off ≡ U-on |
+|---|---|---|---|---|
+| `--final-tool-choice auto` | 0 / 5/5 | 0 / 5/5 | **no, 0/5** (both boots) | yes |
+| `--final-tool-choice auto --thinking` | 0 / 5/5 | 0 / 5/5 | **no, 0/5** (both boots) | yes |
+| default (`tool_choice: none`) | 0 / 5/5 | 0 / 5/5 | **no, 0/5** (both boots) | yes |
+
+Run-1 final text in every probe, both boots:
+```
+{\n  "city": "Paris"\n    , "temperature_c": 18, "conditions": "sunny", "wind":  {"speed_kmh": 10, "direction": "N"}\n}
+```
+
+**Behavioral note (pre-existing, not strict-spec):** with the tool grammar
+on, the union lets the first output token pick JSON instead of `<tool_call>`,
+and at temperature 0 the model always picks JSON — it answers the schema
+directly from priors (sunny/10/N) and never calls `get_weather`. With the tool
+grammar off (earlier boots) turn 1 called the tool 5/5. Identical in `U-off`
+and `U-on`, so the lever does not change the choice; it only speeds the
+decode that follows. Whether the union should bias toward the tool call is a
+separate question for the tool-grammar path.
+
+`Done:` lines for the probe's (single-turn) answers:
+
+```
+U-on : Done: 80 tokens (stop) 50.0 tok/s, TTFT=164.3ms, serial=0.03 mtp=0.97 p1=0.543 mean_na=1.229 tok_step=2.229 depth=k4
+U-on : Done: 80 tokens (stop) 50.0 tok/s, TTFT=161.3ms, serial=0.03 mtp=0.97 p1=0.543 mean_na=1.229 tok_step=2.229 depth=k4
+U-off: Done: 80 tokens (stop) 36.6 tok/s, TTFT=164.4ms, serial=1.00 mtp=0.00 p1=0.000 mean_na=0.000 tok_step=1.000 depth=k5
+U-off: Done: 80 tokens (stop) 36.6 tok/s, TTFT=162.7ms, serial=1.00 mtp=0.00 p1=0.000 mean_na=0.000 tok_step=1.000 depth=k5
+```
+
+`U-on` shows the expected `serial=0.03` (first union token decoded serially)
+then `mtp=0.97`; `U-off` is fully serial. 50.0 vs 36.6 tok/s on the same
+80-token reply.
+
+`strict_spec_ab.py compare union-off.json union-on.json`:
+
+| case | U-off tok/s | U-on tok/s | on/off | invalid off | invalid on | identical |
+|---|---|---|---|---|---|---|
+| schema@c1 | 36.6 | 70.8 | 1.93 | 0/3 | 0/3 | 3/3 |
+| schema@c4 | 86.8 | 145.0 | 1.67 | 0/12 | 0/12 | 12/12 |
+| object@c1 | 36.5 | 69.8 | 1.91 | 0/3 | 0/3 | 3/3 |
+| plain@c1 | 50.2 | 50.3 | 1.00 | 0/3 | 0/3 | 3/3 |
+
+0 request errors in both records. Pass criteria met: every probe exits 0 in
+`U-on`, final texts match `U-off`, zero invalid replies, zero errors. Rates
+with the tool grammar on match the `--disable-tool-grammar` A/B within noise
+(70.8 / 145.0 / 69.8 / 50.3 vs 70.8 / 149.0 / 68.9 / 50.0).
