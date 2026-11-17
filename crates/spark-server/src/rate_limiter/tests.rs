@@ -84,3 +84,28 @@ fn token_refund_restores_budget() {
     lim.refund_tokens("k", 500);
     assert!(lim.admit("k", 500).allowed);
 }
+
+#[test]
+fn retry_after_is_wait_until_next_request_fits() {
+    let lim = RateLimiter::with_config(cfg(60, 0));
+    for _ in 0..60 {
+        assert!(lim.admit("k", 0).allowed);
+    }
+    let d = lim.admit("k", 0);
+    assert!(!d.allowed);
+    assert!(matches!(d.denied_by, Some(DenialReason::Requests)));
+    assert_eq!(d.retry_after_secs, 1);
+    assert_eq!(d.requests.reset_secs, 60);
+}
+
+#[test]
+fn retry_after_is_wait_until_token_cost_fits() {
+    // 6000 TPM refills 100 tokens/s; 200 more tokens fit after 2s.
+    let lim = RateLimiter::with_config(cfg(0, 6000));
+    assert!(lim.admit("k", 6000).allowed);
+    let d = lim.admit("k", 200);
+    assert!(!d.allowed);
+    assert!(matches!(d.denied_by, Some(DenialReason::Tokens)));
+    assert_eq!(d.retry_after_secs, 2);
+    assert_eq!(d.tokens.reset_secs, 60);
+}
