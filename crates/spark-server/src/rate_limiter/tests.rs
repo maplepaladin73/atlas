@@ -109,3 +109,17 @@ fn retry_after_is_wait_until_token_cost_fits() {
     assert_eq!(d.retry_after_secs, 2);
     assert_eq!(d.tokens.reset_secs, 60);
 }
+
+#[test]
+fn retry_after_waits_for_both_buckets_when_both_are_short() {
+    // 60 requests x 100 tokens drains both buckets. The 61st request fits
+    // the request bucket after 1s, but its 200 tokens need 2s at 100/s.
+    let lim = RateLimiter::with_config(cfg(60, 6000));
+    for _ in 0..60 {
+        assert!(lim.admit("k", 100).allowed);
+    }
+    let d = lim.admit("k", 200);
+    assert!(!d.allowed);
+    assert!(matches!(d.denied_by, Some(DenialReason::Requests)));
+    assert_eq!(d.retry_after_secs, 2);
+}

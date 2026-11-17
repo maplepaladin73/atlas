@@ -281,6 +281,24 @@ impl RateLimiter {
         let tok_rate = tpm as f64 / 60.0;
         let req_burst = self.cfg.burst_rpm as f64;
         let tok_burst = self.cfg.burst_tpm as f64;
+        // Seconds until both buckets admit this request, from each bucket's
+        // `(available, reset)` snapshot. A cost above burst never fits, so
+        // that bucket falls back to its full refill.
+        let retry_after = |(req_avail, req_reset): (f64, u64),
+                           (tok_avail, tok_reset): (f64, u64)| {
+            let req_wait = if rpm > 0 {
+                secs_until_fits(1.0, req_avail, req_rate, req_burst).unwrap_or(req_reset)
+            } else {
+                0
+            };
+            let tok_wait = if tpm > 0 {
+                secs_until_fits(estimated_tokens as f64, tok_avail, tok_rate, tok_burst)
+                    .unwrap_or(tok_reset)
+            } else {
+                0
+            };
+            req_wait.max(tok_wait).max(1)
+        };
 
         let mut map = self.inner.lock();
         // DoS guard: if the map has grown past MAX_KEYS without natural
@@ -322,9 +340,7 @@ impl RateLimiter {
                     remaining: self.cfg.advertised_remaining_tpm(tok_avail.max(0.0) as u64),
                     reset_secs: tok_reset,
                 },
-                retry_after_secs: secs_until_fits(1.0, req_avail, req_rate, req_burst)
-                    .unwrap_or(req_reset)
-                    .max(1),
+                retry_after_secs: retry_after((req_avail, req_reset), (tok_avail, tok_reset)),
                 denied_by: Some(DenialReason::Requests),
             };
         }
@@ -356,14 +372,7 @@ impl RateLimiter {
                     remaining: self.cfg.advertised_remaining_tpm(tok_avail.max(0.0) as u64),
                     reset_secs: tok_reset,
                 },
-                retry_after_secs: secs_until_fits(
-                    estimated_tokens as f64,
-                    tok_avail,
-                    tok_rate,
-                    tok_burst,
-                )
-                .unwrap_or(tok_reset)
-                .max(1),
+                retry_after_secs: retry_after((req_avail, req_reset), (tok_avail, tok_reset)),
                 denied_by: Some(DenialReason::Tokens),
             };
         }
