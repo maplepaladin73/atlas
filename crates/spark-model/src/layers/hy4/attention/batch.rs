@@ -381,7 +381,11 @@ impl AttentionCache<'_, '_> {
                 gpu.op_cache()
                     .kernel(gpu, "hy4_mla", "hy4_mla_batch_partial")?,
             )
-            .grid([a.heads as u32, splits as u32, (end - first) as u32])
+            .grid([
+                a.heads as u32,
+                splits.div_ceil(2) as u32,
+                (end - first) as u32,
+            ])
             .block([256, 1, 1])
             .arg_ptr(b.absorbed.offset(first * a.heads * 576 * 2))
             .arg_ptr(self.latent)

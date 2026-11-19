@@ -121,7 +121,7 @@ void batch_attention(unsigned start,unsigned window,unsigned page_size,unsigned 
     for(unsigned first=0;first<count_rows;first+=tile) {
         unsigned rows=std::min(tile,count_rows-first),count=keys(start+first+rows-1),splits=(count+127)/128;
         fill(start+first+rows-1);
-        hy4_mla_batch_partial<<<dim3(heads,splits,rows),256>>>(dq.p+first*heads*576,dc.p,dt.p,window?nullptr:di.p+first*stride,
+        hy4_mla_batch_partial<<<dim3(heads,(splits+1)/2,rows),256>>>(dq.p+first*heads*576,dc.p,dt.p,window?nullptr:di.p+first*stride,
             parts.p,start+first,page_size,columns,window,count,splits,heads,stride);
         hy4_mla_batch_merge<<<dim3(heads,rows),256>>>(parts.p,sink.p,out.p+first*heads*512,splits,heads);
     }

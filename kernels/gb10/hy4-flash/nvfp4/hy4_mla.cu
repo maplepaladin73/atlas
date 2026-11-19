@@ -49,8 +49,8 @@ extern "C" __global__ void hy4_gate(__nv_bfloat16* out,
 __device__ __forceinline__ void hy4_mla_partial_impl(const __nv_bfloat16* q,
     const __nv_bfloat16* cache, const unsigned* table, const int* indices,
     float* partials, unsigned position, unsigned page_size,
-    unsigned columns, unsigned window, unsigned count, unsigned splits) {
-    unsigned h=blockIdx.x,part=blockIdx.y,tid=threadIdx.x,lane=tid%32,warp=tid/32;
+    unsigned columns, unsigned window, unsigned count, unsigned splits, unsigned part) {
+    unsigned h=blockIdx.x,tid=threadIdx.x,lane=tid%32,warp=tid/32;
     __shared__ float scores[128],red[256],query[576],maximum,denominator;
     __shared__ int rows[128];
     for (unsigned d=tid;d<576;d+=256) query[d]=(float)q[(size_t)h*576+d];
@@ -110,7 +110,7 @@ extern "C" __global__ void hy4_mla_partial(const __nv_bfloat16* q,
     const __nv_bfloat16* cache,const unsigned* table,const int* indices,
     float* partials,unsigned position,unsigned page_size,
     unsigned columns,unsigned window,unsigned count,unsigned splits) {
-    hy4_mla_partial_impl(q,cache,table,indices,partials,position,page_size,columns,window,count,splits);
+    hy4_mla_partial_impl(q,cache,table,indices,partials,position,page_size,columns,window,count,splits,blockIdx.y);
 }
 
 extern "C" __global__ void hy4_mla_batch_partial(const __nv_bfloat16* q,
@@ -120,9 +120,13 @@ extern "C" __global__ void hy4_mla_batch_partial(const __nv_bfloat16* q,
     unsigned heads,unsigned index_stride) {
     unsigned row=blockIdx.z;position+=row;
     count=window?min(position+1,window):min(position/4,index_stride/4-1)*4+position%4+1;
-    hy4_mla_partial_impl(q+(size_t)row*heads*576,cache,table,
-        indices?indices+(size_t)row*index_stride:nullptr,
-        partials+(size_t)row*heads*splits*514,position,page_size,columns,window,count,splits);
+    const __nv_bfloat16* qrow=q+(size_t)row*heads*576;
+    const int* irow=indices?indices+(size_t)row*index_stride:nullptr;
+    float* prow=partials+(size_t)row*heads*splits*514;
+    unsigned part0=blockIdx.y*2;
+    hy4_mla_partial_impl(qrow,cache,table,irow,prow,position,page_size,columns,window,count,splits,part0);
+    if (part0+1<splits)
+        hy4_mla_partial_impl(qrow,cache,table,irow,prow,position,page_size,columns,window,count,splits,part0+1);
 }
 
 // The zero-value sink participates once, including when every key is masked.
