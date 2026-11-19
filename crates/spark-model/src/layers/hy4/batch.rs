@@ -20,7 +20,7 @@ pub(crate) fn gemm(
         gpu,
         gpu.op_cache().kernel(gpu, "hy4_ffn", "hy4_batch_linear")?,
     )
-    .grid([n.div_ceil(8) as u32, rows.div_ceil(8) as u32, heads as u32])
+    .grid([n.div_ceil(8) as u32, rows.div_ceil(16) as u32, heads as u32])
     .block([256, 1, 1]);
     for ptr in buffers {
         launch = launch.arg_ptr(ptr);

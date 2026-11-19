@@ -7,12 +7,12 @@ __device__ __forceinline__ void hy4_batch_linear_impl(
     const __nv_bfloat16* x,const void* weights,const float* scales,void* out,
     unsigned n,unsigned k,unsigned rows,unsigned heads,unsigned xh,unsigned yh,
     unsigned xr,unsigned yr,unsigned wr,unsigned kind,unsigned float_out) {
-    unsigned o=blockIdx.x*8+threadIdx.x/32,first=blockIdx.y*8,head=blockIdx.z;
+    unsigned o=blockIdx.x*8+threadIdx.x/32,first=blockIdx.y*16,head=blockIdx.z;
     if(o>=n || head>=heads)return;
     constexpr unsigned width=KIND==1?16:8;
     unsigned lane=threadIdx.x%32;
     size_t wi=((size_t)head*n+o)*wr;
-    float sums[8]={};
+    float sums[16]={};
     for(unsigned col=lane*width;col<k;col+=32*width) {
         unsigned packed[8]={};
         const char* base=(const char*)weights+wi*(KIND==1?1:KIND==2?4:2);
@@ -44,7 +44,7 @@ __device__ __forceinline__ void hy4_batch_linear_impl(
             values[j]=w;
         }
         #pragma unroll
-        for(unsigned r=0;r<8;r++)if(first+r<rows) {
+        for(unsigned r=0;r<16;r++)if(first+r<rows) {
             const __nv_bfloat16* input=x+(size_t)(first+r)*xr+(size_t)head*xh+col;
             bool xv=ALIGNED || (col+width<=k && (uintptr_t)input%16==0);
             unsigned data[8]={};
@@ -65,7 +65,7 @@ __device__ __forceinline__ void hy4_batch_linear_impl(
         }
     }
     #pragma unroll
-    for(unsigned r=0;r<8;r++) {
+    for(unsigned r=0;r<16;r++) {
         float v=hy4_warp_sum(sums[r]);
         if(lane==0 && first+r<rows) {
             size_t at=(size_t)(first+r)*yr+(size_t)head*yh+o;
@@ -119,7 +119,7 @@ __device__ __forceinline__ void hy4_qdots(const __nv_bfloat16* x,Hy4Q4 q,unsigne
     const unsigned* entries,unsigned count,unsigned slots,bool activated,float* sums,const float* lut) {
     unsigned lane=threadIdx.x%32;
     #pragma unroll
-    for(unsigned r=0;r<8;r++)sums[r]=0.f;
+    for(unsigned r=0;r<16;r++)sums[r]=0.f;
     if(count==1) {
         unsigned row=activated?entries[0]:entries[0]/slots;
         sums[0]=hy4_qdot(x+(size_t)row*k,q,o,k,lut);
@@ -147,7 +147,7 @@ __device__ __forceinline__ void hy4_qdots(const __nv_bfloat16* x,Hy4Q4 q,unsigne
                 values[j]=lut[(words[at/8]>>(4*(at%8)))&15]*scale;
             }
             #pragma unroll
-            for(unsigned r=0;r<8;r++)if(r<count) {
+            for(unsigned r=0;r<16;r++)if(r<count) {
                 unsigned entry=entries[r],row=activated?entry:entry/slots;
                 const __nv_bfloat16* input=x+(size_t)row*k+col+g*16;
                 uint4 lo=*(const uint4*)input,hi=*(const uint4*)(input+8);
@@ -161,7 +161,7 @@ __device__ __forceinline__ void hy4_qdots(const __nv_bfloat16* x,Hy4Q4 q,unsigne
         }
     }
     #pragma unroll
-    for(unsigned r=0;r<8;r++)sums[r]=hy4_warp_sum(sums[r]);
+    for(unsigned r=0;r<16;r++)sums[r]=hy4_warp_sum(sums[r]);
 }
 
 extern "C" __global__ __launch_bounds__(256,4) void hy4_batch_expert(const __nv_bfloat16* x,
@@ -181,10 +181,10 @@ extern "C" __global__ __launch_bounds__(256,4) void hy4_batch_expert(const __nv_
             out[(size_t)list[1+r]*n+o]=__float2bfloat16_rn(0.f);
         return;
     }
-    for(unsigned first=0;first<list[0];first+=8) {
-    unsigned count=min(8u,list[0]-first);
+    for(unsigned first=0;first<list[0];first+=16) {
+    unsigned count=min(16u,list[0]-first);
     const unsigned* entries=list+1+first;
-    float a[8],b[8];
+    float a[16],b[16];
     hy4_qdots(x,table[(e+group)*3+(down?2:0)],o,k,entries,count,slots,down,a,lut);
     if(!down)hy4_qdots(x,table[(e+group)*3+1],o,k,entries,count,slots,false,b,lut);
     if(threadIdx.x%32==0)for(unsigned r=0;r<count;r++) {
