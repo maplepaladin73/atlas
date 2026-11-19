@@ -40,7 +40,7 @@ template<class T>void linear(unsigned rows,unsigned k,unsigned kind,unsigned hea
     Buffer<T>out(rows*yr),reference(rows*yr);
     const void*weight=kind==1?(void*)fp8.p:kind==2?(void*)df.p:(void*)dw.p;
     unsigned of32=sizeof(T)==4;
-    hy4_batch_linear<<<dim3((n+7)/8,(rows+15)/16,heads),256>>>(dx.p,weight,scales.p,out.p,n,k,rows,heads,xh,yh,xr,yr,k,kind,of32);
+    hy4_batch_linear<<<dim3((n+7)/8,(rows+7)/8,heads),256>>>(dx.p,weight,scales.p,out.p,n,k,rows,heads,xh,yh,xr,yr,k,kind,of32);
     for(unsigned r=0;r<rows;r++)for(unsigned h=0;h<heads;h++){
         auto input=dx.p+r*xr+h*xh;
         auto output=reference.p+r*yr+h*yh;
