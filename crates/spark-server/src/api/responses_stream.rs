@@ -53,7 +53,7 @@ pub(super) async fn responses_endpoint_stream(
     input_messages: Vec<crate::openai::IncomingMessage>,
     metadata: Option<std::collections::HashMap<String, String>>,
     store_flag: bool,
-    conversation_id: Option<String>,
+    conversation: Option<(String, usize)>,
     client_session: Option<crate::session_key::ClientSessionId>,
 ) -> Response {
     use axum::response::sse::Event;
@@ -69,8 +69,11 @@ pub(super) async fn responses_endpoint_stream(
     // Capture the conversation-linked user items (the new turn's user
     // input) before handing chat_req off. We use them to append back
     // to the conversation after the stream finishes.
-    let conv_new_user_items: Vec<serde_json::Value> =
-        conv_items::conv_new_user_items(&state_arc, conversation_id.as_ref(), &input_messages);
+    let conv_new_user_items: Vec<serde_json::Value> = conv_items::conv_new_user_items(
+        conversation.as_ref().map(|(_, len)| *len),
+        &input_messages,
+    );
+    let conversation_id = conversation.map(|(id, _)| id);
 
     // Run the chat-completions streaming handler (re-using the full
     // pipeline: scheduler, tool detection, thinking, logprobs, ...).

@@ -206,3 +206,83 @@ async fn blocking_conversation_instructions() {
 async fn streaming_conversation_instructions() {
     check_resume(true, true).await;
 }
+
+async fn check_filtered_conversation_prefix(stream: bool) {
+    let (request_tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let state = Arc::new(crate::AppState {
+        request_tx,
+        ..test_app_state::app_state(tokenizer())
+    });
+    let conversation_id = state.conversation_store.create(
+        vec![json!({"type": "reasoning", "summary": []})],
+        Default::default(),
+    );
+    let scheduler = tokio::spawn(async move {
+        match rx.recv().await.unwrap() {
+            InferenceRequest::Blocking { response_tx, .. } => {
+                assert!(
+                    response_tx
+                        .send(Ok(InferenceResponse {
+                            output_tokens: vec![0],
+                            finish_reason: "stop".into(),
+                            time_to_first_token_ms: 0.0,
+                            decode_time_ms: 0.0,
+                            logprobs: vec![],
+                            reasoning_tokens: 0,
+                            cached_prompt_tokens: 0,
+                            accepted_prediction_tokens: 0,
+                            prompt_logprobs: vec![],
+                            guard_stop: None,
+                        }))
+                        .is_ok()
+                );
+            }
+            InferenceRequest::Streaming { token_tx, .. } => {
+                token_tx.send(StreamEvent::Token(0)).await.unwrap();
+                token_tx
+                    .send(StreamEvent::Done {
+                        finish_reason: "stop".into(),
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        time_to_first_token_ms: 0.0,
+                        decode_time_ms: 0.0,
+                        reasoning_tokens: 0,
+                        cached_prompt_tokens: 0,
+                        accepted_prediction_tokens: 0,
+                        guard_stop: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    turn(
+        state.clone(),
+        json!({
+            "model": "fixture", "input": "new user input", "instructions": "X",
+            "conversation": conversation_id, "store": true, "stream": stream,
+            "max_output_tokens": 1,
+        }),
+    )
+    .await;
+    scheduler.await.unwrap();
+    let conversation = state.conversation_store.get(&conversation_id).unwrap();
+    let appended = &conversation.items[1..];
+    assert!(
+        appended
+            .iter()
+            .any(|item| item["role"] == "user" && item["content"][0]["text"] == "new user input"),
+        "new user input missing from conversation append: {appended:?}"
+    );
+    assert!(!appended.iter().any(|item| item["role"] == "system"));
+}
+
+#[tokio::test]
+async fn blocking_filtered_conversation_prefix() {
+    check_filtered_conversation_prefix(false).await;
+}
+
+#[tokio::test]
+async fn streaming_filtered_conversation_prefix() {
+    check_filtered_conversation_prefix(true).await;
+}

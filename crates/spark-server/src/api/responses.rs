@@ -128,7 +128,8 @@ pub async fn responses_endpoint(
 
     // Prepend conversation items (if any) before the lowered input so
     // the turn sees the full prior history.
-    let instructions_index = has_instructions.then_some(conversation_prefix.len());
+    let conversation_prefix_len = conversation_prefix.len();
+    let instructions_index = has_instructions.then_some(conversation_prefix_len);
     if !conversation_prefix.is_empty() {
         let mut combined = conversation_prefix;
         combined.append(&mut chat_req.messages);
@@ -154,7 +155,7 @@ pub async fn responses_endpoint(
             input_messages,
             metadata,
             store_flag,
-            conversation_id,
+            conversation_id.map(|cid| (cid, conversation_prefix_len)),
             client_session,
         )
         .await;
@@ -166,7 +167,13 @@ pub async fn responses_endpoint(
     // handler dumps at its own entry point if --dump is enabled).
     let ir_req = crate::session_key::with_override(chat_req.into(), client_session);
     let resp = chat_completions_inner(state.clone(), None, ir_req, None).await;
-    let conv_pair = conversation_id.map(|cid| (state.conversation_store.clone(), cid));
+    let conv_pair = conversation_id.map(|cid| {
+        (
+            state.conversation_store.clone(),
+            cid,
+            conversation_prefix_len,
+        )
+    });
     translate_chat_response_to_responses(
         resp,
         metadata,
