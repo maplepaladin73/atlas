@@ -5,13 +5,18 @@ use super::timing;
 use anyhow::Result;
 use spark_runtime::{gpu::DevicePtr, kernel_args::KernelLaunch};
 
-/// Native-FP4 (mxf4nvf4) expert path, gated by ATLAS_HY4_EXPERT_MMA=1.
-/// Each phase's bf16 activations are quantized into a packed-FP4 side
-/// buffer ([a_rows*k/2 e2m1 nibbles | a_rows*k/16 e4m3 scales], built by
-/// `hy4_expert_quantize` in the same module) and consumed by
-/// `hy4_batch_expert_mma`. When the gate is unset — or a phase's K is not
-/// a multiple of the native kernel's 128-wide K stage — the proven
-/// `hy4_batch_expert` kernel keeps serving the phase unchanged.
+/// Tensor-core expert paths, gated by ATLAS_HY4_EXPERT_MMA:
+/// - "1": native-FP4 (mxf4nvf4). Each phase's bf16 activations are
+///   quantized into a packed-FP4 side buffer ([a_rows*k/2 e2m1 nibbles |
+///   a_rows*k/16 e4m3 scales], built by `hy4_expert_quantize` in the same
+///   module) and consumed by `hy4_batch_expert_mma`.
+/// - "2": FP8 (e4m3) mma.sync m16n8k32 (`hy4_batch_expert_mma_fp8`) reading
+///   plain bf16 activations directly — no quantize pass, 3 mantissa bits on
+///   both operands instead of e2m1's one.
+///
+/// When the gate is unset — or a phase's K/N is not a multiple of the
+/// kernels' 128-wide stage — the proven `hy4_batch_expert` kernel keeps
+/// serving the phase unchanged.
 const MMA_K_STAGE: usize = 128;
 
 impl Hy4Ffn<'_> {
@@ -35,7 +40,9 @@ impl Hy4Ffn<'_> {
         // rows (x); down consumes the `rows*slots` activated slot rows.
         let phase_rows = [rows as usize, rows as usize * slots];
         let phase_k = [h, i];
-        let phase_native = std::env::var("ATLAS_HY4_EXPERT_MMA").as_deref() == Ok("1");
+        let mma_mode = std::env::var("ATLAS_HY4_EXPERT_MMA").ok();
+        let phase_native = mma_mode.as_deref() == Some("1");
+        let phase_fp8 = mma_mode.as_deref() == Some("2");
         // Packed-FP4 prequant buffer per phase. Two ops-cache tags keep the
         // gate/up and down buffers independent (they overlap in time only
         // within this call, but grow-only scratch is keyed per phase anyway).
@@ -103,29 +110,37 @@ impl Hy4Ffn<'_> {
             // (K must be a multiple of the 128-wide K stage, N of the
             // 128-column tile); otherwise the proven kernel reads the bf16
             // `input` directly and the side buffer stays unused.
-            let native = phase_native && k % MMA_K_STAGE == 0 && n % MMA_K_STAGE == 0;
+            let native =
+                (phase_native || phase_fp8) && k % MMA_K_STAGE == 0 && n % MMA_K_STAGE == 0;
             if native {
-                let a_rows = phase_rows[phase];
-                let packed_bytes = a_rows * (k / 2);
+                // fp8 mode reads the bf16 input directly; the mxf4 mode
+                // quantizes into the packed side buffer first.
+                let (kernel_name, a_ptr) = if phase_fp8 {
+                    ("hy4_batch_expert_mma_fp8", input)
+                } else {
+                    let a_rows = phase_rows[phase];
+                    let packed_bytes = a_rows * (k / 2);
+                    KernelLaunch::new(
+                        self.gpu,
+                        self.gpu
+                            .op_cache()
+                            .kernel(self.gpu, "hy4_ffn", "hy4_expert_quantize")?,
+                    )
+                    .grid([a_rows as u32, 1, 1])
+                    .block([256, 1, 1])
+                    .arg_ptr(input)
+                    .arg_ptr(packed[phase])
+                    .arg_ptr(packed[phase].offset(packed_bytes))
+                    .arg_u32(a_rows as u32)
+                    .arg_u32(k as u32)
+                    .launch(stream)?;
+                    ("hy4_batch_expert_mma", packed[phase])
+                };
                 KernelLaunch::new(
                     self.gpu,
                     self.gpu
                         .op_cache()
-                        .kernel(self.gpu, "hy4_ffn", "hy4_expert_quantize")?,
-                )
-                .grid([a_rows as u32, 1, 1])
-                .block([256, 1, 1])
-                .arg_ptr(input)
-                .arg_ptr(packed[phase])
-                .arg_ptr(packed[phase].offset(packed_bytes))
-                .arg_u32(a_rows as u32)
-                .arg_u32(k as u32)
-                .launch(stream)?;
-                KernelLaunch::new(
-                    self.gpu,
-                    self.gpu
-                        .op_cache()
-                        .kernel(self.gpu, "hy4_ffn", "hy4_batch_expert_mma")?,
+                        .kernel(self.gpu, "hy4_ffn", kernel_name)?,
                 )
                 .grid([
                     n.div_ceil(MMA_K_STAGE) as u32,
@@ -133,7 +148,7 @@ impl Hy4Ffn<'_> {
                     experts.min(rows as usize * slots) as u32,
                 ])
                 .block([256, 1, 1])
-                .arg_ptr(packed[phase])
+                .arg_ptr(a_ptr)
                 .arg_ptr(self.table)
                 .arg_ptr(groups)
                 .arg_ptr(output)

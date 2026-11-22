@@ -168,3 +168,7 @@ extern "C" __global__ void hy4_norm_add(const __nv_bfloat16* routed,
 // A3 — tensor-core expert variant (opt-in via ATLAS_HY4_EXPERT_MMA=1).
 // Loaded via the hy4_ffn module; launcher resolves it by name.
 #include "hy4_batch_mma.cuh"
+
+// A3-fp8 — FP8 (e4m3) mma variant (opt-in via ATLAS_HY4_EXPERT_MMA=2); takes
+// plain bf16 activations, no quantize pass. Same launcher contract.
+#include "hy4_batch_mma_fp8.cuh"
