@@ -90,7 +90,7 @@ async fn conversation_tool_call_replay_blocking_persistence() {
         None,
         vec![input],
         false,
-        Some((store.clone(), id.clone())),
+        Some((store.clone(), id.clone(), 0)),
     )
     .await;
     let stored = store.get(&id).unwrap();
@@ -194,6 +194,37 @@ async fn streaming_response_persists_large_conversation_turn() {
     };
     finalize_responses_stream(&tx, state.clone(), ctx).await;
     assert_large_turn_persisted(&state.conversation_store.get(&id).unwrap().items);
+}
+
+#[tokio::test]
+async fn conversation_merged_prefix_keeps_new_input() {
+    let store = crate::conversation_store::ConversationStore::with_config(
+        10,
+        std::time::Duration::from_secs(60),
+    );
+    let prior = vec![
+        serde_json::json!({"role":"assistant", "content":"Checking"}),
+        serde_json::json!({"type":"function_call", "call_id":"a", "name":"lookup"}),
+        serde_json::json!({"type":"function_call", "call_id":"b", "name":"lookup"}),
+    ];
+    let id = store.create(prior.clone(), Default::default());
+    let mut input = crate::openai::IncomingMessage::from_conversation_items(&prior);
+    let prefix_len = input.len();
+    input.push(crate::openai::IncomingMessage::synthetic_user_text(
+        "new turn".into(),
+    ));
+    translate_chat_response_to_responses(
+        ChatOutcome::Blocking(Box::new(chat_response(ir::FinishReason::Stop))),
+        None,
+        None,
+        input,
+        false,
+        Some((store.clone(), id.clone(), prefix_len)),
+    )
+    .await;
+    let stored = store.get(&id).unwrap();
+    assert_eq!(stored.items.len(), 5);
+    assert_eq!(stored.items[3]["content"][0]["text"], "new turn");
 }
 
 /// Runs the stream finalizer and returns the terminal SSE frame as
