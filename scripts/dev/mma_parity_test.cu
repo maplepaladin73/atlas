@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Parity test: hy4_batch_expert (proven) vs hy4_batch_expert_mma (new).
-// Includes the null/remote-expert case (EP).
+// Parity test: hy4_batch_expert (proven, bf16 activations) vs
+// hy4_batch_expert_mma (native-FP4 block-scale mxf4nvf4 port with
+// prequantized activations). Includes the null/remote-expert case (EP) and
+// asserts both phases. Optional bench mode times both kernels (ms/launch).
 #include "../../kernels/gb10/hy4-flash/nvfp4/hy4_ffn.cu"
+#include <cstring>
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
@@ -18,12 +21,30 @@ template<class T> struct Buffer {
 };
 
 int main(int argc, char** argv) {
-    unsigned latent=1536, inter=1536, e=512, slots=16, rows=256;
-    if (argc > 1) rows = atoi(argv[1]);
-    if (argc > 2) slots = atoi(argv[2]);
-    if (argc > 3) e = atoi(argv[3]);
-    if (argc > 4) latent = atoi(argv[4]);
-    if (argc > 5) inter = atoi(argv[5]);
+    // Default: production shapes — latent/hidden 3072, inter 1536. The old
+    // default (lat=1536) exercised the square-parity shape only.
+    unsigned latent=3072, inter=1536, e=128, slots=16, rows=256;
+    int bench=0, iters=200;
+    for (int i=1;i<argc;i++){
+        if (!strcmp(argv[i],"bench")) bench=1;
+        else if (!strcmp(argv[i],"iter")&&i+1<argc) iters=atoi(argv[++i]);
+        else {
+            // numeric positionals: rows, slots, experts, latent, inter
+            static int pos=0;
+            unsigned v=(unsigned)atoi(argv[i]);
+            switch (pos++) {
+                case 0: rows=v; break;
+                case 1: slots=v; break;
+                case 2: e=v; break;
+                case 3: latent=v; break;
+                case 4: inter=v; break;
+            }
+        }
+    }
+    if (latent % 128 || inter % 128) {
+        fprintf(stderr,"latent/inter must be multiples of 128 for the native kernel\n");
+        return 1;
+    }
 
     Buffer<unsigned char>wbuf((size_t)e*inter*latent/2),sbuf((size_t)e*inter*latent/16);
     std::vector<unsigned char>aw(wbuf.n),bs(sbuf.n);
@@ -37,8 +58,6 @@ int main(int argc, char** argv) {
             desc[j*3+1]={nullptr,nullptr,0.f,0};
             desc[j*3+2]={nullptr,nullptr,0.f,0};
         } else {
-            // Non-bf16-exact scales so the mma path's weight-rounding
-            // difference is visible (bf16 mantissa has 8 bits).
             desc[j*3]={wbuf.p,sbuf.p,0.113f*(j%8+1),0};
             desc[j*3+1]={wbuf.p,sbuf.p,0.311f,0};
             desc[j*3+2]={wbuf.p,sbuf.p,0.071f,0};
@@ -54,19 +73,78 @@ int main(int argc, char** argv) {
     dx.put(x);
     hy4_group_init<<<1,1>>>(groups.p,rows,e);
     hy4_group_rows<<<e,256>>>(di.p,groups.p,rows,slots);
-    // proven
-    hy4_batch_expert<<<dim3((inter+7)/8,1,e),256>>>(dx.p,table.p,groups.p,out_a.p,inter,latent,rows,slots,0,0,.25f,e);
-    hy4_batch_expert<<<dim3((latent+7)/8,1,e),256>>>(out_a.p,table.p,groups.p,out_p.p,latent,inter,rows,slots,0,1,.25f,e);
+    // Packed-FP4 activation buffers: [rows*latent/2 | rows*latent/16] for
+    // phase 0 and [rows*slots*inter/2 | rows*slots*inter/16] for phase 1.
+    Buffer<unsigned char>q0((size_t)rows*latent/2+(size_t)rows*latent/16);
+    Buffer<unsigned char>q1((size_t)rows*slots*inter/2+(size_t)rows*slots*inter/16);
+
+    auto run_proven=[&](){
+        hy4_batch_expert<<<dim3((inter+7)/8,1,e),256>>>(dx.p,table.p,groups.p,out_a.p,inter,latent,rows,slots,0,0,.25f,e);
+        hy4_batch_expert<<<dim3((latent+7)/8,1,e),256>>>(out_a.p,table.p,groups.p,out_p.p,latent,inter,rows,slots,0,1,.25f,e);
+    };
+    auto run_native=[&](){
+        // production shape: the phase-0 activations are quantized every call
+        hy4_expert_quantize<<<rows,256>>>(dx.p,q0.p,q0.p+(size_t)rows*(latent/2),rows,latent);
+        hy4_batch_expert_mma<<<dim3((inter+127)/128,1,e),256>>>(q0.p,table.p,groups.p,ref_a.p,inter,latent,rows,slots,0,0,.25f,e);
+        hy4_expert_quantize<<<rows*slots,256>>>(ref_a.p,q1.p,q1.p+(size_t)rows*slots*(inter/2),rows*slots,inter);
+        hy4_batch_expert_mma<<<dim3((latent+127)/128,1,e),256>>>(q1.p,table.p,groups.p,ref_p.p,latent,inter,rows,slots,0,1,.25f,e);
+    };
     CUDA(cudaDeviceSynchronize());
-    // mma
-    hy4_batch_expert_mma<<<dim3((inter+63)/64,1,e),256>>>(dx.p,table.p,groups.p,ref_a.p,inter,latent,rows,slots,0,0,.25f,e);
-    hy4_batch_expert_mma<<<dim3((latent+63)/64,1,e),256>>>(ref_a.p,table.p,groups.p,ref_p.p,latent,inter,rows,slots,0,1,.25f,e);
+    run_proven();
     CUDA(cudaDeviceSynchronize());
+    CUDA(cudaGetLastError());
+    run_native();
+    CUDA(cudaDeviceSynchronize());
+    {auto err=cudaGetLastError(); if(err!=cudaSuccess){fprintf(stderr,"native run: %s\n",cudaGetErrorString(err));return 1;}}
     auto go=out_a.get(), gm=ref_a.get(), gp=out_p.get(), gmp=ref_p.get();
-    float ma=0.f,mp=0.f; size_t maidx=0, mpidx=0;
-    for(size_t i=0;i<go.size();i++){float d=fabsf(float(go[i])-float(gm[i])); if(d>ma){ma=d;maidx=i;}}
-    for(size_t i=0;i<gp.size();i++){float d=fabsf(float(gp[i])-float(gmp[i])); if(d>mp){mp=d;mpidx=i;}}
-    printf("max_err_gate_up=%.6f (n=%zu, idx=%zu)\n", ma, go.size(), maidx);
-    printf("max_err_down=%.6f (n=%zu, idx=%zu)\n", mp, gp.size(), mpidx);
+    float ma=0.f,mp=0.f; size_t maidx=0, mpidx=0; double sa=0.,sp=0.;
+    size_t na=0, np2=0;
+    for(size_t j=0;j<go.size();j++){float d=fabsf(float(go[j])-float(gm[j])); if(d>ma){ma=d;maidx=j;} sa+=d; if(go[j]!=gm[j])na++;}
+    for(size_t j=0;j<gp.size();j++){float d=fabsf(float(gp[j])-float(gmp[j])); if(d>mp){mp=d;mpidx=j;} sp+=d; if(gp[j]!=gmp[j])np2++;}
+    printf("max_err_gate_up=%.6f (n=%zu, idx=%zu, mismatched=%zu, mean_err=%.6f)\n", ma, go.size(), maidx, na, sa/go.size());
+    printf("max_err_down=%.6f (n=%zu, idx=%zu, mismatched=%zu, mean_err=%.6f)\n", mp, gp.size(), mpidx, np2, sp/gp.size());
+    // Assertions: (a) null/remote experts (odd ids here) zero-fill bitwise in
+    // BOTH paths and both phases; (b) parity errors stay in a sane band.
+    int null_bad = 0;
+    for (unsigned t = 0; t < rows && t < 64; ++t) {
+        for (unsigned s = 0; s < slots; ++s) {
+            if (ids[(size_t)t*slots+s] % 2 == 0) continue;
+            const size_t at = (size_t)t*slots+s;
+            for (unsigned c = 0; c < inter; ++c) {
+                unsigned short pa = *(const unsigned short*)&go[at*inter+c];
+                unsigned short pn = *(const unsigned short*)&gm[at*inter+c];
+                if (pa || pn) { null_bad++; break; }
+            }
+            for (unsigned c = 0; c < latent; ++c) {
+                unsigned short pp = *(const unsigned short*)&gp[at*latent+c];
+                unsigned short pq = *(const unsigned short*)&gmp[at*latent+c];
+                if (pp || pq) { null_bad++; break; }
+            }
+        }
+    }
+    if (null_bad) { fprintf(stderr, "FAIL: %d null-expert rows non-zero\n", null_bad); return 1; }
+    if (!(ma == ma) || !(mp == mp) || ma > 0.1f || mp > 0.1f) {
+        fprintf(stderr, "FAIL: parity error out of band (gate_up %.6f, down %.6f)\n", ma, mp);
+        return 1;
+    }
+    printf("null-expert zero-fill: OK (both paths, both phases)\n");
+    if (bench) {
+        cudaEvent_t a,b; cudaEventCreate(&a); cudaEventCreate(&b);
+        // warmup
+        for(int i=0;i<10;i++) run_proven();
+        CUDA(cudaDeviceSynchronize());
+        cudaEventRecord(a);
+        for(int i=0;i<iters;i++) run_proven();
+        cudaEventRecord(b); cudaEventSynchronize(b);
+        float ms; cudaEventElapsedTime(&ms,a,b);
+        printf("proven  : %.3f ms/iter (gate_up+down, %d iters)\n", ms/iters, iters);
+        for(int i=0;i<10;i++) run_native();
+        CUDA(cudaDeviceSynchronize());
+        cudaEventRecord(a);
+        for(int i=0;i<iters;i++) run_native();
+        cudaEventRecord(b); cudaEventSynchronize(b);
+        cudaEventElapsedTime(&ms,a,b);
+        printf("native  : %.3f ms/iter (gate_up+down + quantize, %d iters)\n", ms/iters, iters);
+    }
     return 0;
 }
