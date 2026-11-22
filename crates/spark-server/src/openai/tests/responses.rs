@@ -33,6 +33,37 @@ fn responses_input_reasoning_and_empty_accepted() {
     }
 }
 
+#[test]
+fn responses_input_non_objects_rejected() {
+    for item in serde_json::json!([null, true, 42, "text", []])
+        .as_array()
+        .unwrap()
+    {
+        let req = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "input": [item],
+        }))
+        .unwrap();
+        let err = lower_responses_to_chat(req, |_| None).unwrap_err();
+        assert!(matches!(err, LowerResponsesError::BadRequest(_)));
+        assert_eq!(err.message(), "input items must be objects");
+    }
+}
+
+#[test]
+fn responses_input_known_missing_fields_unchanged() {
+    let req = serde_json::from_value(serde_json::json!({
+        "model": "test",
+        "input": [{"type": "message"}, {"type": "function_call"},
+                  {"type": "function_call_output"}],
+    }))
+    .unwrap();
+    let chat = lower_responses_to_chat(req, |_| None).unwrap();
+    assert_eq!(chat.messages.len(), 1);
+    assert_eq!(chat.messages[0].role, "tool");
+    assert!(chat.messages[0].content.text.is_empty());
+}
+
 fn lower_with_tools(
     tools: serde_json::Value,
 ) -> Result<ChatCompletionRequest, LowerResponsesError> {
@@ -129,7 +160,9 @@ fn responses_input_image_string_url_is_carried() {
             {"type": "input_image", "image_url": "data:image/png;base64,AAA"}
         ]
     });
-    let m = IncomingMessage::from_responses_input_item(&item).expect("message");
+    let m = IncomingMessage::from_responses_input_item(&item)
+        .expect("valid item")
+        .expect("message");
     assert_eq!(m.content.text, "what is this?");
     assert_eq!(
         m.content.images().collect::<Vec<_>>(),
@@ -147,7 +180,9 @@ fn responses_input_image_object_url_is_carried() {
             {"type": "input_image", "image_url": {"url": "https://example.com/a.png"}}
         ]
     });
-    let m = IncomingMessage::from_responses_input_item(&item).expect("message");
+    let m = IncomingMessage::from_responses_input_item(&item)
+        .expect("valid item")
+        .expect("message");
     assert_eq!(
         m.content.images().collect::<Vec<_>>(),
         vec!["https://example.com/a.png"]
@@ -169,7 +204,9 @@ fn responses_function_call_output_image_is_carried() {
             {"type": "input_image", "image_url": "data:image/png;base64,BBB"}
         ]
     });
-    let m = IncomingMessage::from_responses_input_item(&item).expect("tool message");
+    let m = IncomingMessage::from_responses_input_item(&item)
+        .expect("valid item")
+        .expect("tool message");
     assert_eq!(m.role, "tool");
     assert_eq!(m.tool_call_id.as_deref(), Some("call_1"));
     assert_eq!(m.content.text, "screenshot follows");
@@ -186,7 +223,9 @@ fn responses_function_call_output_string_unchanged() {
         "call_id": "call_2",
         "output": "plain result"
     });
-    let m = IncomingMessage::from_responses_input_item(&item).expect("tool message");
+    let m = IncomingMessage::from_responses_input_item(&item)
+        .expect("valid item")
+        .expect("tool message");
     assert_eq!(m.content.text, "plain result");
     assert!(!m.content.has_images());
 }
@@ -201,7 +240,9 @@ fn responses_function_call_output_opaque_array_stringified() {
         "call_id": "call_3",
         "output": opaque.clone()
     });
-    let m = IncomingMessage::from_responses_input_item(&item).expect("tool message");
+    let m = IncomingMessage::from_responses_input_item(&item)
+        .expect("valid item")
+        .expect("tool message");
     assert_eq!(m.content.text, opaque.to_string());
     assert!(!m.content.has_images());
 }

@@ -58,16 +58,9 @@ pub fn lower_responses_to_chat(
         }
         serde_json::Value::Array(items) => {
             for it in items {
-                let kind = it.get("type").and_then(|v| v.as_str()).unwrap_or("message");
-                match kind {
-                    "message" | "function_call" | "function_call_output" | "reasoning" => {}
-                    other => {
-                        return Err(LowerResponsesError::BadRequest(format!(
-                            "unknown input item type '{other}'"
-                        )));
-                    }
-                }
-                if let Some(m) = IncomingMessage::from_responses_input_item(it) {
+                if let Some(m) = IncomingMessage::from_responses_input_item(it)
+                    .map_err(LowerResponsesError::BadRequest)?
+                {
                     messages.push(m);
                 }
             }
