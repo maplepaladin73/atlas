@@ -5,6 +5,34 @@
 
 use crate::openai::*;
 
+#[test]
+fn responses_input_unknown_type_rejected() {
+    let req = serde_json::from_value(serde_json::json!({
+        "model": "test",
+        "input": [{"type": "unknown_item"}],
+    }))
+    .unwrap();
+    let err = lower_responses_to_chat(req, |_| None).unwrap_err();
+    assert!(matches!(err, LowerResponsesError::BadRequest(_)));
+    assert!(err.message().contains("unknown_item"));
+}
+
+#[test]
+fn responses_input_reasoning_and_empty_accepted() {
+    for input in [
+        serde_json::json!([]),
+        serde_json::json!([{"type": "reasoning", "encrypted_content": "opaque"}]),
+    ] {
+        let req = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "input": input,
+        }))
+        .unwrap();
+        let chat = lower_responses_to_chat(req, |_| None).unwrap();
+        assert!(chat.messages.is_empty());
+    }
+}
+
 fn lower_with_tools(
     tools: serde_json::Value,
 ) -> Result<ChatCompletionRequest, LowerResponsesError> {
