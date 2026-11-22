@@ -68,14 +68,20 @@ impl Hy4Ffn<'_> {
                 },
                 stream,
             )?;
+            let (kernel_name, col_tiles) =
+                if std::env::var("ATLAS_HY4_EXPERT_MMA").as_deref() == Ok("1") {
+                    ("hy4_batch_expert_mma", 64usize)
+                } else {
+                    ("hy4_batch_expert", 8usize)
+                };
             KernelLaunch::new(
                 self.gpu,
                 self.gpu
                     .op_cache()
-                    .kernel(self.gpu, "hy4_ffn", "hy4_batch_expert")?,
+                    .kernel(self.gpu, "hy4_ffn", kernel_name)?,
             )
             .grid([
-                n.div_ceil(8) as u32,
+                n.div_ceil(col_tiles) as u32,
                 1,
                 experts.min(rows as usize * slots) as u32,
             ])
