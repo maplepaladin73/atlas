@@ -213,7 +213,29 @@ pub fn lower_responses_to_chat(
             }
         },
         stop: Vec::new(),
-        response_format: None,
+        response_format: match r
+            .text
+            .and_then(|mut text| text.get_mut("format").map(serde_json::Value::take))
+        {
+            None => None,
+            Some(format) => {
+                let normalized =
+                    if format.get("type").and_then(|v| v.as_str()) == Some("json_schema") {
+                        serde_json::json!({"type": "json_schema", "json_schema": format})
+                    } else {
+                        format
+                    };
+                match serde_json::from_value::<ResponseFormat>(normalized) {
+                    Ok(ResponseFormat::Text) => None,
+                    Ok(format) => Some(format),
+                    Err(e) => {
+                        return Err(LowerResponsesError::BadRequest(format!(
+                            "invalid text.format: {e}"
+                        )));
+                    }
+                }
+            }
+        },
         min_tokens: 0,
         ignore_eos: false,
         disable_mtp: false,
