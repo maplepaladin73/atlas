@@ -140,8 +140,8 @@ extern "C" __global__ void __launch_bounds__(256) hy4_batch_expert_mma_fp8(
                     *(uint4*)&sA[row_][cb_] = *(const uint4*)( \
                         a_bf16 + (size_t)F8_AROW((unsigned)sTok[row_]) * k * 2 + kb_ * 2 + cb_); \
             } \
-            for (unsigned j_ = t; j_ < 128u * 8u; j_ += 256) { \
-                const unsigned c_ = j_ >> 3, q_ = (j_ & 7u) * 16u; \
+            for (unsigned j_ = t; j_ < 128u * 4u; j_ += 256) { \
+                const unsigned c_ = j_ >> 2, q_ = (j_ & 3u) * 16u; \
                 const unsigned gc_ = cta_n + c_; \
                 if (gc_ < n) \
                     *(uint4*)&sBr[c_][q_] = *(const uint4*)( \
