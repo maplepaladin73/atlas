@@ -50,6 +50,7 @@ mod conv_items;
 pub(super) async fn responses_endpoint_stream(
     CurrentModel(state): CurrentModel,
     mut chat_req: ChatCompletionRequest,
+    input_messages: Vec<crate::openai::IncomingMessage>,
     metadata: Option<std::collections::HashMap<String, String>>,
     store_flag: bool,
     conversation_id: Option<String>,
@@ -64,7 +65,6 @@ pub(super) async fn responses_endpoint_stream(
     chat_req.stream_options = None;
 
     let model = chat_req.model.clone();
-    let input_messages = chat_req.messages.clone();
     let state_arc = state.clone();
     // Capture the conversation-linked user items (the new turn's user
     // input) before handing chat_req off. We use them to append back

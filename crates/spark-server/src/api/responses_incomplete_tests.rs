@@ -16,6 +16,62 @@ use crate::api::chat::ChatOutcome;
 use crate::api::test_app_state;
 use crate::ir;
 
+#[test]
+fn responses_previous_instructions_replaced() {
+    check_instructions_resume(Some("Y"));
+}
+
+#[test]
+fn responses_previous_instructions_not_inherited() {
+    check_instructions_resume(None);
+}
+
+#[test]
+fn responses_transcript_preserves_explicit_system_messages() {
+    use super::responses::response_input_transcript;
+    use crate::openai::IncomingMessage;
+    let messages = vec![
+        IncomingMessage::synthetic_system("conversation system".into()),
+        IncomingMessage::synthetic_system("instructions".into()),
+        IncomingMessage::synthetic_system("input system".into()),
+    ];
+    let transcript = response_input_transcript(&messages, Some(1));
+    assert_eq!(transcript.len(), 2);
+    assert_eq!(transcript[0].content.text, "conversation system");
+    assert_eq!(transcript[1].content.text, "input system");
+    assert_eq!(response_input_transcript(&messages, None).len(), 3);
+    assert!(response_input_transcript(&[], None).is_empty());
+}
+
+fn check_instructions_resume(instructions: Option<&str>) {
+    use crate::openai::{ResponsesRequest, lower_responses_to_chat};
+    let first: ResponsesRequest = serde_json::from_value(serde_json::json!({
+        "model": "test", "instructions": "X", "input": "first"
+    }))
+    .unwrap();
+    let first = lower_responses_to_chat(first, |_| None).unwrap();
+    assert_eq!(first.messages[0].content.text, "X");
+    let prior = super::responses::response_input_transcript(&first.messages, Some(0));
+    let next: ResponsesRequest = serde_json::from_value(serde_json::json!({
+        "model": "test", "previous_response_id": "resp_A",
+        "instructions": instructions, "input": "second"
+    }))
+    .unwrap();
+    let next = lower_responses_to_chat(next, |id| {
+        assert_eq!(id, "resp_A");
+        Some(prior)
+    })
+    .unwrap();
+    let systems: Vec<_> = next
+        .messages
+        .iter()
+        .filter(|m| m.role == "system")
+        .map(|m| m.content.text.as_str())
+        .collect();
+    assert_eq!(systems, instructions.into_iter().collect::<Vec<_>>());
+    assert_eq!(next.messages.iter().filter(|m| m.role == "user").count(), 2);
+}
+
 fn tokenizer() -> crate::tokenizer::ChatTokenizer {
     let dir = tempfile::tempdir().unwrap();
     let vocab = [("[UNK]".to_string(), 0)].into_iter().collect();

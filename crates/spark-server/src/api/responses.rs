@@ -62,6 +62,7 @@ pub async fn responses_endpoint(
     let metadata = r.metadata.clone();
     let store_flag = r.store.unwrap_or(true); // Responses API defaults to store=true.
     let streaming = r.stream;
+    let has_instructions = r.instructions.is_some();
 
     // Resolve `conversation` field (2026): either a string id or
     // `{"id": "..."}`. When set, pre-seed the turn with the stored
@@ -127,6 +128,7 @@ pub async fn responses_endpoint(
 
     // Prepend conversation items (if any) before the lowered input so
     // the turn sees the full prior history.
+    let instructions_index = has_instructions.then_some(conversation_prefix.len());
     if !conversation_prefix.is_empty() {
         let mut combined = conversation_prefix;
         combined.append(&mut chat_req.messages);
@@ -143,10 +145,13 @@ pub async fn responses_endpoint(
         )
     });
 
+    let input_messages = response_input_transcript(&chat_req.messages, instructions_index);
+
     if streaming {
         return responses_endpoint_stream(
             CurrentModel(state),
             chat_req,
+            input_messages,
             metadata,
             store_flag,
             conversation_id,
@@ -154,10 +159,6 @@ pub async fn responses_endpoint(
         )
         .await;
     }
-
-    // Capture the input transcript BEFORE moving chat_req into the handler
-    // — we need it for the stored-turn's `messages` field.
-    let input_messages = chat_req.messages.clone();
 
     // Re-enter the blocking chat-completions handler with the lowered
     // request. Use the _inner variant because we already have a parsed
@@ -175,4 +176,16 @@ pub async fn responses_endpoint(
         conv_pair,
     )
     .await
+}
+
+pub(super) fn response_input_transcript(
+    messages: &[crate::openai::IncomingMessage],
+    instructions_index: Option<usize>,
+) -> Vec<crate::openai::IncomingMessage> {
+    let mut transcript = messages.to_vec();
+    // Request-scoped instructions are not conversation history.
+    if let Some(index) = instructions_index {
+        transcript.remove(index);
+    }
+    transcript
 }
