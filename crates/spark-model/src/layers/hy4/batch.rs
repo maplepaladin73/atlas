@@ -7,6 +7,11 @@ use spark_runtime::{
 };
 
 pub const MAX_ROWS: usize = 256;
+/// Prefill chunk width: the wide workspace and the expert-FFN batch gate.
+/// The expert FFN streams its weights once per chunk, so wider chunks cut
+/// per-token weight traffic; attention and Engram still process each chunk
+/// in MAX_ROWS slices, and VERIFY keeps using the MAX_ROWS-wide workspace.
+pub const PREFILL_ROWS: usize = 1024;
 
 pub(crate) fn gemm(
     gpu: &dyn GpuBackend,

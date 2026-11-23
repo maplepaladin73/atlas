@@ -19,7 +19,7 @@ pub(super) struct BatchScratch<'a> {
 impl<'a> BatchScratch<'a> {
     fn new(e: &Hy4Engram<'a>) -> Result<Self> {
         let mut m = Owned::new(e.mem.gpu);
-        let rows = batch::MAX_ROWS;
+        let rows = batch::PREFILL_ROWS;
         Ok(Self {
             tokens: m.alloc(rows * 3 * 4)?,
             hashes: m.alloc(rows * e.layout.sizes.len() * 4)?,
@@ -49,7 +49,7 @@ impl<'a> Hy4Engram<'a> {
             .ok_or_else(|| anyhow::anyhow!("Hy4 Engram batch start"))?;
         ensure!(
             rows > 0
-                && rows <= batch::MAX_ROWS
+                && rows <= batch::PREFILL_ROWS
                 && !hidden.is_null()
                 && self.mem.is_live()
                 && scratch.mem.is_live()
