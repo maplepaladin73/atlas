@@ -24,12 +24,14 @@ pub(crate) fn gemm(
     let [kind, float_out] = flags;
     // Tensor-core paths gated by ATLAS_HY4_LINEAR_MMA=1: fp8-e4m3 weights
     // decode to bf16 in-kernel (numerics identical to the GEMV, bf16
-    // output only), and bf16 weights run mma directly with fp32 output
-    // allowed (the router). Requires K%32; crossover vs the GEMV is
-    // rows≈32 on GB10 (kernel bench), so decode stays on the GEMV.
+    // output only), and bf16 weights run mma directly. Both are bf16
+    // output only: the fp32 router GEMM stays on the scalar GEMV because
+    // fp32 accumulation order flips top-k expert ties (parity break).
+    // Requires K%32; crossover vs the GEMV is rows~32 on GB10 (kernel
+    // bench), so decode stays on the GEMV.
     let linear_mma = std::env::var("ATLAS_HY4_LINEAR_MMA").ok().as_deref() == Some("1");
     let mma_fp8 = kind == 1 && float_out == 0 && linear_mma;
-    let mma_bf16 = kind == 0 && linear_mma;
+    let mma_bf16 = kind == 0 && float_out == 0 && linear_mma;
     if (mma_fp8 || mma_bf16) && k % 32 == 0 && rows >= 32 {
         let name = if mma_fp8 {
             "hy4_batch_linear_mma"
