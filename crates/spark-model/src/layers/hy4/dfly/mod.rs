@@ -106,7 +106,7 @@ pub struct Head {
     pub weight: DevicePtr,
 }
 
-pub type EmbeddingLookup<'a> = dyn FnMut(&[u32], DevicePtr, u64) -> Result<()> + 'a;
+pub type EmbeddingLookup<'a> = dyn FnMut(DevicePtr, usize, DevicePtr, u64) -> Result<()> + 'a;
 
 struct Layer {
     input_norm: DevicePtr,
@@ -163,7 +163,6 @@ struct Scratch {
     final_hidden: DevicePtr,
     embedding: DevicePtr,
     logits: DevicePtr,
-    id: DevicePtr,
     ids: DevicePtr,
 }
 pub struct Dfly<'a> {
@@ -194,18 +193,8 @@ impl<'a> Dfly<'a> {
         self.forward(
             input,
             head.weight,
-            &mut |tokens, output, stream| {
-                let bytes: Vec<_> = tokens.iter().flat_map(|id| id.to_le_bytes()).collect();
-                self.ops
-                    .gpu
-                    .copy_h2d_async_retained(&bytes, self.scratch.ids, stream)?;
-                self.ops.embed(
-                    head.embedding,
-                    self.scratch.ids,
-                    output,
-                    tokens.len(),
-                    stream,
-                )
+            &mut |ids, rows, output, stream| {
+                self.ops.embed(head.embedding, ids, output, rows, stream)
             },
             comm,
             stream,

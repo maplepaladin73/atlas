@@ -17,7 +17,9 @@ impl Dfly<'_> {
         let rows = input.count + 1;
         let heads = 32 / c.world;
         let ids = input.query_ids(c);
-        lookup(&ids, s.hidden, stream)?;
+        let id_bytes: Vec<_> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+        o.gpu.copy_h2d_async_retained(&id_bytes, s.ids, stream)?;
+        lookup(s.ids, rows, s.hidden, stream)?;
         o.norm(s.hidden, self.fusion.en, s.concat, [1, H, H, H], stream)?;
         o.norm(
             input.target_hidden,
@@ -88,10 +90,9 @@ impl Dfly<'_> {
             stream,
         )?;
         let b = &self.correction;
-        let mut previous = input.bonus;
         let mut tokens = Vec::with_capacity(input.count);
         for step in 0..input.count {
-            lookup(&[previous], s.embedding, stream)?;
+            lookup(s.ids.offset(step * 4), 1, s.embedding, stream)?;
             let hidden = s.final_hidden.offset((step + 1) * H * 2);
             o.norm(hidden, b.hn, s.concat, [1, H, H, H], stream)?;
             o.norm(
@@ -106,8 +107,20 @@ impl Dfly<'_> {
             o.element(Op::Silu, s.cg, s.cu, s.ca, H, stream)?;
             o.linear(s.ca, b.down, s.delta, [1, H, H], stream)?;
             o.element(Op::Add, hidden, s.delta, s.corrected, H, stream)?;
-            previous = o.head(s.corrected, weight, s.logits, s.id, comm, stream)?;
-            tokens.push(previous);
+            o.head(
+                s.corrected,
+                weight,
+                s.logits,
+                s.ids.offset((step + 1) * 4),
+                comm,
+                stream,
+            )?;
+        }
+        o.gpu.synchronize(stream)?;
+        let mut bytes = vec![0u8; input.count * 4];
+        o.gpu.copy_d2h(s.ids.offset(4), &mut bytes)?;
+        for chunk in bytes.chunks_exact(4) {
+            tokens.push(u32::from_le_bytes(chunk.try_into()?));
         }
         Ok(tokens)
     }

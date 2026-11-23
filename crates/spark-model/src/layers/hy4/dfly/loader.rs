@@ -183,7 +183,6 @@ pub(super) fn load<'a>(
         final_hidden: bf(ROWS * H)?,
         embedding: bf(H)?,
         logits: l.memory.alloc(c.vocab * 4)?,
-        id: l.memory.alloc(4)?,
         ids: l.memory.alloc(ROWS * 4)?,
     };
     Ok(Dfly {

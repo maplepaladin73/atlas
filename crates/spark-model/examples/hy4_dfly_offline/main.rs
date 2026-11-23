@@ -101,14 +101,20 @@ fn main() -> Result<()> {
         config.vocab / world,
         &mut buffers,
     )?;
-    let mut lookup = |ids: &[u32], output: spark_runtime::gpu::DevicePtr, stream| {
-        ensure!(!ids.is_empty(), "empty embedding lookup");
+    let mut lookup = |ids: spark_runtime::gpu::DevicePtr,
+                      rows: usize,
+                      output: spark_runtime::gpu::DevicePtr,
+                      stream| {
+        ensure!(rows > 0, "empty embedding lookup");
         io::guard(g, reserve, 0)?;
-        for (row, id) in ids.iter().enumerate() {
+        let mut id_bytes = vec![0u8; rows * 4];
+        g.copy_d2h(ids, &mut id_bytes)?;
+        for (row, chunk) in id_bytes.chunks_exact(4).enumerate() {
+            let id = u32::from_le_bytes(chunk.try_into().unwrap()) as usize;
             checkpoint.copy_rows(
                 "model.embed_tokens.weight",
                 [config.vocab, 3072],
-                *id as usize,
+                id,
                 1,
                 |offset, bytes| {
                     g.copy_h2d_async_retained(bytes, output.offset(row * 3072 * 2 + offset), stream)
