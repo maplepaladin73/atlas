@@ -92,11 +92,26 @@ pub struct SystemBlock {
 // filtering is the shape of bug where a serving problem gets debugged in
 // the copy that never runs.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnthropicRole {
     User,
     Assistant,
+}
+
+impl<'de> Deserialize<'de> for AnthropicRole {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let role = String::deserialize(deserializer)?;
+        match role.as_str() {
+            "user" => Ok(Self::User),
+            "assistant" => Ok(Self::Assistant),
+            _ => Err(<D::Error as serde::de::Error>::custom(format!(
+                "unknown Anthropic message role `{role}`"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

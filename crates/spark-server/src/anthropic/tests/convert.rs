@@ -207,6 +207,21 @@ fn rejects_unknown_message_role() {
 }
 
 #[test]
+fn rejects_object_message_role() {
+    for role in [
+        serde_json::json!({"user": null}),
+        serde_json::json!({"assistant": null}),
+    ] {
+        serde_json::from_value::<MessagesRequest>(serde_json::json!({
+            "model": "qwen3-80b",
+            "max_tokens": 1024,
+            "messages": [{"role": role, "content": "hello"}],
+        }))
+        .expect_err("an object message role should be rejected");
+    }
+}
+
+#[test]
 fn tool_result_is_error_defaults_to_none_when_absent() {
     // The success path is "field absent", not "field false" — a missing
     // `is_error` must not deserialize into an error-flagged result.
