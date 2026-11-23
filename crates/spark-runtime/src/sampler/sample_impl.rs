@@ -367,27 +367,16 @@ pub fn argmax_last_wins_f32(v: &[f32]) -> u32 {
 #[test]
 fn top_n_sigma_with_masked_logits_full_row() {
     let mut params = SamplingParams::greedy(1);
-    params.temperature = 4.0;
-    params.top_n_sigma = 0.1;
-    let row = [3.0f32, 0.0, 0.0, f32::NEG_INFINITY, -1.0];
-    let bytes: Vec<_> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-    for seed in 0..32 {
-        assert_eq!(
-            sample_with_params_seeded(&bytes, &params, &[], Some(seed)),
-            0
-        );
-    }
-
-    for (logit, expected) in [(f32::NEG_INFINITY, 0), (3.0, 1)] {
-        let bytes: Vec<_> = [f32::NEG_INFINITY, logit]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        assert_eq!(
-            sample_with_params_seeded(&bytes, &params, &[], Some(0)),
-            expected
-        );
+    (params.temperature, params.top_n_sigma) = (4.0, 0.1);
+    let mask = f32::NEG_INFINITY;
+    for (row, expected) in [
+        ([3.0, 0.0, 0.0, mask, -1.0], 0),
+        ([mask; 5], 0),
+        ([mask, 3.0, mask, mask, mask], 1),
+    ] {
+        let bytes: Vec<_> = row.into_iter().flat_map(f32::to_le_bytes).collect();
+        let sample = |seed| sample_with_params_seeded(&bytes, &params, &[], Some(seed));
+        (0..32).for_each(|seed| assert_eq!(sample(seed), expected));
     }
 }
 
