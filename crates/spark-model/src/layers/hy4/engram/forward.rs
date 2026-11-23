@@ -90,8 +90,15 @@ impl Hy4Engram<'_> {
         }
         if let Some(c) = comm {
             let _reduce = timing::span("all_reduce", stream)?;
-            // The four key chunks are contiguous; reduce them as one buffer.
-            c.all_reduce_async(scratch.keys.0, 4 * self.h * 2, stream)?;
+            if self.max_fused_rows > 0 {
+                // The four key chunks are contiguous; reduce them as one buffer.
+                c.all_reduce_async(scratch.keys.0, 4 * self.h * 2, stream)?;
+            } else {
+                let bytes = self.h * 2;
+                for part in 0..4 {
+                    c.all_reduce_async(scratch.keys.offset(part * bytes).0, bytes, stream)?;
+                }
+            }
             c.all_reduce_async(scratch.value.0, self.h * 2, stream)?;
         }
         for (input, weight, out) in [

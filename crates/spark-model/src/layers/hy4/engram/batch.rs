@@ -145,8 +145,15 @@ impl<'a> Hy4Engram<'a> {
         }
         if let Some(comm) = comm.filter(|_| self.topology[1] > 1) {
             let _reduce = super::super::timing::span("all_reduce", stream)?;
-            // The four key chunks are contiguous; reduce them as one buffer.
-            comm.all_reduce_async(b.keys.0, rows * 4 * self.h * 2, stream)?;
+            if rows <= self.max_fused_rows {
+                // The four key chunks are contiguous; reduce them as one buffer.
+                comm.all_reduce_async(b.keys.0, rows * 4 * self.h * 2, stream)?;
+            } else {
+                let chunk = rows * self.h * 2;
+                for part in 0..4 {
+                    comm.all_reduce_async(b.keys.offset(part * chunk).0, chunk, stream)?;
+                }
+            }
             comm.all_reduce_async(b.value.0, rows * self.h * 2, stream)?;
         }
         for row in 0..rows {

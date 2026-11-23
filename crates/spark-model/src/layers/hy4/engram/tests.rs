@@ -14,6 +14,7 @@ fn fixture(gpu: &MockGpuBackend, rank: usize, world: usize) -> (ModelConfig, Wei
         "../../../../../atlas-core/src/config/fixtures/hy4/config.json"
     ))
     .unwrap();
+    c.max_batch_tokens = 1024;
     c.tp_rank = rank;
     c.tp_world_size = world;
     let sizes = vec![vec![7; 8]; 2];
@@ -208,5 +209,52 @@ fn batched_keys_respect_n_by_h_collective_capacity_and_reject_empty_batches() {
             .is_err()
     );
     assert_eq!(gpu.launch_count(), launches);
+    gpu.free(hidden).unwrap();
+}
+
+#[test]
+fn batched_keys_split_when_fused_payload_exceeds_collective_capacity() {
+    let gpu = MockGpuBackend::new();
+    let (mut c, store) = fixture(&gpu, 0, 2);
+    c.max_batch_tokens = 129;
+    let block = Hy4Engram::load(&c, &store, 1, &gpu).unwrap();
+    let mut scratch = block.scratch().unwrap();
+    let history = vec![1; 57];
+    let hidden = gpu.alloc(history.len() * c.hidden_size * 4 * 2).unwrap();
+    let unit = history.len() * c.hidden_size * 2;
+    let comm = Comm {
+        rank: 0,
+        calls: AtomicUsize::new(0),
+        bytes: unit,
+        sizes: Mutex::new(Vec::new()),
+    };
+    block
+        .forward_batch(hidden, &history, 0, &mut scratch, Some(&comm), 0)
+        .unwrap();
+    assert_eq!(comm.calls.load(Ordering::Relaxed), 5);
+    assert_eq!(comm.sizes.lock().unwrap().as_slice(), &[unit; 5]);
+    gpu.free(hidden).unwrap();
+}
+
+#[test]
+fn serial_keys_split_when_fused_payload_exceeds_collective_capacity() {
+    let gpu = MockGpuBackend::new();
+    let (mut c, store) = fixture(&gpu, 0, 2);
+    c.max_batch_tokens = 3;
+    let block = Hy4Engram::load(&c, &store, 1, &gpu).unwrap();
+    let mut scratch = block.scratch().unwrap();
+    let hidden = gpu.alloc(c.hidden_size * 4 * 2).unwrap();
+    let unit = c.hidden_size * 2;
+    let comm = Comm {
+        rank: 0,
+        calls: AtomicUsize::new(0),
+        bytes: unit,
+        sizes: Mutex::new(Vec::new()),
+    };
+    block
+        .forward(hidden, &[], 1, &mut scratch, Some(&comm), 0)
+        .unwrap();
+    assert_eq!(comm.calls.load(Ordering::Relaxed), 5);
+    assert_eq!(comm.sizes.lock().unwrap().as_slice(), &[unit; 5]);
     gpu.free(hidden).unwrap();
 }

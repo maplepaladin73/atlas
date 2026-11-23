@@ -23,6 +23,7 @@ pub struct Hy4Engram<'a> {
     heads: std::ops::Range<usize>,
     dim: usize,
     h: usize,
+    max_fused_rows: usize,
     rows: std::ops::Range<usize>,
     table: DevicePtr,
     scales: DevicePtr,
@@ -232,6 +233,9 @@ impl<'a> Hy4Engram<'a> {
             heads,
             dim,
             h: config.hidden_size,
+            // The 2-rank receive buffer is max_batch_tokens × hidden × BF16;
+            // fused keys carry 4 × hidden per row.
+            max_fused_rows: config.max_batch_tokens / 4,
             rows,
             table,
             scales,
