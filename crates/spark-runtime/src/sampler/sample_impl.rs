@@ -83,15 +83,19 @@ fn sample_core(
     // ── 1. Top-n-sigma: filter noise in logit space (temperature-invariant) ──
     // Keep tokens with logit >= mean - n*sigma. Filters NVFP4 quantization noise.
     if top_n_sigma > 0.0 {
-        let sum: f32 = raw_logits.iter().sum();
-        let mean = sum / n as f32;
-        let var: f32 = raw_logits.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n as f32;
-        let sigma = var.sqrt();
-        if sigma > 0.0 {
-            let threshold = mean - top_n_sigma * sigma;
-            for logit in raw_logits.iter_mut() {
-                if *logit < threshold {
-                    *logit = f32::NEG_INFINITY;
+        let finite = || raw_logits.iter().copied().filter(|v| v.is_finite());
+        let (count, sum) =
+            finite().fold((0, 0.0), |(count, sum), v| (count + 1, sum + f64::from(v)));
+        if count > 1 {
+            let mean = sum / count as f64;
+            let var = finite().map(|v| (f64::from(v) - mean).powi(2)).sum::<f64>() / count as f64;
+            let sigma = var.sqrt();
+            if sigma > 0.0 {
+                let threshold = mean - f64::from(top_n_sigma) * sigma;
+                for logit in &mut raw_logits {
+                    if f64::from(*logit) < threshold {
+                        *logit = f32::NEG_INFINITY;
+                    }
                 }
             }
         }
@@ -357,6 +361,34 @@ pub fn argmax_last_wins_f32(v: &[f32]) -> u32 {
         .unwrap_or(0)
         .try_into()
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+#[test]
+fn top_n_sigma_with_masked_logits_full_row() {
+    let mut params = SamplingParams::greedy(1);
+    params.temperature = 4.0;
+    params.top_n_sigma = 0.1;
+    let row = [3.0f32, 0.0, 0.0, f32::NEG_INFINITY, -1.0];
+    let bytes: Vec<_> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    for seed in 0..32 {
+        assert_eq!(
+            sample_with_params_seeded(&bytes, &params, &[], Some(seed)),
+            0
+        );
+    }
+
+    for (logit, expected) in [(f32::NEG_INFINITY, 0), (3.0, 1)] {
+        let bytes: Vec<_> = [f32::NEG_INFINITY, logit]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(
+            sample_with_params_seeded(&bytes, &params, &[], Some(0)),
+            expected
+        );
+    }
 }
 
 #[cfg(test)]
