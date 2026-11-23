@@ -239,7 +239,11 @@ impl Runtime<'_> {
                     }
                 }
                 drop(row_span);
-                gpu.synchronize(stream)?;
+                // VERIFY argmax is enqueued on the same stream; avoid a host
+                // wait between the forward and that launch.
+                if mode != VERIFY {
+                    gpu.synchronize(stream)?;
+                }
                 if let Some(timer) = timer {
                     timer.finish()?;
                 }
