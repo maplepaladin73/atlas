@@ -253,11 +253,13 @@ impl AttentionCache<'_, '_> {
             linear(b.qc, ix.query, b.query, ix.heads * 128, a.qrank)?;
             linear(input, ix.head, b.hw, ix.heads, a.hidden)?;
         }
-        // Speculative VERIFY keeps the proven tile width while prefix capture is active.
+        // Speculative VERIFY keeps the proven tile geometry while prefix
+        // capture is active (the window constraint still applies to SWA).
+        let causal_rows = causal_rows(a.window, self.layout.table.len() * self.layout.page_size);
         let causal_rows = if self.prefix_capturing() {
-            CAUSAL_ROWS
+            causal_rows.min(CAUSAL_ROWS)
         } else {
-            causal_rows(a.window, self.layout.table.len() * self.layout.page_size)
+            causal_rows
         };
         for first in (0..rows).step_by(causal_rows) {
             let end = (first + causal_rows).min(rows);
