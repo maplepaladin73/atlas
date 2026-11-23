@@ -8,10 +8,12 @@ use spark_comm::CommBackend;
 use spark_runtime::{gpu::DevicePtr, kernel_args::KernelLaunch};
 
 const CAUSAL_ROWS: usize = 8;
+// Indexed (DSA) layers have a non-circular paged cache: wider causal tiles.
+const INDEXED_TILE_ROWS: usize = 64;
 const INDEX_KEYS: usize = 2048;
 
 fn causal_rows(window: Option<usize>, slots: usize) -> usize {
-    window.map_or(CAUSAL_ROWS, |w| (slots - (w - 1)).min(CAUSAL_ROWS))
+    window.map_or(INDEXED_TILE_ROWS, |w| (slots - (w - 1)).min(CAUSAL_ROWS))
 }
 
 pub(super) struct BatchScratch<'a> {
@@ -39,11 +41,12 @@ impl<'a> BatchScratch<'a> {
     fn new(a: &Hy4Attention<'a>) -> Result<Self> {
         let mut m = Owned::new(a.memory.gpu);
         let max_groups = a.max_context.div_ceil(4);
+        let tile_rows = a.window.map_or(INDEXED_TILE_ROWS, |_| CAUSAL_ROWS);
         let (quant, scales, scores) = match &a.index {
             Some(ix) => (
-                m.alloc(CAUSAL_ROWS * ix.heads * 128)?,
-                m.alloc(CAUSAL_ROWS * ix.heads * 4)?,
-                m.alloc(CAUSAL_ROWS * max_groups * 4)?,
+                m.alloc(tile_rows * ix.heads * 128)?,
+                m.alloc(tile_rows * ix.heads * 4)?,
+                m.alloc(tile_rows * max_groups * 4)?,
             ),
             None => (DevicePtr::NULL, DevicePtr::NULL, DevicePtr::NULL),
         };
@@ -61,9 +64,9 @@ impl<'a> BatchScratch<'a> {
             key: alloc(128)?,
             query: alloc(a.index.as_ref().map_or(1, |ix| ix.heads * 128))?,
             hw: alloc(a.index.as_ref().map_or(1, |ix| ix.heads))?,
-            indices: m.alloc(CAUSAL_ROWS * INDEX_KEYS * 4)?,
+            indices: m.alloc(tile_rows * INDEX_KEYS * 4)?,
             softmax_parts: m.alloc(
-                CAUSAL_ROWS * a.heads * a.window.unwrap_or(INDEX_KEYS).div_ceil(128) * 514 * 4,
+                tile_rows * a.heads * a.window.unwrap_or(INDEX_KEYS).div_ceil(128) * 514 * 4,
             )?,
             quant,
             scales,
@@ -491,6 +494,6 @@ mod tests {
                 assert!(window - 1 + rows <= capacity);
             }
         }
-        assert_eq!(causal_rows(None, 1), CAUSAL_ROWS);
+        assert_eq!(causal_rows(None, 1), INDEXED_TILE_ROWS);
     }
 }
