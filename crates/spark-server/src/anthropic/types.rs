@@ -92,9 +92,16 @@ pub struct SystemBlock {
 // filtering is the shape of bug where a serving problem gets debugged in
 // the copy that never runs.
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnthropicRole {
+    User,
+    Assistant,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AnthropicMessage {
-    pub role: String,
+    pub role: AnthropicRole,
     pub content: AnthropicContent,
 }
 
