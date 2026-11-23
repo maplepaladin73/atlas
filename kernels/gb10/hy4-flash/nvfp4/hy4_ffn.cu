@@ -15,30 +15,28 @@ __device__ __constant__ float HY4_FP4[16]={
 __device__ __forceinline__ float hy4_qdot(const __nv_bfloat16* x,Hy4Q4 q,
     unsigned row,unsigned k,const float* lut) {
     float sum=0.f;
-    if (q.w) for (unsigned col=(threadIdx.x%32)*32;col<k;col+=1024) {
-        unsigned count=min(32u,k-col);
-        uint4 packed;
-        if (count==32 && k%32==0) packed=*(const uint4*)(q.w+(size_t)row*(k/2)+col/2);
-        else {
-            const uint2* p=(const uint2*)(q.w+(size_t)row*(k/2)+col/2);
-            const uint2 lo=p[0],hi=count==32?p[1]:make_uint2(0,0);
-            packed=make_uint4(lo.x,lo.y,hi.x,hi.y);
+    if (q.w) for (unsigned col=(threadIdx.x%32)*16;col<k;col+=512) {
+        unsigned count=min(16u,k-col);
+        unsigned words[2]={};
+        if (count==16 && k%16==0) {
+            uint2 packed=*(const uint2*)(q.w+(size_t)row*(k/2)+col/2);
+            words[0]=packed.x;words[1]=packed.y;
+        } else {
+            const unsigned char* p=(const unsigned char*)q.w+(size_t)row*(k/2)+col/2;
+            for(unsigned b=0;b<count/2;b++)words[b/4]|=(unsigned)p[b]<<(8*(b%4));
         }
-        const unsigned words[4]={packed.x,packed.y,packed.z,packed.w};
-        for (unsigned group=0;group<count/16;group++) {
-            __nv_fp8_e4m3 sf;sf.__x=q.s[(size_t)row*(k/16)+col/16+group];
-            float scale=(float)sf*q.scale;
+        __nv_fp8_e4m3 sf;sf.__x=q.s[(size_t)row*(k/16)+col/16];
+        float scale=(float)sf*q.scale;
+        #pragma unroll
+        for (unsigned v=0;v<2;v++) {
+            uint4 a=*(const uint4*)(x+col+v*8);
+            const unsigned ar[4]={a.x,a.y,a.z,a.w};
+            unsigned w=words[v];
             #pragma unroll
-            for (unsigned v=0;v<2;v++) {
-                uint4 a=*(const uint4*)(x+col+group*16+v*8);
-                const unsigned ar[4]={a.x,a.y,a.z,a.w};
-                unsigned w=words[group*2+v];
-                #pragma unroll
-                for (unsigned j=0;j<4;j++) {
-                    float2 values=__bfloat1622float2(*((const __nv_bfloat162*)&ar[j]));
-                    sum+=(lut[(w>>(j*8))&15]*scale)*values.x;
-                    sum+=(lut[(w>>(j*8+4))&15]*scale)*values.y;
-                }
+            for (unsigned j=0;j<4;j++) {
+                float2 values=__bfloat1622float2(*((const __nv_bfloat162*)&ar[j]));
+                sum+=(lut[(w>>(j*8))&15]*scale)*values.x;
+                sum+=(lut[(w>>(j*8+4))&15]*scale)*values.y;
             }
         }
     }

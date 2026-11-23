@@ -125,38 +125,32 @@ __device__ __forceinline__ void hy4_qdots(const __nv_bfloat16* x,Hy4Q4 q,unsigne
         sums[0]=hy4_qdot(x+(size_t)row*k,q,o,k,lut);
         return;
     }
-    if(q.w)for(unsigned col=lane*32;col<k;col+=1024) {
-        unsigned count_k=min(32u,k-col);
+    if(q.w)for(unsigned col=lane*16;col<k;col+=512) {
+        unsigned count_k=min(16u,k-col);
+        unsigned words[2]={};
         const unsigned char* p=q.w+(size_t)o*(k/2)+col/2;
-        uint4 packed;
-        if(count_k==32 && ((uintptr_t)p%16)==0)packed=*(const uint4*)p;
-        else {
-            unsigned words[4]={};
+        if(count_k==16 && ((uintptr_t)p%8)==0) {
+            uint2 packed=*(const uint2*)p;
+            words[0]=packed.x;words[1]=packed.y;
+        } else {
             for(unsigned b=0;b<count_k/2;b++)words[b/4]|=(unsigned)p[b]<<(8*(b%4));
-            packed=make_uint4(words[0],words[1],words[2],words[3]);
         }
-        unsigned words[4]={packed.x,packed.y,packed.z,packed.w};
+        __nv_fp8_e4m3 sf;sf.__x=q.s[(size_t)o*(k/16)+col/16];
+        float scale=(float)sf*q.scale;
+        float values[16];
         #pragma unroll
-        for(unsigned g=0;g<2;g++)if(g<count_k/16) {
-            __nv_fp8_e4m3 sf;sf.__x=q.s[(size_t)o*(k/16)+col/16+g];
-            float scale=(float)sf*q.scale;
-            float values[16];
+        for(unsigned j=0;j<16;j++)
+            values[j]=lut[(words[j/8]>>(4*(j%8)))&15]*scale;
+        #pragma unroll
+        for(unsigned r=0;r<8;r++)if(r<count) {
+            unsigned entry=entries[r],row=activated?entry:entry/slots;
+            const __nv_bfloat16* input=x+(size_t)row*k+col;
+            uint4 lo=*(const uint4*)input,hi=*(const uint4*)(input+8);
+            unsigned data[8]={lo.x,lo.y,lo.z,lo.w,hi.x,hi.y,hi.z,hi.w};
             #pragma unroll
             for(unsigned j=0;j<16;j++) {
-                unsigned at=g*16+j;
-                values[j]=lut[(words[at/8]>>(4*(at%8)))&15]*scale;
-            }
-            #pragma unroll
-            for(unsigned r=0;r<8;r++)if(r<count) {
-                unsigned entry=entries[r],row=activated?entry:entry/slots;
-                const __nv_bfloat16* input=x+(size_t)row*k+col+g*16;
-                uint4 lo=*(const uint4*)input,hi=*(const uint4*)(input+8);
-                unsigned data[8]={lo.x,lo.y,lo.z,lo.w,hi.x,hi.y,hi.z,hi.w};
-                #pragma unroll
-                for(unsigned j=0;j<16;j++) {
-                    unsigned short bits=(data[j/2]>>(16*(j%2)))&65535;
-                    sums[r]+=values[j]*(float)*(const __nv_bfloat16*)&bits;
-                }
+                unsigned short bits=(data[j/2]>>(16*(j%2)))&65535;
+                sums[r]+=values[j]*(float)*(const __nv_bfloat16*)&bits;
             }
         }
     }
