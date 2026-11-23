@@ -65,10 +65,8 @@ fn build_malformed_f32_gguf(name: &str, dims: &[u64], offset: u64) -> Vec<u8> {
 
 fn malformed_gguf_error(tag: &str, name: &str, dims: &[u64], offset: u64) -> anyhow::Error {
     let bytes = build_malformed_f32_gguf(name, dims, offset);
-    let dir = std::env::temp_dir().join(format!(
-        "atlas_gguf_malformed_{tag}_{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("atlas_gguf_malformed_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("model.gguf"), &bytes).unwrap();
 
@@ -191,12 +189,7 @@ fn malformed_gguf_rejects_dim_product_overflow_in_load_pass() {
 
 #[test]
 fn malformed_gguf_rejects_tensor_byte_size_overflow() {
-    let err = malformed_gguf_error(
-        "byte-size",
-        "mystery.weight",
-        &[u64::MAX / 4 + 1],
-        0,
-    );
+    let err = malformed_gguf_error("byte-size", "mystery.weight", &[u64::MAX / 4 + 1], 0);
     let msg = format!("{err:#}");
     assert!(msg.contains("byte") && msg.contains("overflow"), "{msg}");
 }
