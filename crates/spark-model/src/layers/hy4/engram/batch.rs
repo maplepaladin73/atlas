@@ -47,7 +47,7 @@ impl<'a> Hy4Engram<'a> {
             .ok_or_else(|| anyhow::anyhow!("Hy4 Engram batch start"))?;
         ensure!(
             rows > 0
-                && rows <= batch::MAX_ROWS
+                && rows <= batch::PREFILL_ROWS
                 && !hidden.is_null()
                 && self.mem.is_live()
                 && scratch.mem.is_live()
@@ -64,7 +64,25 @@ impl<'a> Hy4Engram<'a> {
             Some(b) => b,
             None => BatchScratch::new(self)?,
         };
-        let result = self.batch_rows(hidden, history, start, &b, comm, stream);
+        // The batch scratch is MAX_ROWS-wide; a wider prefill chunk is
+        // processed as consecutive MAX_ROWS slices (same kernel stream and
+        // collective cadence as MAX_ROWS-sized chunks).
+        let result = (|| {
+            let mut cur = start;
+            while cur < history.len() {
+                let end = (cur + batch::MAX_ROWS).min(history.len());
+                self.batch_rows(
+                    hidden.offset((cur - start) * 4 * self.h * 2),
+                    &history[..end],
+                    cur,
+                    &b,
+                    comm,
+                    stream,
+                )?;
+                cur = end;
+            }
+            Ok(())
+        })();
         scratch.batch = Some(b);
         result
     }

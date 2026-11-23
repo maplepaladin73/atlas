@@ -6,7 +6,16 @@ use spark_runtime::{
     kernel_args::KernelLaunch,
 };
 
+/// Batch scratch width: attention and Engram per-layer scratch, plus the
+/// attention tile width inside a prefill chunk. Sized for the VERIFY decode
+/// footprint; prefill chunks are wider via [`PREFILL_ROWS`].
 pub const MAX_ROWS: usize = 256;
+/// Prefill chunk width (workspace capacity and the expert-FFN batch gate).
+/// The expert FFN streams its weights once per chunk, so 512-row chunks
+/// halve the per-token weight traffic vs [`MAX_ROWS`]-row chunks. Attention
+/// and Engram still process each chunk in MAX_ROWS slices, keeping their
+/// scratch at the decode-sized footprint.
+pub const PREFILL_ROWS: usize = 512;
 
 pub(crate) fn gemm(
     gpu: &dyn GpuBackend,

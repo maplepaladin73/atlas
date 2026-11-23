@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
-use crate::layers::hy4::batch::{self, MAX_ROWS};
+use crate::layers::hy4::batch::{self, MAX_ROWS, PREFILL_ROWS};
 use crate::layers::hy4::timing;
 use spark_runtime::kernel_args::KernelLaunch;
 use std::sync::atomic::Ordering;
@@ -22,7 +22,7 @@ pub(super) struct Workspace<'a> {
 }
 impl<'a> Workspace<'a> {
     pub fn new(s: &'a Shared) -> Result<Self> {
-        let capacity = MAX_ROWS.min(s.max_seq);
+        let capacity = PREFILL_ROWS.min(s.max_seq);
         let h = s.config.hidden_size;
         let mut m = Owned::new(s.gpu.as_ref());
         Ok(Self {
@@ -32,7 +32,9 @@ impl<'a> Workspace<'a> {
             normed: m.alloc(capacity * h * 2)?,
             output: m.alloc(capacity * h * 2)?,
             post: m.alloc(capacity * 4 * 4)?,
-            logits: m.alloc(capacity * s.config.vocab_size * 4)?,
+            // Logits are written only by LAST (1 row) and VERIFY (draft rows)
+            // calls, so they keep the decode-sized MAX_ROWS width.
+            logits: m.alloc(MAX_ROWS.min(capacity) * s.config.vocab_size * 4)?,
             _memory: m,
         })
     }
@@ -49,7 +51,8 @@ impl Runtime<'_> {
         ensure!(
             !tokens.is_empty()
                 && tokens.len() <= self.multi.capacity
-                && matches!(mode, BATCH | LAST | VERIFY),
+                && matches!(mode, BATCH | LAST | VERIFY)
+                && (mode != VERIFY || tokens.len() <= MAX_ROWS),
             "Hy4 invalid batch geometry/logit mode"
         );
         let mut requests = self.requests.lock();
