@@ -19,7 +19,7 @@ use super::inference_types::{InferenceRequest, RepetitionDetectionParams};
 use super::strip::strip_thinking_tags;
 
 pub(super) fn validate_logit_bias(
-    bias: Option<&std::collections::HashMap<String, f32>>,
+    bias: Option<&std::collections::HashMap<String, f64>>,
 ) -> Result<(), Box<Response>> {
     if let Some(map) = bias {
         for (key, value) in map {
