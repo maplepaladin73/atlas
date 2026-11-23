@@ -8,8 +8,7 @@ use spark_comm::CommBackend;
 use spark_runtime::{gpu::DevicePtr, kernel_args::KernelLaunch};
 
 const CAUSAL_ROWS: usize = 8;
-// Indexed (DSA) layers have a non-circular paged cache: wider causal tiles.
-const INDEXED_TILE_ROWS: usize = 64;
+const INDEXED_TILE_ROWS: usize = 64; // DSA layers: non-circular paged cache
 const INDEX_KEYS: usize = 2048;
 
 fn causal_rows(window: Option<usize>, slots: usize) -> usize {
@@ -254,7 +253,12 @@ impl AttentionCache<'_, '_> {
             linear(b.qc, ix.query, b.query, ix.heads * 128, a.qrank)?;
             linear(input, ix.head, b.hw, ix.heads, a.hidden)?;
         }
-        let causal_rows = causal_rows(a.window, self.layout.table.len() * self.layout.page_size);
+        // Speculative VERIFY keeps the proven tile width while prefix capture is active.
+        let causal_rows = if self.prefix_capturing() {
+            CAUSAL_ROWS
+        } else {
+            causal_rows(a.window, self.layout.table.len() * self.layout.page_size)
+        };
         for first in (0..rows).step_by(causal_rows) {
             let end = (first + causal_rows).min(rows);
             let start_position = self.len;
@@ -379,15 +383,10 @@ impl AttentionCache<'_, '_> {
             );
             let splits = count.div_ceil(128);
             let mla = timing::span("latent_attention", stream)?;
-            // ATLAS_HY4_MLA_MMA=1: one CTA per (row, 128-key partition, 16-head
-            // tile) gathers K into shared once per tile and runs both attention
-            // GEMMs on tensor cores. Requires heads <= 32 and ~99KB opt-in
-            // dynamic shared (sm_120+).
-            // EXPERT_MMA+MLA_MMA is decode-unsafe on VERIFY rows: accepted
-            // drafts collapse (144 vs 180 on the Step 1 harness). Keep MLA on
-            // the tensor-core path only for prefill-scale row counts when the
-            // expert MMA path is also enabled; VERIFY stays on the proven MLA
-            // kernel while expert MMA still serves the FFN phases.
+            // ATLAS_HY4_MLA_MMA=1: tensor-core MLA, heads <= 32, ~99KB opt-in
+            // smem. EXPERT_MMA+MLA_MMA is decode-unsafe on VERIFY rows (drafts
+            // collapsed in Step 1), so keep MLA MMA off sub-32-row VERIFY
+            // batches while expert MMA serves the FFN phases.
             let expert_mma = std::env::var("ATLAS_HY4_EXPERT_MMA").ok().as_deref() == Some("1");
             let mla_mma = a.heads <= 32
                 && std::env::var("ATLAS_HY4_MLA_MMA").as_deref() == Ok("1")
