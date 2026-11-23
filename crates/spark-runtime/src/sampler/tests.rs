@@ -395,21 +395,18 @@ fn tiny_positive_temperature_with_absent_tokens() {
 
     params.top_k = 1;
     assert_eq!(
-        sample_with_absent(&present, 3, &params, Some(0), absent),
+        sample_with_absent(&present, &params, Some(0), absent),
         Some(1)
     );
     params.top_k = 0;
     params.min_p = 0.1;
     assert_eq!(
-        sample_with_absent(&present, 3, &params, Some(0), absent),
+        sample_with_absent(&present, &params, Some(0), absent),
         Some(1)
     );
     params.min_p = 0.0;
     params.top_p = 0.9;
-    assert_eq!(
-        sample_with_absent(&present, 3, &params, Some(0), absent),
-        None
-    );
+    assert_eq!(sample_with_absent(&present, &params, Some(0), absent), None);
 }
 
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
