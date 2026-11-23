@@ -446,7 +446,7 @@ fn a_split_rows_candidates_pick_what_the_full_row_picks() {
             let (view, absent) = split_view(&row, ranks, c, t);
             let seed = Some(77 + trial);
             let full = sample_with_params_seeded(&f32_bytes(&row), &params, &[], seed);
-            if let Some(pick) = sample_with_absent(&present(&view), n, &params, seed, absent) {
+            if let Some(pick) = sample_with_absent(&present(&view), &params, seed, absent) {
                 assert_eq!(pick, full, "config {cfg} trial {trial}");
                 some += 1;
             }
@@ -472,7 +472,7 @@ fn a_row_without_absent_tokens_samples_as_before() {
     };
     for s in 0..100 {
         assert_eq!(
-            sample_with_absent(&present(&row), row.len(), &params, Some(s), none),
+            sample_with_absent(&present(&row), &params, Some(s), none),
             Some(sample_with_params_seeded(
                 &f32_bytes(&row),
                 &params,

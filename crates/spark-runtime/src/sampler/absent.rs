@@ -36,7 +36,6 @@ impl Absent {
 /// neutral (the caller's pipeline applied them).
 pub fn sample_with_absent(
     present: &[(u32, f32)],
-    _vocab: usize,
     params: &SamplingParams,
     seed: Option<u64>,
     absent: Absent,
@@ -85,15 +84,12 @@ mod tests {
         let seed = Some(0);
 
         params.top_k = 2;
-        assert_eq!(
-            sample_with_absent(&present, row.len(), &params, seed, absent),
-            None
-        );
+        assert_eq!(sample_with_absent(&present, &params, seed, absent), None);
 
         params.top_k = 1;
         let full = sample_with_params_seeded(&bytes, &params, &[], seed);
         assert_eq!(
-            sample_with_absent(&present, row.len(), &params, seed, absent),
+            sample_with_absent(&present, &params, seed, absent),
             Some(full)
         );
     }
