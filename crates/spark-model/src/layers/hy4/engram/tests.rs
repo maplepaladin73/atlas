@@ -4,7 +4,10 @@ use super::*;
 use spark_runtime::{gpu::mock::MockGpuBackend, weights::WeightTensor};
 use std::{
     collections::HashMap,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 fn fixture(gpu: &MockGpuBackend, rank: usize, world: usize) -> (ModelConfig, WeightStore) {
     let mut c = atlas_core::config::parse_config(include_str!(
@@ -80,6 +83,7 @@ struct Comm {
     rank: usize,
     calls: AtomicUsize,
     bytes: usize,
+    sizes: Mutex<Vec<usize>>,
 }
 impl spark_comm::CommBackend for Comm {
     fn rank(&self) -> usize {
@@ -92,7 +96,8 @@ impl spark_comm::CommBackend for Comm {
         anyhow::bail!("must use stream-ordered reduction")
     }
     fn all_reduce_async(&self, _p: u64, b: usize, _s: u64) -> Result<()> {
-        assert_eq!(b, self.bytes);
+        assert!(b == self.bytes || b == 4 * self.bytes);
+        self.sizes.lock().unwrap().push(b);
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -131,6 +136,7 @@ fn tp2_dispatch_owns_whole_heads_and_reduces_each_key_and_value_once() {
             rank: 1,
             calls: AtomicUsize::new(0),
             bytes: 3072 * 2,
+            sizes: Mutex::new(Vec::new()),
         };
         assert!(
             block
@@ -140,7 +146,9 @@ fn tp2_dispatch_owns_whole_heads_and_reduces_each_key_and_value_once() {
         block
             .forward(hidden, &[10, 11], 12, &mut scratch, Some(&comm), 0)
             .unwrap();
-        assert_eq!(comm.calls.load(Ordering::Relaxed), 5);
+        assert_eq!(comm.calls.load(Ordering::Relaxed), 2);
+        let unit = comm.bytes;
+        assert_eq!(comm.sizes.lock().unwrap().as_slice(), [4 * unit, unit]);
         assert_eq!(
             gpu.launches_snapshot()
                 .iter()
@@ -174,6 +182,7 @@ fn batched_keys_respect_n_by_h_collective_capacity_and_reject_empty_batches() {
         rank: 0,
         calls: AtomicUsize::new(0),
         bytes: history.len() * c.hidden_size * 2,
+        sizes: Mutex::new(Vec::new()),
     };
     assert!(
         block
@@ -189,7 +198,9 @@ fn batched_keys_respect_n_by_h_collective_capacity_and_reject_empty_batches() {
     block
         .forward_batch(hidden, &history, 0, &mut scratch, Some(&comm), 0)
         .unwrap();
-    assert_eq!(comm.calls.load(Ordering::Relaxed), 5);
+    assert_eq!(comm.calls.load(Ordering::Relaxed), 2);
+    let unit = comm.bytes;
+    assert_eq!(comm.sizes.lock().unwrap().as_slice(), [4 * unit, unit]);
     let launches = gpu.launch_count();
     assert!(
         block

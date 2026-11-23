@@ -87,10 +87,12 @@ impl Hy4Engram<'_> {
                 .arg_u32((self.heads.len() * self.dim) as u32)
                 .arg_u32(u32::from(self.topology[0] == 0))
                 .launch(stream)?;
-            if let Some(c) = comm {
-                let _reduce = timing::span("all_reduce", stream)?;
-                c.all_reduce_async(out.0, self.h * 2, stream)?;
-            }
+        }
+        if let Some(c) = comm {
+            let _reduce = timing::span("all_reduce", stream)?;
+            // The four key chunks are contiguous; reduce them as one buffer.
+            c.all_reduce_async(scratch.keys.0, 4 * self.h * 2, stream)?;
+            c.all_reduce_async(scratch.value.0, self.h * 2, stream)?;
         }
         for (input, weight, out) in [
             (scratch.keys, self.key_norm, scratch.norm_keys),
