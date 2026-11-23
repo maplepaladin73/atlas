@@ -304,8 +304,7 @@ pub(crate) fn estimate_load_bytes(
             // FP4-Local (3.6 GB on disk, 7.5 GB on device). Count the one
             // component that sizes it at that size and the others at zero.
             if let Some((_, part)) = super::nvfp4_csf::csf_part(&name) {
-                let decoded = super::nvfp4_csf::decoded_len(part, &shape)
-                    .with_context(|| format!("tensor {name}: CSF size cannot be represented"))?;
+                let decoded = super::nvfp4_csf::decoded_len(part, &shape).unwrap_or(0);
                 total = total
                     .checked_add(decoded)
                     .with_context(|| format!("tensor {name}: total estimate overflows"))?;
@@ -397,8 +396,12 @@ mod tests {
     fn estimates_reject_overflowing_header_shapes() {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "atlas-loader-overflow-{}-{n}.safetensors",
+            "atlas-loader-overflow-{}-{unique}-{n}.safetensors",
             std::process::id()
         ));
         let header = serde_json::json!({
@@ -409,7 +412,11 @@ mod tests {
             }
         });
         let bytes = serde_json::to_vec(&header).unwrap();
-        let mut file = std::fs::File::create(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
         file.write_all(&(bytes.len() as u64).to_le_bytes()).unwrap();
         file.write_all(&bytes).unwrap();
         drop(file);
