@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use super::{AttentionCache, Hy4Attention, memory::Owned};
+use super::{AttentionCache, Hy4Attention, kernels::INDEX_KEYS, memory::Owned};
 use crate::layers::hy4::batch::{self, MAX_ROWS};
 use crate::layers::hy4::timing;
 use anyhow::{Result, ensure};
@@ -9,7 +9,6 @@ use spark_runtime::{gpu::DevicePtr, kernel_args::KernelLaunch};
 
 const CAUSAL_ROWS: usize = 8;
 const INDEXED_TILE_ROWS: usize = 64; // DSA layers: non-circular paged cache
-const INDEX_KEYS: usize = 2048;
 
 fn causal_rows(window: Option<usize>, slots: usize) -> usize {
     window.map_or(INDEXED_TILE_ROWS, |w| (slots - (w - 1)).min(CAUSAL_ROWS))
@@ -271,23 +270,13 @@ impl AttentionCache<'_, '_> {
             let batched = end - first;
             let base = positions.get(first).copied().unwrap_or([0; 3]);
             {
-                let _rope = timing::span("attn_norm", stream)?;
-                KernelLaunch::new(
-                    gpu,
-                    gpu.op_cache().kernel(gpu, "hy4_mla", "hy4_batch_kv_norm")?,
-                )
-                .grid([batched as u32, 1, 1])
-                .block([256, 1, 1])
-                .arg_ptr(b.kv.offset(first * 576 * 2))
-                .arg_ptr(a.kvn)
-                .arg_ptr(self.latent)
-                .arg_ptr(self.table)
-                .arg_u32(start_position as u32)
-                .arg_u32(page_size)
-                .arg_u32(columns)
-                .arg_u32(circular)
-                .arg_f32(a.eps)
-                .launch(stream)?;
+                let _norm = timing::span("attn_norm", stream)?;
+                self.launch_tile_kv_norm(
+                    b.kv.offset(first * 576 * 2),
+                    batched,
+                    start_position,
+                    stream,
+                )?;
             }
             {
                 let _rope = timing::span("attn_rope", stream)?;
@@ -320,35 +309,13 @@ impl AttentionCache<'_, '_> {
                 .arg_u32(u32::from(a.rope.mrope_interleaved))
                 .arg_u32(0)
                 .launch(stream)?;
-                KernelLaunch::new(
-                    gpu,
-                    gpu.op_cache().kernel(gpu, "hy4_mla", "hy4_batch_rotary")?,
-                )
-                .grid([1, batched as u32, 1])
-                .block([32, 1, 1])
-                .arg_ptr(b.kv.offset(first * 576 * 2))
-                .arg_ptr(self.latent)
-                .arg_u32(576)
-                .arg_u32(576)
-                .arg_u32(512)
-                .arg_u32(512)
-                .arg_u32(576)
-                .arg_u32(576)
-                .arg_ptr(self.table)
-                .arg_u32(start_position as u32)
-                .arg_u32(page_size)
-                .arg_u32(columns)
-                .arg_u32(circular)
-                .arg_u32(1)
-                .arg_u64(base[0] as u64)
-                .arg_u64(base[1] as u64)
-                .arg_u64(base[2] as u64)
-                .arg_f32(a.rope.rope_theta as f32)
-                .arg_u32(a.rope.mrope_section[1] as u32)
-                .arg_u32(a.rope.mrope_section[2] as u32)
-                .arg_u32(u32::from(a.rope.mrope_interleaved))
-                .arg_u32(0)
-                .launch(stream)?;
+                self.launch_tile_kv_rotary(
+                    b.kv.offset(first * 576 * 2),
+                    batched,
+                    start_position,
+                    base,
+                    stream,
+                )?;
             }
             if a.index.is_some() {
                 self.run_index_tile(
@@ -393,45 +360,17 @@ impl AttentionCache<'_, '_> {
             let mla_mma = a.heads <= 32
                 && std::env::var("ATLAS_HY4_MLA_MMA").as_deref() == Ok("1")
                 && !(expert_mma && rows < 32);
-            let (mla_kernel, mla_grid, mla_smem) = if mla_mma {
-                (
-                    "hy4_mla_batch_partial_mma",
-                    [
-                        splits as u32,
-                        (end - first) as u32,
-                        a.heads.div_ceil(16) as u32,
-                    ],
-                    100544,
-                )
-            } else {
-                (
-                    "hy4_mla_batch_partial",
-                    [a.heads as u32, splits as u32, (end - first) as u32],
-                    0,
-                )
-            };
-            KernelLaunch::new(gpu, gpu.op_cache().kernel(gpu, "hy4_mla", mla_kernel)?)
-                .grid(mla_grid)
-                .block([256, 1, 1])
-                .shared_mem(mla_smem)
-                .arg_ptr(b.absorbed.offset(first * a.heads * 576 * 2))
-                .arg_ptr(self.latent)
-                .arg_ptr(self.table)
-                .arg_ptr(if a.window.is_some() {
-                    DevicePtr::NULL
-                } else {
-                    b.indices
-                })
-                .arg_ptr(b.softmax_parts)
-                .arg_u32(start_position as u32)
-                .arg_u32(self.layout.page_size as u32)
-                .arg_u32(self.layout.table.len() as u32)
-                .arg_u32(a.window.unwrap_or(0) as u32)
-                .arg_u32(count as u32)
-                .arg_u32(splits as u32)
-                .arg_u32(a.heads as u32)
-                .arg_u32(INDEX_KEYS as u32)
-                .launch(stream)?;
+            self.launch_tile_mla(
+                b.absorbed.offset(first * a.heads * 576 * 2),
+                b.indices,
+                b.softmax_parts,
+                end - first,
+                start_position,
+                count,
+                splits,
+                mla_mma,
+                stream,
+            )?;
             KernelLaunch::new(
                 gpu,
                 gpu.op_cache()
