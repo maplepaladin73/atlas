@@ -4,6 +4,7 @@ use super::*;
 use crate::traits::Model;
 use spark_runtime::{
     gpu::mock::MockGpuBackend,
+    kv_cache::KvCacheDtype,
     weights::{WeightDtype as D, WeightTensor},
 };
 
@@ -152,7 +153,7 @@ pub(super) fn store(gpu: &MockGpuBackend) -> WeightStore {
 fn model() -> Hy4Model {
     let gpu = Box::new(MockGpuBackend::new());
     let weights = store(&gpu);
-    Hy4Model::new(config(), weights, gpu, None, 8, 4, 2).unwrap()
+    Hy4Model::new(config(), weights, gpu, None, 8, 4, 2, KvCacheDtype::Bf16).unwrap()
 }
 #[test]
 fn eager_dispatch_preserves_chunk_decode_and_slot_isolation() {
@@ -250,7 +251,8 @@ fn bad_topology_and_missing_checkpoint_weights_fail_before_forward() {
             None,
             8,
             4,
-            1
+            1,
+            KvCacheDtype::Bf16
         )
         .is_err()
     );
@@ -262,7 +264,8 @@ fn bad_topology_and_missing_checkpoint_weights_fail_before_forward() {
             None,
             8,
             4,
-            1
+            1,
+            KvCacheDtype::Bf16
         )
         .is_err()
     );
@@ -274,7 +277,8 @@ fn bad_topology_and_missing_checkpoint_weights_fail_before_forward() {
             None,
             0,
             4,
-            1
+            1,
+            KvCacheDtype::Bf16
         )
         .is_err()
     );
@@ -327,7 +331,17 @@ fn scheduler_stop_reaches_worker_but_legacy_prefill_headers_do_not() {
     c.tp_world_size = 2;
     c.ep_world_size = 2;
     let comm = Arc::new(StopComm(Mutex::new(Vec::new()), 0));
-    let model = Hy4Model::new(c, weights, Box::new(gpu), Some(comm.clone()), 32, 2, 2).unwrap();
+    let model = Hy4Model::new(
+        c,
+        weights,
+        Box::new(gpu),
+        Some(comm.clone()),
+        32,
+        2,
+        2,
+        KvCacheDtype::Bf16,
+    )
+    .unwrap();
     model.ep_broadcast_cmd_for_seq(0, 0xFFFFFFF0).unwrap();
     model.ep_broadcast_cmd(4).unwrap();
     assert!(comm.0.lock().is_empty());
@@ -347,7 +361,17 @@ fn worker_bootstrap_slots_do_not_send_commands_and_accept_head_allocation() {
     c.tp_rank = 1;
     c.ep_rank = 1;
     let comm = Arc::new(StopComm(Mutex::new(Vec::new()), 1));
-    let model = Hy4Model::new(c, weights, Box::new(gpu), Some(comm.clone()), 32, 2, 2).unwrap();
+    let model = Hy4Model::new(
+        c,
+        weights,
+        Box::new(gpu),
+        Some(comm.clone()),
+        32,
+        2,
+        2,
+        KvCacheDtype::Bf16,
+    )
+    .unwrap();
     let mut a = model.alloc_sequence().unwrap();
     let mut b = model.alloc_sequence().unwrap();
     assert!(model.alloc_sequence().is_err());

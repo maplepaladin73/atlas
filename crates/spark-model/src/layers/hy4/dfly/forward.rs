@@ -60,6 +60,7 @@ impl Dfly<'_> {
                     b.sink,
                     s.latent,
                 ],
+                cache.latent_scales,
                 rows,
                 cache.len,
                 stream,
