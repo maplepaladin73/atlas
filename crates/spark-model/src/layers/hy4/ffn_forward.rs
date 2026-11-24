@@ -126,10 +126,20 @@ impl Hy4Ffn<'_> {
                 stream,
             )?;
             drop(routed_span);
-            if let Some(comm) = comm {
+            // Defer the all-reduce's completion wait: the exchange runs on the
+            // comm backend's own stream, so the shared-expert MLP below
+            // overlaps the RDMA transfer instead of stalling behind it.
+            let reduce_deferred = if let Some(comm) = comm {
                 let _reduce = timing::span("all_reduce", stream)?;
-                comm.all_reduce_async(routed.0, rows as usize * self.h * 2, stream)?;
-            }
+                if comm.all_reduce_async_deferred(routed.0, rows as usize * self.h * 2, stream)? {
+                    true
+                } else {
+                    comm.all_reduce_async(routed.0, rows as usize * self.h * 2, stream)?;
+                    false
+                }
+            } else {
+                false
+            };
             let _shared = timing::span("ffn_shared_dense", stream)?;
             self.mlp(
                 x,
@@ -143,11 +153,28 @@ impl Hy4Ffn<'_> {
                 [scratch.groups, scratch.partials],
                 stream,
             )?;
+            if reduce_deferred {
+                // Join the compute stream just before ihc_norms reads `routed`.
+                if let Some(comm) = comm {
+                    comm.all_reduce_async_wait(stream)?;
+                }
+            }
         }
         let _norm = timing::span("ihc_norms", stream)?;
-        KernelLaunch::new(self.gpu, self.kernels[4])
-            .grid([rows, 1, 1])
-            .block([256, 1, 1])
+        // Rows divisible by 4 (prefill chunks) run four rows per 1024-thread
+        // block via hy4_norm_add4: each 256-thread group executes exactly
+        // hy4_norm_add's per-row math, so the output is bit-identical.
+        let batched = rows.is_multiple_of(4);
+        let kernel = if batched {
+            self.kernels[5]
+        } else {
+            self.kernels[4]
+        };
+        let grid_rows = if batched { rows / 4 } else { rows };
+        let block_threads = if batched { 1024 } else { 256 };
+        KernelLaunch::new(self.gpu, kernel)
+            .grid([grid_rows, 1, 1])
+            .block([block_threads, 1, 1])
             .arg_ptr(if self.dense { DevicePtr::NULL } else { routed })
             .arg_ptr(shared)
             .arg_ptr(self.norm)

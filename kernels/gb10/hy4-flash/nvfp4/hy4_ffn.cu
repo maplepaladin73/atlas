@@ -162,6 +162,49 @@ extern "C" __global__ void hy4_norm_add(const __nv_bfloat16* routed,
     }
 }
 
+// Four rows per 1024-thread block (grid [rows/4], rows%4==0): each 256-thread
+// group runs exactly hy4_norm_add's per-row loop and reduction tree, so every
+// row's fp32 reduction order — and hence the output — is bit-identical; only
+// the launch shape changes. Pass-1 values stay in registers instead of
+// re-reading shared/routed in pass 2 (no intervening writes, same values).
+// H<=4096 keeps every value cached; larger H recomputes in pass 2.
+extern "C" __global__ void hy4_norm_add4(const __nv_bfloat16* routed,
+    const __nv_bfloat16* shared, const __nv_bfloat16* norm, __nv_bfloat16* out,
+    unsigned H, float eps) {
+    const unsigned g=threadIdx.x/256, tid=threadIdx.x%256;
+    const unsigned t=blockIdx.x*4+g;
+    __shared__ float red[4][256], r[4];
+    float v[16];
+    float ss=0.f;
+    unsigned k=0;
+    for (unsigned d=tid;d<H;d+=256) {
+        float x=(float)shared[(size_t)t*H+d];
+        if (routed) x=hy4_round(x+(float)routed[(size_t)t*H+d]);
+        if (k<16) v[k]=x;
+        ss+=x*x;
+        k++;
+    }
+    red[g][tid]=ss; __syncthreads();
+    for (unsigned s=128;s;s>>=1) {
+        if (tid<s) red[g][tid]+=red[g][tid+s];
+        __syncthreads();
+    }
+    if (tid==0) r[g]=rsqrtf(red[g][0]/H+eps);
+    __syncthreads();
+    k=0;
+    for (unsigned d=tid;d<H;d+=256) {
+        float x;
+        if (k<16) {
+            x=v[k];
+        } else {
+            x=(float)shared[(size_t)t*H+d];
+            if (routed) x=hy4_round(x+(float)routed[(size_t)t*H+d]);
+        }
+        out[(size_t)t*H+d]=__float2bfloat16_rn(norm?x*r[g]*(float)norm[d]:x);
+        k++;
+    }
+}
+
 #include "hy4_batch.cuh"
 
 

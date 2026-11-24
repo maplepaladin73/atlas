@@ -32,7 +32,7 @@ pub struct Hy4Ffn<'a> {
     pub(super) down: DevicePtr,
     pub(super) up: DevicePtr,
     pub(super) norm: DevicePtr,
-    pub(super) kernels: [KernelHandle; 5],
+    pub(super) kernels: [KernelHandle; 6],
 }
 
 impl<'a> Hy4Ffn<'a> {
@@ -158,6 +158,7 @@ impl<'a> Hy4Ffn<'a> {
             gpu.kernel("hy4_ffn", "hy4_qgate_up")?,
             gpu.kernel("hy4_ffn", "hy4_qdown")?,
             gpu.kernel("hy4_ffn", "hy4_norm_add")?,
+            gpu.kernel("hy4_ffn", "hy4_norm_add4")?,
         ];
         let bytes = descriptors(&experts);
         let table = gpu.alloc(bytes.len())?;
