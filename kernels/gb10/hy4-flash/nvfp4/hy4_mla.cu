@@ -45,9 +45,27 @@ extern "C" __global__ void hy4_gate(__nv_bfloat16* out,
     }
 }
 
+// FP8 (E4M3) rowwise latent read: one FP32 scale per slot for dims 0..512 and
+// one for dims 512..576. The BF16 path keeps the original vectorized loads.
+template<bool FP8>
+__device__ __forceinline__ float hy4_mla_kv(const unsigned char* cache,
+    const float* scales, size_t row, unsigned kv_stride, unsigned d) {
+    const unsigned char* base=cache+row*kv_stride;
+    if constexpr (FP8) {
+        __nv_fp8_e4m3 v; v.__x=base[d];
+        return (float)v*(d<512?scales[2*row]:scales[2*row+1]);
+    } else {
+        return (float)((const __nv_bfloat16*)base)[d];
+    }
+}
+
 // Each head/128-key partition produces an unnormalized FP32 softmax partial.
+// `cache` is the latent base in bytes; `kv_stride` is the per-slot byte stride
+// (1152 bf16 / 576 fp8).
+template<bool FP8>
 __device__ __forceinline__ void hy4_mla_partial_impl(const __nv_bfloat16* q,
-    const __nv_bfloat16* cache, const unsigned* table, const int* indices,
+    const unsigned char* cache, const float* scales, unsigned kv_stride,
+    const unsigned* table, const int* indices,
     float* partials, unsigned position, unsigned page_size,
     unsigned columns, unsigned window, unsigned count, unsigned splits) {
     unsigned h=blockIdx.x,part=blockIdx.y,tid=threadIdx.x,lane=tid%32,warp=tid/32;
@@ -65,15 +83,22 @@ __device__ __forceinline__ void hy4_mla_partial_impl(const __nv_bfloat16* q,
             unsigned page=(unsigned)logical/page_size;
             row=(size_t)table[window?page%columns:page]*page_size+(unsigned)logical%page_size;
         }
-        const __nv_bfloat16* kv=cache+row*576;
         float dot=0.f;
-        if (valid) for (unsigned d=lane*8;d<576;d+=256) {
-            uint4 v=*(const uint4*)(kv+d);
-            const unsigned words[4]={v.x,v.y,v.z,v.w};
-            #pragma unroll
-            for (unsigned k=0;k<4;k++) {
-                float2 b=__bfloat1622float2(*((const __nv_bfloat162*)&words[k]));
-                dot+=query[d+k*2]*b.x;dot+=query[d+k*2+1]*b.y;
+        if (valid) {
+            if constexpr (FP8) {
+                for (unsigned d=lane;d<576;d+=32)
+                    dot+=query[d]*hy4_mla_kv<true>(cache,scales,row,576,d);
+            } else {
+                const __nv_bfloat16* kv=(const __nv_bfloat16*)(cache+row*kv_stride);
+                for (unsigned d=lane*8;d<576;d+=256) {
+                    uint4 v=*(const uint4*)(kv+d);
+                    const unsigned words[4]={v.x,v.y,v.z,v.w};
+                    #pragma unroll
+                    for (unsigned k=0;k<4;k++) {
+                        float2 b=__bfloat1622float2(*((const __nv_bfloat162*)&words[k]));
+                        dot+=query[d+k*2]*b.x;dot+=query[d+k*2+1]*b.y;
+                    }
+                }
             }
         }
         dot=hy4_warp_sum(dot);
@@ -98,8 +123,13 @@ __device__ __forceinline__ void hy4_mla_partial_impl(const __nv_bfloat16* q,
     __syncthreads();
     float a=0.f,b=0.f;
     for (unsigned j=0;j<128;j++) if (rows[j]>=0) {
-        const __nv_bfloat16* kv=cache+(size_t)rows[j]*576;
-        a+=scores[j]*(float)kv[tid];b+=scores[j]*(float)kv[tid+256];
+        if constexpr (FP8) {
+            a+=scores[j]*hy4_mla_kv<true>(cache,scales,(size_t)rows[j],576,tid);
+            b+=scores[j]*hy4_mla_kv<true>(cache,scales,(size_t)rows[j],576,tid+256);
+        } else {
+            const __nv_bfloat16* kv=(const __nv_bfloat16*)(cache+(size_t)rows[j]*kv_stride);
+            a+=scores[j]*(float)kv[tid];b+=scores[j]*(float)kv[tid+256];
+        }
     }
     float* out=partials+((size_t)h*splits+part)*514;
     out[tid]=a;out[tid+256]=b;
@@ -110,7 +140,19 @@ extern "C" __global__ void hy4_mla_partial(const __nv_bfloat16* q,
     const __nv_bfloat16* cache,const unsigned* table,const int* indices,
     float* partials,unsigned position,unsigned page_size,
     unsigned columns,unsigned window,unsigned count,unsigned splits) {
-    hy4_mla_partial_impl(q,cache,table,indices,partials,position,page_size,columns,window,count,splits);
+    hy4_mla_partial_impl<false>(q,(const unsigned char*)cache,nullptr,1152,
+        table,indices,partials,position,page_size,columns,window,count,splits);
+}
+
+// FP8 KV variant: same args plus the trailing rowwise-scale buffer; the latent
+// cache arg is E4M3 bytes with a 576-byte slot stride.
+extern "C" __global__ void hy4_mla_partial_fp8kv(const __nv_bfloat16* q,
+    const unsigned char* cache,const unsigned* table,const int* indices,
+    float* partials,unsigned position,unsigned page_size,
+    unsigned columns,unsigned window,unsigned count,unsigned splits,
+    const float* scales) {
+    hy4_mla_partial_impl<true>(q,cache,scales,576,
+        table,indices,partials,position,page_size,columns,window,count,splits);
 }
 
 extern "C" __global__ void hy4_mla_batch_partial(const __nv_bfloat16* q,
@@ -120,7 +162,20 @@ extern "C" __global__ void hy4_mla_batch_partial(const __nv_bfloat16* q,
     unsigned heads,unsigned index_stride) {
     unsigned row=blockIdx.z;position+=row;
     count=window?min(position+1,window):min(position/4,index_stride/4-1)*4+position%4+1;
-    hy4_mla_partial_impl(q+(size_t)row*heads*576,cache,table,
+    hy4_mla_partial_impl<false>(q+(size_t)row*heads*576,(const unsigned char*)cache,
+        nullptr,1152,table,
+        indices?indices+(size_t)row*index_stride:nullptr,
+        partials+(size_t)row*heads*splits*514,position,page_size,columns,window,count,splits);
+}
+
+extern "C" __global__ void hy4_mla_batch_partial_fp8kv(const __nv_bfloat16* q,
+    const unsigned char* cache,const unsigned* table,const int* indices,
+    float* partials,unsigned position,unsigned page_size,
+    unsigned columns,unsigned window,unsigned count,unsigned splits,
+    unsigned heads,unsigned index_stride,const float* scales) {
+    unsigned row=blockIdx.z;position+=row;
+    count=window?min(position+1,window):min(position/4,index_stride/4-1)*4+position%4+1;
+    hy4_mla_partial_impl<true>(q+(size_t)row*heads*576,cache,scales,576,table,
         indices?indices+(size_t)row*index_stride:nullptr,
         partials+(size_t)row*heads*splits*514,position,page_size,columns,window,count,splits);
 }
@@ -186,6 +241,133 @@ extern "C" __global__ void hy4_batch_kv_norm(const __nv_bfloat16* kv,
 // rows share one (in_stride,out_stride,in_offset,out_offset) layout via the
 // row_in/row_out element strides; paged=1 targets latent slot rows through
 // the page table instead of contiguous output rows.
+// ── FP8 (E4M3) rowwise latent KV cache writes ──────────────────────────
+// An fp8 latent slot is 576 E4M3 bytes plus two FP32 rowwise scales:
+// scales[2*slot] covers dims 0..512, scales[2*slot+1] covers dims 512..576.
+__device__ __forceinline__ unsigned char hy4_enc_e4m3(float v) {
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+    return rw_enc_fp8(v);
+#else
+    return (unsigned char)__nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+#endif
+}
+__device__ __forceinline__ float hy4_fp8_row_scale(float amax) {
+    float s=amax/448.f;
+    return s<1e-12f?1e-12f:s;
+}
+
+// RMSNorm over dims 0..512 (same math as hy4_batch_kv_norm), then rowwise
+// E4M3 quantization of the normed values into the fp8 latent slot.
+__device__ __forceinline__ void hy4_kv_norm_fp8_impl(const __nv_bfloat16* x,
+    const __nv_bfloat16* w, unsigned char* out, float* scale_out, float eps) {
+    unsigned tid=threadIdx.x;
+    __shared__ float red[256], r, s;
+    float ss=0.f;
+    for (unsigned d=tid; d<512; d+=256) { float v=(float)x[d]; ss+=v*v; }
+    red[tid]=ss;
+    __syncthreads();
+    for (unsigned half=128;half;half>>=1) {
+        if (tid<half) red[tid]+=red[tid+half];
+        __syncthreads();
+    }
+    if (tid==0) r=rsqrtf(red[0]/512+eps);
+    __syncthreads();
+    float mx=0.f;
+    for (unsigned d=tid; d<512; d+=256) {
+        float v=(float)x[d]*r*(float)w[d];
+        mx=fmaxf(mx,fabsf(v));
+    }
+    red[tid]=mx;
+    __syncthreads();
+    for (unsigned half=128;half;half>>=1) {
+        if (tid<half) red[tid]=fmaxf(red[tid],red[tid+half]);
+        __syncthreads();
+    }
+    if (tid==0) { s=hy4_fp8_row_scale(red[0]); *scale_out=s; }
+    __syncthreads();
+    for (unsigned d=tid; d<512; d+=256) {
+        float v=(float)x[d]*r*(float)w[d];
+        out[d]=hy4_enc_e4m3(v/s);
+    }
+}
+
+// 64 rotary outputs quantized rowwise into fp8 slot dims out_offset..+64.
+// Block must be exactly 32 threads (one warp) so the shuffle reduce is exact.
+__device__ __forceinline__ void hy4_rotary_fp8_impl(const __nv_bfloat16* src,
+    unsigned char* dst, float* scale_out, unsigned long long pt,
+    unsigned long long ph, unsigned long long pw, float theta,
+    unsigned sh, unsigned sw, unsigned interleaved, unsigned split) {
+    unsigned i=threadIdx.x;
+    if (i>=32) return;
+    unsigned axis=interleaved?((i%3==1 && i<sh*3)?1:((i%3==2 && i<sw*3)?2:0)):
+        (i<32-sh-sw?0:(i<32-sw?1:2));
+    float p=(float)(axis==0?pt:(axis==1?ph:pw));
+    float angle=p*powf(theta,-(float)i/32.f),s,c;
+    sincosf(angle,&s,&c);
+    float a=(float)src[i*2],b=(float)src[i*2+1];
+    float v0=a*c-b*s, v1=a*s+b*c;
+    float mx=fmaxf(fabsf(v0),fabsf(v1));
+    #pragma unroll
+    for (unsigned off=16;off;off>>=1)
+        mx=fmaxf(mx,__shfl_xor_sync(0xffffffffu,mx,off));
+    __shared__ float sc;
+    if (i==0) { float t=hy4_fp8_row_scale(mx); *scale_out=t; sc=t; }
+    __syncthreads();
+    dst[split?i:i*2]=hy4_enc_e4m3(v0/sc);
+    dst[split?32+i:i*2+1]=hy4_enc_e4m3(v1/sc);
+}
+
+// Batched fp8 variant of hy4_batch_kv_norm: same args, latent is E4M3 bytes,
+// rowwise scale appended as the trailing arg.
+extern "C" __global__ void hy4_batch_kv_norm_fp8kv(const __nv_bfloat16* kv,
+    const __nv_bfloat16* w, unsigned char* latent8, const unsigned* table,
+    unsigned start, unsigned page_size, unsigned columns, unsigned circular,
+    float eps, float* scales) {
+    unsigned row=blockIdx.x;
+    unsigned pos=start+row, page=pos/page_size;
+    unsigned column=circular?page%columns:page;
+    size_t slot=(size_t)table[column]*page_size+pos%page_size;
+    hy4_kv_norm_fp8_impl(kv+(size_t)row*576, w, latent8+slot*576, scales+2*slot, eps);
+}
+
+// Paged fp8 variant of hy4_batch_rotary (paged latent write only): same args,
+// latent is E4M3 bytes, rowwise scale for dims 512..576 appended last.
+extern "C" __global__ void hy4_batch_rotary_fp8kv(const __nv_bfloat16* x,
+    unsigned char* latent8, unsigned in_stride, unsigned out_stride,
+    unsigned in_offset, unsigned out_offset, unsigned row_in, unsigned row_out,
+    const unsigned* table, unsigned start, unsigned page_size,
+    unsigned columns, unsigned circular, unsigned paged,
+    unsigned long long pt, unsigned long long ph, unsigned long long pw,
+    float theta, unsigned sh, unsigned sw, unsigned interleaved, unsigned split,
+    float* scales) {
+    unsigned head=blockIdx.x, row=blockIdx.y;
+    unsigned pos=start+row, page=pos/page_size;
+    unsigned column=circular?page%columns:page;
+    size_t slot=(size_t)table[column]*page_size+pos%page_size;
+    const __nv_bfloat16* src=x+(size_t)row*row_in+(size_t)head*in_stride+in_offset;
+    hy4_rotary_fp8_impl(src, latent8+slot*576+out_offset, scales+2*slot+1,
+        pt+row, ph+row, pw+row, theta, sh, sw, interleaved, split);
+}
+
+// Decode single-row fp8 latent writes: norm (dims 0..512) and rotary
+// (dims 512..576) each record one rowwise scale for the slot.
+extern "C" __global__ void hy4_kv_norm_fp8kv(const __nv_bfloat16* kv,
+    const __nv_bfloat16* w, unsigned char* latent8, float* scales,
+    unsigned slot, float eps) {
+    hy4_kv_norm_fp8_impl(kv, w, latent8+(size_t)slot*576, scales+2*slot, eps);
+}
+
+extern "C" __global__ void hy4_rotary_fp8kv(const __nv_bfloat16* x,
+    unsigned char* latent8, float* scales, unsigned slot,
+    unsigned in_stride, unsigned in_offset, unsigned out_offset,
+    unsigned long long pt, unsigned long long ph, unsigned long long pw,
+    float theta, unsigned sh, unsigned sw, unsigned interleaved, unsigned split) {
+    unsigned head=blockIdx.x;
+    const __nv_bfloat16* src=x+(size_t)head*in_stride+in_offset;
+    hy4_rotary_fp8_impl(src, latent8+(size_t)slot*576+out_offset, scales+2*slot+1,
+        pt, ph, pw, theta, sh, sw, interleaved, split);
+}
+
 extern "C" __global__ void hy4_batch_rotary(const __nv_bfloat16* x, __nv_bfloat16* y,
     unsigned in_stride, unsigned out_stride, unsigned in_offset, unsigned out_offset,
     unsigned row_in, unsigned row_out, const unsigned* table,
