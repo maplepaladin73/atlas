@@ -13,6 +13,7 @@ use spark_runtime::{
 
 mod batch;
 mod forward;
+mod nvmap;
 #[cfg(test)]
 mod tests;
 pub struct Hy4Engram<'a> {
@@ -26,6 +27,10 @@ pub struct Hy4Engram<'a> {
     rows: std::ops::Range<usize>,
     fp8_table: bool,
     table: DevicePtr,
+    /// NVMe-mmap of the rank's bf16 table slice: `table` reads into it, so
+    /// it must outlive every launch. Held for its Drop (the unmap), never
+    /// read — hence the underscore name.
+    _table_nvmap: Option<nvmap::TableMap>,
     scales: DevicePtr,
     lookup_norm: DevicePtr,
     map: DevicePtr,
@@ -124,15 +129,45 @@ impl<'a> Hy4Engram<'a> {
         } else {
             (WeightDtype::BF16, 2)
         };
-        let table = table_slice(
-            &mut mem,
-            store,
-            &format!("{base}.multi_head_embedding.embedding.weight"),
-            &[n, dim],
-            dtype,
-            rows.start * dim * width,
-            rows.len() * dim * width,
-        )?;
+        let table_name = format!("{base}.multi_head_embedding.embedding.weight");
+        // bf16 + deferred table + knob on: serve this rank's slice straight
+        // off NVMe via mmap (GB10 reads host memory coherently through the
+        // page cache — see nvmap) instead of copying it into device memory.
+        // fp8 tables and knob-off loads stay device-resident, as before.
+        let mut table_nvmap = None;
+        let table = match nvmap::enabled(fp8_table)
+            .then(|| store.deferred(&table_name))
+            .flatten()
+        {
+            Some(d) => {
+                let m = nvmap::TableMap::open(
+                    d,
+                    &table_name,
+                    dtype,
+                    &[n, dim],
+                    rows.start * dim * width,
+                    rows.len() * dim * width,
+                )?;
+                tracing::info!(
+                    "engram tables NVMe-mmap: rank slice rows={} bytes={} (~{:.1} GB resident-free)",
+                    rows.len(),
+                    m.bytes(),
+                    m.bytes() as f64 / 1073741824.0
+                );
+                let ptr = m.table_ptr(mem.gpu);
+                table_nvmap = Some(m);
+                ptr
+            }
+            None => table_slice(
+                &mut mem,
+                store,
+                &table_name,
+                &[n, dim],
+                dtype,
+                rows.start * dim * width,
+                rows.len() * dim * width,
+            )?,
+        };
         let scales = if fp8_table {
             table_slice(
                 &mut mem,
@@ -260,6 +295,7 @@ impl<'a> Hy4Engram<'a> {
             rows,
             fp8_table,
             table,
+            _table_nvmap: table_nvmap,
             scales,
             lookup_norm,
             map,

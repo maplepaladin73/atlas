@@ -276,18 +276,24 @@ fn bf16_flag_rejects_fp8_table_contract_without_leaks() {
     assert_eq!(gpu.alloc_count(), before);
 }
 
-/// Deferred (demand-paged) bf16 tables: the slice copied off the shard must
-/// be the doubled byte window — start `rows.start*dim*2`, length
-/// `rows.len()*dim*2` — and no scale slice may be loaded for the table.
-#[test]
-fn deferred_bf16_table_slice_reads_doubled_byte_window() {
-    let gpu = MockGpuBackend::new();
-    let (c, mut store) = fixture(&gpu, 1, 2, false);
+/// A standalone shard for a deferred engram table: `0xAA` guard head, a
+/// `[112, 96]` table of distinct bytes (`11048` guard bytes before its first
+/// element), `0x55` tail. The load must read its rank window out of this
+/// file — device-resident when NVMap is off, mmap'd when it is on.
+fn defer_table(
+    store: &mut WeightStore,
+    tag: &str,
+    fp8_table: bool,
+) -> (std::path::PathBuf, Vec<u8>) {
     let dim = 96;
-    let dir = std::env::temp_dir().join(format!("atlas-hy4-engram-bf16-{}", std::process::id()));
+    let width = if fp8_table { 1 } else { 2 };
+    let dir = std::env::temp_dir().join(format!(
+        "atlas-hy4-engram-nvmap-{tag}-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let mut bytes = vec![0xAAu8; 8192];
-    let table: Vec<u8> = (0..112 * dim * 2).map(|i| (i % 251) as u8).collect();
+    let table: Vec<u8> = (0..112 * dim * width).map(|i| (i % 251) as u8).collect();
     bytes.extend_from_slice(&table);
     bytes.extend_from_slice(&[0x55u8; 16]);
     std::fs::write(dir.join("s.bin"), &bytes).unwrap();
@@ -296,15 +302,94 @@ fn deferred_bf16_table_slice_reads_doubled_byte_window() {
         DeferredTensor {
             path: dir.join("s.bin"),
             offset: 8192,
-            shape: vec![112, 96],
-            dtype: WeightDtype::BF16,
+            shape: vec![112, dim],
+            dtype: if fp8_table {
+                WeightDtype::FP8E4M3
+            } else {
+                WeightDtype::BF16
+            },
         },
     );
+    (dir, table)
+}
+
+/// The NVMap kernel base points into a process mapping, not a device
+/// allocation: `bytes` read through the host pointer.
+fn host_window(ptr: DevicePtr, bytes: usize) -> Vec<u8> {
+    // SAFETY: `Hy4Engram::table_nvmap` holds a read-only mapping covering
+    // [0, bytes) behind `ptr` for the block's lifetime (nvmap module).
+    unsafe { std::slice::from_raw_parts(ptr.0 as *const u8, bytes) }.to_vec()
+}
+
+/// Deferred bf16 tables take the NVMe-mmap path by default: the mapped
+/// slice must be the doubled byte window — base at `rows.start*dim*2`,
+/// length `rows.len()*dim*2`, guard bytes excluded on both ends — and none
+/// of it may back a device allocation (GB10 faults cold rows in from NVMe).
+#[test]
+fn nvmap_bf16_table_maps_doubled_byte_window_without_device_alloc() {
+    let gpu = MockGpuBackend::new();
+    let (c, mut store) = fixture(&gpu, 1, 2, false);
+    let (dir, table) = defer_table(&mut store, "window", false);
+    let dim = 96;
     let block = Hy4Engram::load(&c, &store, 1, &gpu).unwrap();
     assert!(block.scales.is_null());
+    assert_eq!(block.rows, 56..112);
+    assert!(gpu.read_alloc(block.table).is_none());
+    assert_eq!(
+        host_window(block.table, 56 * dim * 2),
+        table[56 * dim * 2..].to_vec()
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `ATLAS_HY4_ENGRAM_NVMAP=0` — forced here via the knob's test seam; the
+/// env strings themselves are unit-tested in nvmap — must fall back to the
+/// old device-resident bf16 slice: exactly one MORE device allocation than
+/// the mmap path (the table copy), holding the same doubled byte window.
+#[test]
+fn nvmap_disabled_loads_resident_bf16_slice_with_one_extra_alloc() {
+    let dim = 96;
+    let resident = {
+        let _knob = nvmap::test_override(false);
+        let gpu = MockGpuBackend::new();
+        let (c, mut store) = fixture(&gpu, 1, 2, false);
+        let (dir, table) = defer_table(&mut store, "resident", false);
+        let before = gpu.alloc_count();
+        let block = Hy4Engram::load(&c, &store, 1, &gpu).unwrap();
+        assert_eq!(
+            gpu.read_alloc(block.table),
+            Some(table[56 * dim * 2..].to_vec())
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        (gpu.alloc_count() - before, table)
+    };
+    let mapped = {
+        let gpu = MockGpuBackend::new();
+        let (c, mut store) = fixture(&gpu, 1, 2, false);
+        let (dir, table) = defer_table(&mut store, "mapped", false);
+        let before = gpu.alloc_count();
+        let block = Hy4Engram::load(&c, &store, 1, &gpu).unwrap();
+        assert!(gpu.read_alloc(block.table).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+        (gpu.alloc_count() - before, table)
+    };
+    assert_eq!(mapped.1, resident.1);
+    assert_eq!(resident.0, mapped.0 + 1);
+}
+
+/// The knob, even forced on, never moves fp8 tables off the device-resident
+/// path: an fp8 deferred slice still lands in a device allocation.
+#[test]
+fn nvmap_knob_never_applies_to_fp8_tables() {
+    let gpu = MockGpuBackend::new();
+    let (c, mut store) = fixture(&gpu, 1, 2, true);
+    let (dir, table) = defer_table(&mut store, "fp8-gate", true);
+    let _knob = nvmap::test_override(true);
+    let dim = 96;
+    let block = Hy4Engram::load(&c, &store, 1, &gpu).unwrap();
     assert_eq!(
         gpu.read_alloc(block.table),
-        Some(table[56 * dim * 2..].to_vec())
+        Some(table[56 * dim..].to_vec())
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
