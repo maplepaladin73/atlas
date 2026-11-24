@@ -161,7 +161,7 @@ fn cmd_ring_nic_words_arrive_beside_legacy_exchanges() {
             for step in 0..STEPS_PER_ROUND {
                 if step == STEPS_PER_ROUND / 4 {
                     for (pair, &(src, dst, stream)) in pairs.iter().zip(&bufs) {
-                        let land = |d, s, len| copy_async(d, s, len, stream);
+                        let land = |d, s, len, st: u64| copy_async(d, s, len, st);
                         assert!(pair.exchange(src, dst, BYTES, stream, land).unwrap());
                     }
                 }

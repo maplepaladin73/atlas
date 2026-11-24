@@ -77,8 +77,35 @@ impl NcclBackend {
             if bytes == 0 {
                 return Ok(true);
             }
-            if rdma.exchange(ptr, ptr, bytes, stream, |dst, src, len| {
-                self.launch_add(dst, src, len / ALL_REDUCE_DTYPE_BYTES, stream)
+            if rdma.exchange(ptr, ptr, bytes, stream, |dst, src, len, st| {
+                self.launch_add(dst, src, len / ALL_REDUCE_DTYPE_BYTES, st)
+            })? {
+                return Ok(true);
+            }
+        }
+        let _ = (ptr, bytes, stream);
+        Ok(false)
+    }
+
+    /// Deferred variant of [`Self::try_rdma_all_reduce`]: the exchange runs on
+    /// the pair's own stream, ordered after `stream`'s prior work, but
+    /// `stream` is not joined to it — the caller overlaps independent kernels
+    /// and later joins via `all_reduce_async_wait`. `false` means the caller
+    /// takes the NCCL path.
+    pub(super) fn try_rdma_all_reduce_deferred(
+        &self,
+        ptr: u64,
+        bytes: usize,
+        stream: u64,
+    ) -> Result<bool> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(rdma) = &self.rdma {
+            ensure_payload_fits(bytes, self.recv_capacity, self.rank, self.world_size)?;
+            if bytes == 0 {
+                return Ok(true);
+            }
+            if rdma.exchange_deferred(ptr, ptr, bytes, stream, |dst, src, len, st| {
+                self.launch_add(dst, src, len / ALL_REDUCE_DTYPE_BYTES, st)
             })? {
                 return Ok(true);
             }
@@ -102,11 +129,11 @@ impl NcclBackend {
             && bytes > 0
             && (!add || self.add_kernel.load(Ordering::Relaxed) != 0)
         {
-            return rdma.exchange(send, dst, bytes, stream, |dst, src, len| {
+            return rdma.exchange(send, dst, bytes, stream, |dst, src, len, st| {
                 if add {
-                    self.launch_add(dst, src, len / ALL_REDUCE_DTYPE_BYTES, stream)
+                    self.launch_add(dst, src, len / ALL_REDUCE_DTYPE_BYTES, st)
                 } else {
-                    rdma_pair::copy_async(dst, src, len, stream)
+                    rdma_pair::copy_async(dst, src, len, st)
                 }
             });
         }

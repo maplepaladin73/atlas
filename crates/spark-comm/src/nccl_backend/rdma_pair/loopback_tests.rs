@@ -79,8 +79,8 @@ impl Step {
         for (rank, pair) in pairs.iter().enumerate() {
             let (src, dst, stream) = (self.src[rank], self.dst[rank], streams[rank]);
             let sent = if self.kind == Kind::Legacy {
-                pair.exchange(src, dst, self.bytes, stream, |d, s, len| {
-                    launch_add(g, stream, d, s, len / 2);
+                pair.exchange(src, dst, self.bytes, stream, |d, s, len, st| {
+                    launch_add(g, st, d, s, len / 2);
                     Ok(())
                 })
             } else {

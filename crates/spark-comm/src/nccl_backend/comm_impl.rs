@@ -113,6 +113,19 @@ impl CommBackend for NcclBackend {
         Ok(())
     }
 
+    fn all_reduce_async_deferred(
+        &self,
+        ptr: u64,
+        bytes: usize,
+        compute_stream: u64,
+    ) -> Result<bool> {
+        self.all_reduce_deferred_inner(ptr, bytes, compute_stream)
+    }
+
+    fn all_reduce_async_wait(&self, compute_stream: u64) -> Result<()> {
+        self.all_reduce_wait_inner(compute_stream)
+    }
+
     fn peer_exchange_async(
         &self,
         send_ptr: u64,

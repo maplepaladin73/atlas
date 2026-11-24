@@ -56,3 +56,13 @@ fn test_single_gpu_symmetric_alloc_unsupported() {
     assert!(comm.symmetric_alloc(1024).is_err());
     assert!(comm.symmetric_free(0x1000).is_err());
 }
+
+#[test]
+fn deferred_all_reduce_defaults_to_unavailable() {
+    // A backend without an internal comm stream reports the deferred
+    // all-reduce as not taken; the caller then uses the ordinary
+    // all_reduce_async, and the join is a harmless no-op.
+    let comm = SingleGpuBackend;
+    assert!(!comm.all_reduce_async_deferred(0x1000, 8192, 0).unwrap());
+    comm.all_reduce_async_wait(0).unwrap();
+}

@@ -8,7 +8,9 @@
 //! 64 KB in ~8 us. Both GPUs use ATS, so they read and write pinned host
 //! memory directly.
 //!
-//! Per all-reduce `seq`, on the caller's stream: copy the partial into the
+//! Per all-reduce `seq`, on the pair's own stream (every exchange funnels
+//! there, so the slot protocol's stream order holds whatever stream each
+//! caller passed): copy the partial into the
 //! pinned send slot `seq % 2`, write the segment count to the host `ready`
 //! word, wait until the host `arrived` word reaches it, then add the peer's
 //! receive slot in place. A proxy thread watches `ready`, RDMA-WRITEs the send
@@ -50,6 +52,7 @@ mod pin;
 mod proxy;
 mod rails;
 mod topology;
+use crate::nccl;
 use cmd_ring::CmdRing;
 pub(super) use oneshot::OneShot;
 use proxy::{CmdLink, proxy_loop};
@@ -125,6 +128,14 @@ pub(super) struct RdmaPair {
     proxy: Option<std::thread::JoinHandle<()>>,
     oneshot: Option<OneShot>,
     cmd: Option<CmdRing>,
+    /// Dedicated stream every exchange runs on: the two-slot flag protocol
+    /// assumes all exchanges are stream-ordered, whatever stream each caller
+    /// passed, so they all funnel here in call order.
+    pstream: u64,
+    /// Recorded on the caller's stream before an exchange (input ready).
+    in_event: u64,
+    /// Recorded on `pstream` after an exchange's last land (result ready).
+    out_event: u64,
 }
 
 // SAFETY: `host` is a pinned allocation owned by this struct; the proxy thread
@@ -182,6 +193,9 @@ impl RdmaPair {
         let cmd_base = os_base + os_cfg.map_or(0, |c| oneshot::region_bytes(c.max, 1));
         let bytes = cmd_base + if cmd_on { cmd_ring::REGION_BYTES } else { 0 };
         let (host, dev) = pinned(bytes, "RDMA pair")?;
+        let pstream = nccl::create_stream()?;
+        let in_event = nccl::create_event()?;
+        let out_event = nccl::create_event()?;
         let Rails {
             mut verbs,
             lkeys,
@@ -269,22 +283,47 @@ impl RdmaPair {
             proxy: Some(proxy),
             oneshot,
             cmd,
+            pstream,
+            in_event,
+            out_event,
         })
     }
 
-    /// Exchange on `stream`: copy each segment of `src[..bytes]` into the send
-    /// slot, then `land(dst, recv, len)` the peer's matching segment into
-    /// `dst` as it arrives (an in-place add for an all-reduce with
-    /// `src == dst`, or a copy for an all-gather step).
-    /// Returns `false` (nothing enqueued) when the payload exceeds the
-    /// capacity or `stream` is capturing — both ranks see the same answer.
+    /// Exchange on `stream`: enqueue via [`Self::exchange_deferred`], then
+    /// join `stream` to the result. Returns `false` (nothing enqueued) when
+    /// the payload exceeds the capacity or `stream` is capturing — both
+    /// ranks see the same answer.
     pub(super) fn exchange(
         &self,
         src: u64,
         dst: u64,
         bytes: usize,
         stream: u64,
-        land: impl Fn(u64, u64, usize) -> Result<()>,
+        land: impl Fn(u64, u64, usize, u64) -> Result<()>,
+    ) -> Result<bool> {
+        let enqueued = self.exchange_deferred(src, dst, bytes, stream, land)?;
+        if enqueued {
+            self.exchange_wait(stream)?;
+        }
+        Ok(enqueued)
+    }
+
+    /// Exchange enqueued on the pair's own stream (`pstream`), ordered after
+    /// `stream`'s prior work by an event hop, with `stream` left free: the
+    /// caller overlaps independent kernels and later calls
+    /// [`Self::exchange_wait`]. Copy each segment of `src[..bytes]` into the
+    /// send slot, then `land(dst, recv, len, pstream)` the peer's matching
+    /// segment into `dst` as it arrives (an in-place add for an all-reduce
+    /// with `src == dst`, or a copy for an all-gather step).
+    /// Returns `false` (nothing enqueued) when the payload exceeds the
+    /// capacity or `stream` is capturing — both ranks see the same answer.
+    pub(super) fn exchange_deferred(
+        &self,
+        src: u64,
+        dst: u64,
+        bytes: usize,
+        stream: u64,
+        land: impl Fn(u64, u64, usize, u64) -> Result<()>,
     ) -> Result<bool> {
         if bytes > self.capacity {
             return Ok(false);
@@ -297,6 +336,9 @@ impl RdmaPair {
         if capturing != 0 {
             return Ok(false);
         }
+        let pstream = self.pstream;
+        nccl::record_event(self.in_event, stream)?;
+        nccl::stream_wait_event(pstream, self.in_event)?;
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let slot = (seq & 1) as usize;
         let flags = self.dev + flag_off(self.capacity) as u64;
@@ -306,13 +348,13 @@ impl RdmaPair {
         let first = self.segs.fetch_add(parts.len() as u64, Ordering::Relaxed);
         for (i, &(off, len)) in parts.iter().enumerate() {
             cu(
-                unsafe { cuMemcpyAsync(send + off as u64, src + off as u64, len, stream) },
+                unsafe { cuMemcpyAsync(send + off as u64, src + off as u64, len, pstream) },
                 "cuMemcpyAsync(RDMA send slot)",
             )?;
             // Default flags fence prior writes (the copy) before the value lands.
             let ready = first + i as u64 + 1;
             cu(
-                unsafe { cuStreamWriteValue64_v2(stream, flags + READY as u64, ready, 0) },
+                unsafe { cuStreamWriteValue64_v2(pstream, flags + READY as u64, ready, 0) },
                 "cuStreamWriteValue64(ready)",
             )?;
         }
@@ -326,7 +368,7 @@ impl RdmaPair {
             cu(
                 unsafe {
                     cuStreamWaitValue64_v2(
-                        stream,
+                        pstream,
                         flags + ARRIVED as u64,
                         arrived,
                         CU_STREAM_WAIT_VALUE_GEQ,
@@ -334,14 +376,20 @@ impl RdmaPair {
                 },
                 "cuStreamWaitValue64(arrived)",
             )?;
-            land(dst + off as u64, recv + off as u64, len)?;
+            land(dst + off as u64, recv + off as u64, len, pstream)?;
         }
+        nccl::record_event(self.out_event, pstream)?;
         if seq == 1 || seq.is_multiple_of(10_000) {
             tracing::info!(
                 "RDMA pair exchange engaged: enqueued={seq} bytes={bytes} stream={stream}"
             );
         }
         Ok(true)
+    }
+
+    /// Make `stream` wait for the last [`Self::exchange_deferred`] result.
+    pub(super) fn exchange_wait(&self, stream: u64) -> Result<()> {
+        nccl::stream_wait_event(stream, self.out_event)
     }
 }
 
@@ -376,6 +424,9 @@ impl Drop for RdmaPair {
         if let Some(proxy) = self.proxy.take() {
             let _ = proxy.join();
         }
+        nccl::destroy_event(self.in_event);
+        nccl::destroy_event(self.out_event);
+        nccl::destroy_stream(self.pstream);
         unsafe { cuMemFreeHost(self.host as *mut c_void) };
     }
 }

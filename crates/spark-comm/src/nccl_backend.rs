@@ -598,4 +598,5 @@ impl Drop for NcclBackend {
 
 mod broadcast;
 mod comm_impl;
+mod deferred;
 mod pair_ops;

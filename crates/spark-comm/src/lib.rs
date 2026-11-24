@@ -104,6 +104,34 @@ pub trait CommBackend: Send + Sync {
         self.all_reduce(ptr, bytes)
     }
 
+    /// Async all-reduce with a deferred completion wait, for overlapping the
+    /// transfer with independent compute: the reduce is enqueued on an
+    /// internal comm stream, ordered after `compute_stream`'s prior work by
+    /// events, but `compute_stream` is NOT joined to it, so kernels enqueued
+    /// on `compute_stream` in between (e.g. the hy4 shared-expert MLP) run
+    /// beside the transfer. The caller MUST call [`Self::all_reduce_async_wait`]
+    /// on `compute_stream` before any kernel reading `ptr`, and must not issue
+    /// another collective on this backend between the two calls; both ranks
+    /// must take the same path. Returns `false` (nothing enqueued) when the
+    /// backend cannot defer — then use [`Self::all_reduce_async`]. The
+    /// reduction itself is unchanged: identical result, only the schedule.
+    fn all_reduce_async_deferred(
+        &self,
+        ptr: u64,
+        bytes: usize,
+        compute_stream: u64,
+    ) -> Result<bool> {
+        let _ = (ptr, bytes, compute_stream);
+        Ok(false)
+    }
+
+    /// Join `compute_stream` to a deferred [`Self::all_reduce_async_deferred`]:
+    /// kernels on `compute_stream` enqueued after this observe the reduced `ptr`.
+    fn all_reduce_async_wait(&self, compute_stream: u64) -> Result<()> {
+        let _ = compute_stream;
+        Ok(())
+    }
+
     /// Asynchronously exchange one BF16 payload with the other rank.
     ///
     /// Unlike an all-reduce, `recv_ptr` receives the peer's unmodified payload.
