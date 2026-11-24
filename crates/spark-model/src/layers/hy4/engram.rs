@@ -24,6 +24,7 @@ pub struct Hy4Engram<'a> {
     dim: usize,
     h: usize,
     rows: std::ops::Range<usize>,
+    fp8_table: bool,
     table: DevicePtr,
     scales: DevicePtr,
     lookup_norm: DevicePtr,
@@ -62,7 +63,6 @@ impl<'a> Hy4Engram<'a> {
         let cfg = config.hy4.as_ref().context("Hy4 Engram config missing")?;
         ensure!(
             cfg.engram_layer_ids.contains(&(layer + 1))
-                && cfg.engram_fp8_embedding
                 && cfg.engram_max_ngram_size == 3
                 && cfg.engram_n_head_per_ngram == 8
                 && cfg.engram_n_embed_per_ngram == 768
@@ -115,24 +115,37 @@ impl<'a> Hy4Engram<'a> {
             ..layout.sizes[..heads.end].iter().sum::<usize>();
         let dim = cfg.engram_n_embed_per_ngram / cfg.engram_n_head_per_ngram;
         let mut mem = Owned::new(gpu);
+        // fp8 tables carry a per-row bf16 weight_scale_inv (2 bytes/row); the
+        // original bf16 tables need no scales and store 2 bytes per element,
+        // so both the byte start offset and byte length double.
+        let fp8_table = cfg.engram_fp8_embedding;
+        let (dtype, width) = if fp8_table {
+            (WeightDtype::FP8E4M3, 1)
+        } else {
+            (WeightDtype::BF16, 2)
+        };
         let table = table_slice(
             &mut mem,
             store,
             &format!("{base}.multi_head_embedding.embedding.weight"),
             &[n, dim],
-            WeightDtype::FP8E4M3,
-            rows.start * dim,
-            rows.len() * dim,
+            dtype,
+            rows.start * dim * width,
+            rows.len() * dim * width,
         )?;
-        let scales = table_slice(
-            &mut mem,
-            store,
-            &format!("{base}.multi_head_embedding.embedding.weight_scale_inv"),
-            &[n],
-            WeightDtype::BF16,
-            rows.start * 2,
-            rows.len() * 2,
-        )?;
+        let scales = if fp8_table {
+            table_slice(
+                &mut mem,
+                store,
+                &format!("{base}.multi_head_embedding.embedding.weight_scale_inv"),
+                &[n],
+                WeightDtype::BF16,
+                rows.start * 2,
+                rows.len() * 2,
+            )?
+        } else {
+            DevicePtr::NULL
+        };
         let lookup_norm = join(
             &mut mem,
             store,
@@ -215,12 +228,20 @@ impl<'a> Hy4Engram<'a> {
         )?;
         let names = [
             "hy4_engram_hash",
-            "hy4_engram_lookup",
+            if fp8_table {
+                "hy4_engram_lookup"
+            } else {
+                "hy4_engram_lookup_bf16"
+            },
             "hy4_engram_project",
             "hy4_engram_norm",
             "hy4_engram_inject",
             "hy4_engram_hash_batch",
-            "hy4_engram_lookup_batch",
+            if fp8_table {
+                "hy4_engram_lookup_batch"
+            } else {
+                "hy4_engram_lookup_batch_bf16"
+            },
             "hy4_engram_norm_batch",
             "hy4_engram_inject_batch",
         ];
@@ -237,6 +258,7 @@ impl<'a> Hy4Engram<'a> {
             dim,
             h: config.hidden_size,
             rows,
+            fp8_table,
             table,
             scales,
             lookup_norm,
