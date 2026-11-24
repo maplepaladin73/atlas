@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use super::{cache::AttentionCache, memory::Owned};
+use super::{
+    cache::{AttentionCache, LATENT_SCALES_PER_SLOT},
+    memory::Owned,
+};
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
@@ -142,14 +145,24 @@ impl AttentionCache<'_, '_> {
         );
         let gpu = self.layer.memory.gpu;
         self.poisoned = true;
+        let kv_stride = self.kv_stride();
         for position in source.len + accepted..self.len {
-            let offset = self.layout.slot(position)? * 1152;
+            let offset = self.layout.slot(position)? * kv_stride;
             gpu.copy_d2d_async(
                 source.latent.offset(offset),
                 self.latent.offset(offset),
-                1152,
+                kv_stride,
                 stream,
             )?;
+            if self.layer.kv_fp8 {
+                let scale_offset = self.layout.slot(position)? * LATENT_SCALES_PER_SLOT * 4;
+                gpu.copy_d2d_async(
+                    source.latent_scales.offset(scale_offset),
+                    self.latent_scales.offset(scale_offset),
+                    LATENT_SCALES_PER_SLOT * 4,
+                    stream,
+                )?;
+            }
             if self.pool_bytes > 0 && position % 4 == 3 {
                 let group = position / 4;
                 let offset = group / 64 * 8448 + group % 64 * 128;

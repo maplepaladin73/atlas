@@ -80,9 +80,9 @@ pub fn build_model(
                 && config.vision.is_none()
                 && config.lm_head_bf16_override.is_none()
                 && !config.lm_head_fp8
-                && kv_dtype == KvCacheDtype::Bf16
-                && layer_dtypes.iter().all(|d| *d == KvCacheDtype::Bf16),
-            "Hy4 requires eager text-only, BF16 latent cache and FP32-accumulating LM head; vision/LoRA/mixed cache dtypes/head overrides unsupported"
+                && matches!(kv_dtype, KvCacheDtype::Bf16 | KvCacheDtype::Fp8)
+                && layer_dtypes.iter().all(|d| *d == kv_dtype),
+            "Hy4 requires eager text-only, uniform BF16/FP8 latent cache and FP32-accumulating LM head; vision/LoRA/mixed cache dtypes/head overrides unsupported"
         );
         let mut model = crate::model::hy4::Hy4Model::new(
             config,
@@ -92,6 +92,7 @@ pub fn build_model(
             max_seq_len,
             kv_block_size,
             max_batch_size,
+            kv_dtype,
         )?;
         if use_speculative {
             model.enable_dfly()?;

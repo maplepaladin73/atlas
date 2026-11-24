@@ -5,6 +5,22 @@ use anyhow::{Result, ensure};
 use atlas_core::hy4_reference::paged::PagedLayout;
 use spark_runtime::gpu::DevicePtr;
 
+/// Latent dims per token slot (512 NoPE + 64 rotary).
+pub(super) const LATENT_DIMS: usize = 576;
+/// FP32 rowwise scales per fp8 slot: dims 0..512 and 512..576.
+pub(super) const LATENT_SCALES_PER_SLOT: usize = 2;
+
+impl Hy4Attention<'_> {
+    /// Per-slot latent byte stride: 576 E4M3 bytes when fp8, 1152 BF16 bytes.
+    pub(super) fn kv_stride(&self) -> usize {
+        if self.kv_fp8 {
+            LATENT_DIMS
+        } else {
+            LATENT_DIMS * 2
+        }
+    }
+}
+
 /// Per-request, per-layer pages plus one-row scratch. No cross-request aliases.
 /// Prefix forks deep-copy the resident pages and partial group, not scratch.
 pub struct AttentionCache<'layer, 'gpu> {
@@ -13,6 +29,8 @@ pub struct AttentionCache<'layer, 'gpu> {
     pub(super) layout: PagedLayout,
     pub(super) table: DevicePtr,
     pub(super) latent: DevicePtr,
+    /// FP8 rowwise scales, two FP32 per latent slot; NULL when the cache is BF16.
+    pub(super) latent_scales: DevicePtr,
     pub(super) pool_table: DevicePtr,
     pub(super) pool: DevicePtr,
     pub(super) tail: DevicePtr,
@@ -78,11 +96,23 @@ impl<'layer, 'gpu> AttentionCache<'layer, 'gpu> {
                 .flat_map(u32::to_le_bytes)
                 .collect::<Vec<_>>(),
         )?;
-        let latent_bytes = pages
+        let slots = pages
             .checked_mul(page_size)
-            .and_then(|n| n.checked_mul(576 * 2))
+            .ok_or_else(|| anyhow::anyhow!("Hy4 cache slot overflow"))?;
+        let kv_stride = layer.kv_stride();
+        let latent_bytes = slots
+            .checked_mul(kv_stride)
             .ok_or_else(|| anyhow::anyhow!("Hy4 cache byte overflow"))?;
         let latent = memory.alloc(latent_bytes)?;
+        let latent_scales = if layer.kv_fp8 {
+            memory.alloc(
+                slots
+                    .checked_mul(LATENT_SCALES_PER_SLOT * 4)
+                    .ok_or_else(|| anyhow::anyhow!("Hy4 scale byte overflow"))?,
+            )?
+        } else {
+            DevicePtr::NULL
+        };
         let (pool_table, pool, pool_bytes, tail) = if layer.index.is_some() {
             let pool_pages = max_tokens.div_ceil(4).div_ceil(64);
             let table = memory.upload(
@@ -162,6 +192,7 @@ impl<'layer, 'gpu> AttentionCache<'layer, 'gpu> {
             layout,
             table,
             latent,
+            latent_scales,
             pool_table,
             pool,
             tail,
@@ -179,6 +210,18 @@ impl<'layer, 'gpu> AttentionCache<'layer, 'gpu> {
     }
     pub fn committed_len(&self) -> usize {
         self.len
+    }
+    /// Per-slot latent byte stride (576 fp8 / 1152 bf16).
+    pub(super) fn kv_stride(&self) -> usize {
+        self.layer.kv_stride()
+    }
+    /// Byte size of the rowwise-scale buffer (0 when the cache is BF16).
+    fn latent_scales_bytes(&self) -> usize {
+        if self.layer.kv_fp8 {
+            self.latent_bytes / self.kv_stride() * LATENT_SCALES_PER_SLOT * 4
+        } else {
+            0
+        }
     }
     /// Drain the bound compute stream first. A failed free can be retried.
     pub fn release(&mut self) -> Result<()> {
@@ -240,11 +283,20 @@ impl<'layer, 'gpu> AttentionCache<'layer, 'gpu> {
             let pages = source.len.div_ceil(self.layout.page_size);
             let latent_bytes = pages
                 .checked_mul(self.layout.page_size)
-                .and_then(|n| n.checked_mul(576 * 2))
+                .and_then(|n| n.checked_mul(self.kv_stride()))
                 .ok_or_else(|| anyhow::anyhow!("Hy4 snapshot byte overflow"))?
                 .min(self.latent_bytes);
             if latent_bytes > 0 {
                 gpu.copy_d2d_async(source.latent, self.latent, latent_bytes, stream)?;
+                if self.layer.kv_fp8 {
+                    let scales_bytes = latent_bytes / self.kv_stride() * LATENT_SCALES_PER_SLOT * 4;
+                    gpu.copy_d2d_async(
+                        source.latent_scales,
+                        self.latent_scales,
+                        scales_bytes,
+                        stream,
+                    )?;
+                }
             }
             if self.pool_bytes > 0 {
                 let pool_bytes = (source.len / 4)
@@ -259,6 +311,15 @@ impl<'layer, 'gpu> AttentionCache<'layer, 'gpu> {
             }
         } else {
             gpu.copy_d2d_async(source.latent, self.latent, self.latent_bytes, stream)?;
+            let scales_bytes = self.latent_scales_bytes();
+            if scales_bytes > 0 {
+                gpu.copy_d2d_async(
+                    source.latent_scales,
+                    self.latent_scales,
+                    scales_bytes,
+                    stream,
+                )?;
+            }
             if self.pool_bytes > 0 {
                 gpu.copy_d2d_async(source.pool, self.pool, self.pool_bytes, stream)?;
                 gpu.copy_d2d_async(source.tail, self.tail, 4 * 128 * 2, stream)?;

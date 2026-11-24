@@ -2,15 +2,24 @@
 
 use super::*;
 use crate::traits::Model;
-use spark_runtime::gpu::mock::MockGpuBackend;
+use spark_runtime::{gpu::mock::MockGpuBackend, kv_cache::KvCacheDtype};
 
 #[test]
 fn prefix_commit_selects_captured_hidden_and_indices_without_running_a_forward() {
     for accepted in 1..=6 {
         let gpu = Box::new(MockGpuBackend::new());
         let weights = super::super::tests::store(&gpu);
-        let model =
-            Hy4Model::new(super::super::tests::config(), weights, gpu, None, 16, 4, 1).unwrap();
+        let model = Hy4Model::new(
+            super::super::tests::config(),
+            weights,
+            gpu,
+            None,
+            16,
+            4,
+            1,
+            KvCacheDtype::Bf16,
+        )
+        .unwrap();
         let mut seq = model.alloc_sequence().unwrap();
         let stream = model.default_stream();
         model.prefill(&[1], &mut seq, stream).unwrap();
@@ -64,7 +73,17 @@ fn prefix_commit_selects_captured_hidden_and_indices_without_running_a_forward()
 fn duplicate_checkpoint_preserves_pre_draft_state_but_new_history_refreshes_it() {
     let gpu = Box::new(MockGpuBackend::new());
     let weights = super::super::tests::store(&gpu);
-    let m = Hy4Model::new(super::super::tests::config(), weights, gpu, None, 8, 4, 1).unwrap();
+    let m = Hy4Model::new(
+        super::super::tests::config(),
+        weights,
+        gpu,
+        None,
+        8,
+        4,
+        1,
+        KvCacheDtype::Bf16,
+    )
+    .unwrap();
     let mut seq = m.alloc_sequence().unwrap();
     let stream = m.default_stream();
     m.prefill(&[1], &mut seq, stream).unwrap();
@@ -156,6 +175,7 @@ fn captured_hidden_and_all_indices_survive_scratch_reuse_and_snapshot_restore() 
     let caches: [TargetCache; 5] = (0..5)
         .map(|i| TargetCache {
             latent: DevicePtr(1),
+            latent_scales: DevicePtr::NULL,
             indices: source.upload(&vec![i as u8 + 1; 8192]).unwrap(),
             len: 57,
             capacity: 64,
@@ -194,6 +214,7 @@ fn capture_rejects_empty_missing_inconsistent_state_and_wrong_snapshot_width() {
     let mut state = State::new(&gpu, 32).unwrap();
     let cache = TargetCache {
         latent: DevicePtr(1),
+        latent_scales: DevicePtr::NULL,
         indices: DevicePtr(2),
         len: 0,
         capacity: 64,

@@ -182,13 +182,23 @@ impl<'a> Ops<'a> {
     pub fn attention(
         &self,
         buffers: [DevicePtr; 7],
+        cache_scales: DevicePtr,
         rows: usize,
         anchor: usize,
         stream: u64,
     ) -> Result<()> {
         let [q, kv, absorbed, cache, indices, sink, output] = buffers;
         let heads = (32 / self.config.world) as u32;
-        KernelLaunch::new(self.gpu, self.kernel(Op::Pack))
+        // A non-NULL scale buffer means the target cache stores fp8 latents.
+        let (pack, attn) = if cache_scales.is_null() {
+            (self.kernel(Op::Pack), self.kernel(Op::Attention))
+        } else {
+            (
+                self.gpu.kernel("hy4_dfly", "hy4_dfly_pack_fp8kv")?,
+                self.gpu.kernel("hy4_dfly", "hy4_dfly_attention_fp8kv")?,
+            )
+        };
+        let mut pack = KernelLaunch::new(self.gpu, pack)
             .grid([heads, rows as u32, 1])
             .block([256, 1, 1])
             .arg_ptr(q)
@@ -197,9 +207,12 @@ impl<'a> Ops<'a> {
             .arg_ptr(cache)
             .arg_u32(heads)
             .arg_u32(anchor as u32)
-            .arg_f32(self.config.theta)
-            .launch(stream)?;
-        KernelLaunch::new(self.gpu, self.kernel(Op::Attention))
+            .arg_f32(self.config.theta);
+        if !cache_scales.is_null() {
+            pack = pack.arg_ptr(cache_scales);
+        }
+        pack.launch(stream)?;
+        let mut attn = KernelLaunch::new(self.gpu, attn)
             .grid([heads, rows as u32, 1])
             .block([256, 1, 1])
             .arg_ptr(absorbed)
@@ -209,8 +222,11 @@ impl<'a> Ops<'a> {
             .arg_ptr(output)
             .arg_u32(heads)
             .arg_u32(anchor as u32)
-            .arg_u32(2048)
-            .launch(stream)
+            .arg_u32(2048);
+        if !cache_scales.is_null() {
+            attn = attn.arg_ptr(cache_scales);
+        }
+        attn.launch(stream)
     }
     pub fn reduce(
         &self,

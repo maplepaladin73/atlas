@@ -4,11 +4,14 @@ use super::*;
 
 fn append(cache: &mut AttentionCache<'_, '_>, gpu: &MockGpuBackend, value: u8) {
     let p = cache.len;
-    gpu.copy_h2d(
-        &vec![value; 1152],
-        cache.latent.offset(cache.layout.slot(p).unwrap() * 1152),
-    )
-    .unwrap();
+    let stride = cache.kv_stride();
+    let slot = cache.layout.slot(p).unwrap();
+    gpu.copy_h2d(&vec![value; stride], cache.latent.offset(slot * stride))
+        .unwrap();
+    if cache.layer.kv_fp8 {
+        gpu.copy_h2d(&[value; 8], cache.latent_scales.offset(slot * 8))
+            .unwrap();
+    }
     if cache.pool_bytes > 0 {
         if p.is_multiple_of(4) {
             cache.first_group_position = Some([p as i64; 3]);
@@ -46,62 +49,71 @@ fn bytes(gpu: &MockGpuBackend, ptr: spark_runtime::gpu::DevicePtr, len: usize) -
 #[test]
 fn exact_prefix_restores_rejected_window_rows_pool_tail_indices_and_positions() {
     for layer in [0, 2] {
-        for base in [57, 255, 515] {
-            for accepted in 1..=6 {
-                let gpu = MockGpuBackend::new();
-                let c = config(0, 1);
-                let store = store(&gpu, &c, layer);
-                let a = Hy4Attention::load(&store, layer, &c, &gpu).unwrap();
-                let mut cache = AttentionCache::new(&a, 1024, 4).unwrap();
-                cache.len = base;
-                cache.stream = Some(17);
-                cache.first_group_position = Some([(base / 4 * 4) as i64; 3]);
-                for (ptr, size) in [
-                    (cache.latent, cache.latent_bytes),
-                    (cache.pool, cache.pool_bytes),
-                    (cache.tail, if cache.pool_bytes > 0 { 1024 } else { 0 }),
-                ] {
-                    if size > 0 {
-                        gpu.copy_h2d(&vec![31; size], ptr).unwrap();
-                    }
-                }
-                let checkpoint = cache.fork(17).unwrap();
-                assert!(cache.commit_prefix(&checkpoint, 1, 6, 17).is_err());
-                assert!(cache.begin_prefix(0, 17).is_err());
-                assert!(cache.begin_prefix(6, 18).is_err());
-                cache.begin_prefix(6, 17).unwrap();
-                let mut expected = None;
-                let mut indices = Vec::new();
-                for row in 0..6 {
-                    append(&mut cache, &gpu, row as u8 + 70);
-                    if row + 1 == accepted {
-                        expected = Some(cache.fork(17).unwrap());
-                        if cache.pool_bytes > 0 {
-                            indices = bytes(&gpu, cache.scratch.indices, 8192);
+        for kv_fp8 in [false, true] {
+            for base in [57, 255, 515] {
+                for accepted in 1..=6 {
+                    let gpu = MockGpuBackend::new();
+                    let c = config(0, 1);
+                    let store = store(&gpu, &c, layer);
+                    let a = Hy4Attention::load(&store, layer, &c, &gpu, kv_fp8).unwrap();
+                    let mut cache = AttentionCache::new(&a, 1024, 4).unwrap();
+                    cache.len = base;
+                    cache.stream = Some(17);
+                    cache.first_group_position = Some([(base / 4 * 4) as i64; 3]);
+                    let scales_bytes = if kv_fp8 {
+                        cache.latent_bytes / cache.kv_stride() * 8
+                    } else {
+                        0
+                    };
+                    for (ptr, size) in [
+                        (cache.latent, cache.latent_bytes),
+                        (cache.latent_scales, scales_bytes),
+                        (cache.pool, cache.pool_bytes),
+                        (cache.tail, if cache.pool_bytes > 0 { 1024 } else { 0 }),
+                    ] {
+                        if size > 0 {
+                            gpu.copy_h2d(&vec![31; size], ptr).unwrap();
                         }
                     }
+                    let checkpoint = cache.fork(17).unwrap();
+                    assert!(cache.commit_prefix(&checkpoint, 1, 6, 17).is_err());
+                    assert!(cache.begin_prefix(0, 17).is_err());
+                    assert!(cache.begin_prefix(6, 18).is_err());
+                    cache.begin_prefix(6, 17).unwrap();
+                    let mut expected = None;
+                    let mut indices = Vec::new();
+                    for row in 0..6 {
+                        append(&mut cache, &gpu, row as u8 + 70);
+                        if row + 1 == accepted {
+                            expected = Some(cache.fork(17).unwrap());
+                            if cache.pool_bytes > 0 {
+                                indices = bytes(&gpu, cache.scratch.indices, 8192);
+                            }
+                        }
+                    }
+                    cache.commit_prefix(&checkpoint, accepted, 6, 17).unwrap();
+                    let expected = expected.unwrap();
+                    assert_eq!(cache.len, base + accepted);
+                    assert_eq!(cache.first_group_position, expected.first_group_position);
+                    for (actual, expected, size) in [
+                        (cache.latent, expected.latent, cache.latent_bytes),
+                        (cache.latent_scales, expected.latent_scales, scales_bytes),
+                        (cache.pool, expected.pool, cache.pool_bytes),
+                        (
+                            cache.tail,
+                            expected.tail,
+                            if cache.pool_bytes > 0 { 1024 } else { 0 },
+                        ),
+                    ] {
+                        assert_eq!(bytes(&gpu, actual, size), bytes(&gpu, expected, size));
+                    }
+                    if cache.pool_bytes > 0 {
+                        assert_eq!(bytes(&gpu, cache.scratch.indices, 8192), indices);
+                    }
+                    assert!(cache.commit_prefix(&checkpoint, 0, 6, 17).is_err());
+                    assert!(cache.commit_prefix(&checkpoint, 7, 6, 17).is_err());
+                    assert!(cache.commit_prefix(&checkpoint, accepted, 6, 18).is_err());
                 }
-                cache.commit_prefix(&checkpoint, accepted, 6, 17).unwrap();
-                let expected = expected.unwrap();
-                assert_eq!(cache.len, base + accepted);
-                assert_eq!(cache.first_group_position, expected.first_group_position);
-                for (actual, expected, size) in [
-                    (cache.latent, expected.latent, cache.latent_bytes),
-                    (cache.pool, expected.pool, cache.pool_bytes),
-                    (
-                        cache.tail,
-                        expected.tail,
-                        if cache.pool_bytes > 0 { 1024 } else { 0 },
-                    ),
-                ] {
-                    assert_eq!(bytes(&gpu, actual, size), bytes(&gpu, expected, size));
-                }
-                if cache.pool_bytes > 0 {
-                    assert_eq!(bytes(&gpu, cache.scratch.indices, 8192), indices);
-                }
-                assert!(cache.commit_prefix(&checkpoint, 0, 6, 17).is_err());
-                assert!(cache.commit_prefix(&checkpoint, 7, 6, 17).is_err());
-                assert!(cache.commit_prefix(&checkpoint, accepted, 6, 18).is_err());
             }
         }
     }
