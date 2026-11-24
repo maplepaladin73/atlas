@@ -137,8 +137,23 @@ impl AttentionCache<'_, '_> {
         let phase = timing::span("attn_q_b", stream)?;
         a.linear(s.qc, a.qb, s.q, a.heads * 256, a.qrank, stream)?;
         drop(phase);
-        let row = self.latent.offset(self.layout.slot(self.len)? * 576 * 2);
-        a.norm(s.kv, a.kvn, row, 512, stream)?;
+        let slot = self.layout.slot(self.len)?;
+        let row = self.latent.offset(slot * self.kv_stride());
+        if a.kv_fp8 {
+            // FP8 latent write: quantize normed dims 0..512 with one rowwise scale.
+            KernelLaunch::new(gpu, a.kernels.kv_norm_fp8)
+                .grid([1, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(s.kv)
+                .arg_ptr(a.kvn)
+                .arg_ptr(self.latent)
+                .arg_ptr(self.latent_scales)
+                .arg_u32(slot as u32)
+                .arg_f32(a.eps)
+                .launch(stream)?;
+        } else {
+            a.norm(s.kv, a.kvn, row, 512, stream)?;
+        }
         let phase = timing::span("attn_q_absorb", stream)?;
         a.gemv(s.q, a.wk, s.absorbed, [512, 192, 256, 576], stream)?;
         drop(phase);
@@ -151,7 +166,30 @@ impl AttentionCache<'_, '_> {
             false,
             stream,
         )?;
-        a.rotary(s.kv, row, 1, [576, 576, 512, 512], position, false, stream)?;
+        if a.kv_fp8 {
+            // FP8 latent write: quantize rotary dims 512..576 with its own scale.
+            KernelLaunch::new(gpu, a.kernels.rotary_fp8)
+                .grid([1, 1, 1])
+                .block([32, 1, 1])
+                .arg_ptr(s.kv)
+                .arg_ptr(self.latent)
+                .arg_ptr(self.latent_scales)
+                .arg_u32(slot as u32)
+                .arg_u32(576)
+                .arg_u32(512)
+                .arg_u32(512)
+                .arg_u64(position[0] as u64)
+                .arg_u64(position[1] as u64)
+                .arg_u64(position[2] as u64)
+                .arg_f32(a.rope.rope_theta as f32)
+                .arg_u32(a.rope.mrope_section[1] as u32)
+                .arg_u32(a.rope.mrope_section[2] as u32)
+                .arg_u32(u32::from(a.rope.mrope_interleaved))
+                .arg_u32(0)
+                .launch(stream)?;
+        } else {
+            a.rotary(s.kv, row, 1, [576, 576, 512, 512], position, false, stream)?;
+        }
         if a.index.is_some() {
             let _index = timing::span("dsa_index", stream)?;
             self.run_index(x, position, stream)?;
@@ -163,7 +201,12 @@ impl AttentionCache<'_, '_> {
         };
         let splits = count.div_ceil(128);
         let phase = timing::span("attn_latent", stream)?;
-        KernelLaunch::new(gpu, a.kernels.attention)
+        let attention = if a.kv_fp8 {
+            a.kernels.attention_fp8
+        } else {
+            a.kernels.attention
+        };
+        let mut latent = KernelLaunch::new(gpu, attention)
             .grid([a.heads as u32, splits as u32, 1])
             .block([256, 1, 1])
             .arg_ptr(s.absorbed)
@@ -176,8 +219,11 @@ impl AttentionCache<'_, '_> {
             .arg_u32(self.layout.table.len() as u32)
             .arg_u32(a.window.unwrap_or(0) as u32)
             .arg_u32(count as u32)
-            .arg_u32(splits as u32)
-            .launch(stream)?;
+            .arg_u32(splits as u32);
+        if a.kv_fp8 {
+            latent = latent.arg_ptr(self.latent_scales);
+        }
+        latent.launch(stream)?;
         KernelLaunch::new(gpu, a.kernels.merge)
             .grid([a.heads as u32, 1, 1])
             .block([256, 1, 1])
