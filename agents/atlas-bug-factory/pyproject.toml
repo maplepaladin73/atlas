@@ -1,0 +1,22 @@
+[project]
+name = "atlas-bug-factory"
+version = "0.1.0"
+description = "Mistral agent that monitors maplepaladin73/atlas for bugs, prioritizing the HY4 Flash and Ling 3.2 Air model areas"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mistralai-agents>=1.1.2,<1.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.mistralai.agents]
+entrypoint = "main:agent"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
