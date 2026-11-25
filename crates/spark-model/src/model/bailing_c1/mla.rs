@@ -30,7 +30,7 @@ use spark_runtime::kv_cache::PagedKvCache;
 use anyhow::{Result, ensure};
 use atlas_core::config::ModelConfig;
 
-use super::spec::{MAX_PREFILL_ROWS, MLA_K_ROW_BF16, MLA_V_ROW_BF16};
+use super::spec::{MLA_K_ROW_BF16, MLA_V_ROW_BF16};
 use super::{LingFfn, LingKernels, LingScratch, MLA_MAX_ROWS_PAGED};
 use crate::layer::{ForwardContext, LayerState, TransformerLayer};
 use crate::layers::ops;
@@ -208,19 +208,22 @@ impl LingMlaLayer {
     }
 
     /// The layer's packed prefill context for a chunk that needs
-    /// `need_rows` = prefix + chunk rows: grown by powers of two from the
-    /// prefill cap and capped at [`MAX_PREFILL_ROWS`] (a 799k-row mirror of
-    /// the whole paged pool would defeat the conservative-memory envelope;
-    /// over-cap chunks keep the legacy paged path). The contents are
-    /// per-pass scratch — the gather refills the prefix from the paged
-    /// pools every prefill call — so growth never changes correctness,
-    /// only capacity.
+    /// `need_rows` = prefix + chunk rows: grown to cover exactly that
+    /// (powers of two, bounded by the paged pool's own row count — the
+    /// rows it can legally mirror; an over-pool need falls back to the
+    /// legacy paged path). The caller pre-sizes the whole chunk's need
+    /// ONCE per prefill call, so sub-chunks never regrow mid-call — and
+    /// the contents are per-pass scratch — the gather refills the prefix
+    /// from the paged pools every prefill call — so growth never changes
+    /// correctness, only capacity.
     fn ctx_pools(
         &self,
         gpu: &dyn GpuBackend,
+        kv_cache: &PagedKvCache,
         need_rows: usize,
     ) -> Result<Option<CtxPools>> {
-        if need_rows > MAX_PREFILL_ROWS {
+        let pool_rows = kv_cache.num_blocks() * kv_cache.block_size();
+        if need_rows > pool_rows {
             return Ok(None);
         }
         let mut cell = self.ctx.lock();
@@ -229,7 +232,7 @@ impl LingMlaLayer {
                 .as_ref()
                 .map_or(1024, |p| p.rows)
                 .max(need_rows.next_power_of_two())
-                .min(MAX_PREFILL_ROWS);
+                .min(pool_rows);
             let k = gpu.alloc(grow * MLA_K_ROW_BF16 * 2)?;
             gpu.memset(k, 0, grow * MLA_K_ROW_BF16 * 2)?;
             let v = gpu.alloc(grow * MLA_V_ROW_BF16 * 2)?;
@@ -789,6 +792,12 @@ impl LingMlaLayer {
         seq_len_start: usize,
         whole_prompt: bool,
         packed: bool,
+        // `carry`: the prefix rows [0, seq_len_start) are already resident
+        // in the packed context (`prefill` gathers once per call and the
+        // sub-chunk loop appends) — skip `ling_mla_ctx_gather`. False for
+        // verify, or a per-sub-chunk fallback without a call-level
+        // preamble, which must re-gather.
+        carry: bool,
         staged: bool,
         block_table: &[u32],
         stream: u64,
@@ -798,7 +807,7 @@ impl LingMlaLayer {
         let hidden_w = s.hidden as u32;
         let rows_u32 = rows as u32;
         if packed {
-            if let Some(ctx) = self.ctx_pools(gpu, seq_len_start + rows)? {
+            if let Some(ctx) = self.ctx_pools(gpu, kv_cache, seq_len_start + rows)? {
                 let v_pool = self.v_cache_pool(gpu, kv_cache)?;
                 return self.attention_half_packed(
                     gpu,
@@ -808,6 +817,7 @@ impl LingMlaLayer {
                     seq_len_start,
                     &ctx,
                     v_pool,
+                    carry,
                     block_table,
                     stream,
                 );
@@ -943,6 +953,7 @@ impl LingMlaLayer {
         seq_len_start: usize,
         ctx: &CtxPools,
         v_pool: DevicePtr,
+        carry: bool,
         block_table: &[u32],
         stream: u64,
     ) -> Result<()> {
@@ -986,7 +997,7 @@ impl LingMlaLayer {
             s.mla_block_table,
             stream,
         )?;
-        if seq_len_start > 0 {
+        if seq_len_start > 0 && !carry {
             self.ctx_gather(
                 gpu,
                 kv_cache,
@@ -1112,6 +1123,7 @@ impl TransformerLayer for LingMlaLayer {
             // The packed path is a prefill shape: a per-verify gather of
             // the prompt prefix would run on every decode step.
             false,
+            false, // no call-level preamble: verify re-gathers, were it packed
             staged,
             block_table,
             stream,
@@ -1146,6 +1158,54 @@ impl TransformerLayer for LingMlaLayer {
         // PREFILL=1 position-0 whole-prompt fast path — is restored with
         // ATLAS_LING_MLA_PACKED_PREFILL=0.
         let packed = packed_prefill();
+        // Preamble (once per call, not per sub-chunk): size the packed
+        // context for the WHOLE chunk — so no sub-chunk ever regrows it
+        // mid-call — and gather the prefix [0, seq_len_start) from the
+        // paged pools. Every sub-chunk then only appends its own rows and
+        // carries the prefix (the sub-chunk loop is one uninterrupted
+        // pass of one sequence on one stream; earlier sub-chunks' rows
+        // are resident by construction). Without this each sub-chunk
+        // would re-gather its growing prefix — quadratic in the sub-chunk
+        // count, which a 20k-token chunk makes pathological.
+        let carry = packed && {
+            match self.ctx_pools(ctx.gpu, kv_cache, seq_len_start + num_tokens)? {
+                Some(ctxp) => {
+                    if seq_len_start > 0 {
+                        let v_pool = self.v_cache_pool(ctx.gpu, kv_cache)?;
+                        let table_i32: Vec<i32> =
+                            block_table.iter().map(|&b| b as i32).collect();
+                        ensure!(
+                            table_i32.len() <= self.scratch.max_blocks,
+                            "ling MLA: block table ({} entries) exceeds the staging cap {}",
+                            table_i32.len(),
+                            self.scratch.max_blocks
+                        );
+                        ctx.gpu.copy_h2d_async(
+                            unsafe {
+                                std::slice::from_raw_parts(
+                                    table_i32.as_ptr() as *const u8,
+                                    table_i32.len() * 4,
+                                )
+                            },
+                            self.scratch.mla_block_table,
+                            stream,
+                        )?;
+                        self.ctx_gather(
+                            ctx.gpu,
+                            kv_cache,
+                            &ctxp,
+                            self.scratch.mla_block_table,
+                            table_i32.len() as u32,
+                            seq_len_start as u32,
+                            v_pool,
+                            stream,
+                        )?;
+                    }
+                    true
+                }
+                None => false,
+            }
+        };
         let fast = std::env::var("ATLAS_LING_MLA_FAST_PREFILL").as_deref() == Ok("1")
             && seq_len_start == 0;
         let cap = self.scratch.rows;
@@ -1159,6 +1219,7 @@ impl TransformerLayer for LingMlaLayer {
                 seq_len_start + chunk,
                 fast && n == 0 && num_tokens <= cap,
                 packed,
+                carry,
                 false,
                 block_table,
                 stream,

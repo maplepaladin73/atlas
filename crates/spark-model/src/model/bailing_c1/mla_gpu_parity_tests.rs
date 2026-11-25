@@ -606,6 +606,7 @@ fn mla_layer5_parity() -> Result<()> {
         false,
         false, // packed: legacy paged groups (the packed path runs in phase 4)
         false, // staged
+        false, // carry: prefix rows are not resident; the call re-gathers
         &rig.block_table,
         stream,
     )?;
@@ -685,6 +686,7 @@ fn mla_layer5_parity() -> Result<()> {
         false,
         false, // packed: legacy paged groups (the packed path runs in phase 4)
         false, // staged
+        false, // carry: prefix rows are not resident; the call re-gathers
         &rig.block_table,
         stream,
     )?;
@@ -785,6 +787,7 @@ fn mla_layer5_parity() -> Result<()> {
         false,
         true,  // packed
         false, // staged
+        false, // carry: prefix rows are not resident; the call re-gathers
         &rig.block_table,
         stream,
     )?;
@@ -835,6 +838,7 @@ fn mla_layer5_parity() -> Result<()> {
         false,
         true, // packed: the gather refills prefix rows [0, 12) from the pool
         false, // staged
+        false, // carry: prefix rows are not resident; the call re-gathers
         &rig.block_table,
         stream,
     )?;
@@ -916,6 +920,7 @@ fn mla_layer5_prefill_fast_parity() -> Result<()> {
         false, // packed: legacy fast path (the packed default runs in phase 4
                // of mla_layer5_parity and end to end in the e2e gate)
         false, // staged
+        false, // carry: prefix rows are not resident; the call re-gathers
         &rig.block_table,
         stream,
     )?;
