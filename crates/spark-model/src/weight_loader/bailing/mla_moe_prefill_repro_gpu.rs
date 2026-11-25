@@ -95,6 +95,7 @@ fn ling_mla_moe_prefill_repro_gpu() -> Result<()> {
         0,
         true, // whole prompt
         true, // packed (upstream repro default)
+        false, // carry: prefix rows are not resident; the call re-gathers
         false, // staged
         &block_table,
         stream,
