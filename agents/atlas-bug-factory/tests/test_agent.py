@@ -1,15 +1,15 @@
 import pytest
 from mistralai import agents
 
-from main import agent
+from main import AREA_PREFIXES, agent
 from priority_map import classify
 
 
 @pytest.fixture(autouse=True)
-def no_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
-    monkeypatch.delenv("MISTRAL_CLIENT_API_KEY", raising=False)
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+def dummy_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A dummy key satisfies the SDK's connector assembly; every test overrides the
+    # model with a ScriptedModel, so no real API call ever happens.
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-only-not-a-real-key")
 
 
 def test_classify_p0_model_areas() -> None:
@@ -40,6 +40,12 @@ def test_classify_p1_shared_and_p2_fallback() -> None:
     assert classify("./kernels/gb10/hy4-flash/MODEL.toml")["tier"] == "P0"
 
 
+def test_area_prefixes_cover_both_p0_areas() -> None:
+    assert any(p.startswith("kernels/gb10/hy4-flash") for p in AREA_PREFIXES["hy4-flash"])
+    assert any(p.startswith("kernels/gb10/ling-3.2-air") for p in AREA_PREFIXES["ling-3.2-air"])
+    assert all(classify(p + "x")["tier"] == "P0" for prefixes in AREA_PREFIXES.values() for p in prefixes)
+
+
 async def test_classify_files_tool_runs_in_turn() -> None:
     model = agents.testing.ScriptedModel(
         [
@@ -67,17 +73,14 @@ async def test_classify_files_tool_runs_in_turn() -> None:
     model.assert_consumed()
 
 
-async def test_missing_token_surfaces_as_tool_error_and_turn_continues() -> None:
+async def test_now_iso_tool_returns_iso_timestamp() -> None:
     model = agents.testing.ScriptedModel(
         [
-            agents.testing.run_typescript(
-                'return await tools.client.list_commits({repo: "maplepaladin73/atlas"});'
-            ),
-            agents.testing.reply("GITHUB_TOKEN is missing, so the scan cannot start."),
+            agents.testing.run_typescript("return await tools.client.now_iso();"),
+            agents.testing.reply("got the time"),
         ]
     )
-    state = await agent.override(model=model).run("list recent commits")
+    state = await agent.override(model=model).run("what time is it?")
     assert isinstance(state, agents.Completed), state
-    assert state.text == "GITHUB_TOKEN is missing, so the scan cannot start."
-    assert [call.name for call in state.tool_calls] == ["client.list_commits"]
+    assert [call.name for call in state.tool_calls] == ["client.now_iso"]
     model.assert_consumed()
