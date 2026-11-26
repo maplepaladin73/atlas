@@ -509,8 +509,10 @@ extern "C" __global__ void ling_mla_v_extract_gated(
 // mla_prefill_attn: at these row counts the pass is KV-bandwidth-bound.
 //
 // 16 query rows a CTA, 16 lanes a row: 36 score dims a lane (the 576 cache
-// row), 32 value dims a lane (the 512 latent). causal == 0 runs the full
-// run unmasked (parity tests).
+// row), 32 value dims a lane (the 512 latent). Each lane loads its 36 / 32
+// contiguous elements as 8-byte uint2 slices (4 bf16 each: 8B-aligned by
+// construction), preserving the scalar FMA order -> bit-identical output.
+// causal == 0 runs the full run unmasked (parity tests).
 //
 // Q: [batch, seq_len, heads, 576]  K: [batch, kv_base + seq_len, 576]
 // V: [batch, kv_base + seq_len, 512]  O: [batch, seq_len, heads, 512]
@@ -542,8 +544,13 @@ extern "C" __global__ void ling_mla_prefill_attn(
         Q + ((unsigned long long)(batch * seq_len + q_row) * gridDim.x + head) * LING_MLA_KV_DIM;
     float q_reg[LING_MLA_PFKVEC];
     #pragma unroll
-    for (unsigned int i = 0; i < LING_MLA_PFKVEC; ++i)
-        q_reg[i] = __bfloat162float(q_base[lane * LING_MLA_PFKVEC + i]);
+    for (unsigned int i = 0; i < LING_MLA_PFKVEC / 4u; ++i) {
+        const uint2 pk = *reinterpret_cast<const uint2*>(q_base + lane * LING_MLA_PFKVEC + i * 4u);
+        const __nv_bfloat16* elems = reinterpret_cast<const __nv_bfloat16*>(&pk);
+        #pragma unroll
+        for (unsigned int j = 0; j < 4u; ++j)
+            q_reg[i * 4u + j] = __bfloat162float(elems[j]);
+    }
 
     float m_prev = -1e30f;
     float l_prev = 0.0f;
@@ -558,8 +565,13 @@ extern "C" __global__ void ling_mla_prefill_attn(
             K + (unsigned long long)(batch * kv_run + kv_pos) * LING_MLA_KV_DIM;
         float dot = 0.0f;
         #pragma unroll
-        for (unsigned int i = 0; i < LING_MLA_PFKVEC; ++i)
-            dot += q_reg[i] * __bfloat162float(k_row[lane * LING_MLA_PFKVEC + i]);
+        for (unsigned int i = 0; i < LING_MLA_PFKVEC / 4u; ++i) {
+            const uint2 pk = *reinterpret_cast<const uint2*>(k_row + lane * LING_MLA_PFKVEC + i * 4u);
+            const __nv_bfloat16* elems = reinterpret_cast<const __nv_bfloat16*>(&pk);
+            #pragma unroll
+            for (unsigned int j = 0; j < 4u; ++j)
+                dot += q_reg[i * 4u + j] * __bfloat162float(elems[j]);
+        }
         // Reduce within the row's 16 lanes (two half-warps; full mask).
         #pragma unroll
         for (int offset = 8; offset > 0; offset >>= 1)
@@ -576,8 +588,13 @@ extern "C" __global__ void ling_mla_prefill_attn(
         const __nv_bfloat16* v_row =
             V + (unsigned long long)(batch * kv_run + kv_pos) * LING_MLA_LORA;
         #pragma unroll
-        for (unsigned int i = 0; i < LING_MLA_PFVVEC; ++i)
-            o_acc[i] = alpha * o_acc[i] + p * __bfloat162float(v_row[lane * LING_MLA_PFVVEC + i]);
+        for (unsigned int i = 0; i < LING_MLA_PFVVEC / 4u; ++i) {
+            const uint2 pv = *reinterpret_cast<const uint2*>(v_row + lane * LING_MLA_PFVVEC + i * 4u);
+            const __nv_bfloat16* elems = reinterpret_cast<const __nv_bfloat16*>(&pv);
+            #pragma unroll
+            for (unsigned int j = 0; j < 4u; ++j)
+                o_acc[i * 4u + j] = alpha * o_acc[i * 4u + j] + p * __bfloat162float(elems[j]);
+        }
         m_prev = m_new;
     }
 
@@ -585,8 +602,14 @@ extern "C" __global__ void ling_mla_prefill_attn(
     __nv_bfloat16* o_row =
         O + ((unsigned long long)(batch * seq_len + q_row) * gridDim.x + head) * LING_MLA_LORA;
     #pragma unroll
-    for (unsigned int i = 0; i < LING_MLA_PFVVEC; ++i)
-        o_row[lane * LING_MLA_PFVVEC + i] = __float2bfloat16(o_acc[i] * inv_l);
+    for (unsigned int i = 0; i < LING_MLA_PFVVEC / 4u; ++i) {
+        uint2 ov;
+        __nv_bfloat16* elems = reinterpret_cast<__nv_bfloat16*>(&ov);
+        #pragma unroll
+        for (unsigned int j = 0; j < 4u; ++j)
+            elems[j] = __float2bfloat16(o_acc[i * 4u + j] * inv_l);
+        *reinterpret_cast<uint2*>(o_row + lane * LING_MLA_PFVVEC + i * 4u) = ov;
+    }
 }
 
 // Refill the packed prefill context's prefix rows [0, rows) from the paged
