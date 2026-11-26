@@ -612,7 +612,7 @@ extern "C" __global__ void ling_mla_prefill_attn(
     }
 }
 
-// ----------------------------------------------------------------------------
+// --------------------------------------------------------------------------------
 // Tensor-core (mma.m16n8k16, bf16) prefill attention — same layout and
 // signature as `ling_mla_prefill_attn`. Kept as a separate entry so the
 // proven scalar kernel stays the default; env ATLAS_LING_MLA_PREFILL_MMA=1
@@ -625,9 +625,17 @@ extern "C" __global__ void ling_mla_prefill_attn(
 // 512-dim V axis into 128-column quarters for the PV pass. Score/softmax
 // are shadowed in smem; P is stored bf16 for the PV mma.
 //
+// K and V are streamed straight from global memory (L2/L1-cached) instead
+// of staged in smem: the smem-staged design held 91,392 B per CTA, which
+// capped GB10 at 1 CTA/SM (4 warps in flight). Staging only the query tile
+// (18,432 B) plus the score/P/softmax shadow (~3.3 KB) leaves 21,760 B per
+// CTA, so 4 CTAs fit a 102,400 B-SM — 16 warps in flight. K rows past kv_run
+// are skipped outright (their scores are masked downstream anyway) and the
+// Q rows past seq_len are zero-filled, so no OOB read is ever performed.
+//
 // Fragment layout mirrors the house SM121 workaround (no ldmatrix):
 //   group_id = lane >> 2 (rows 0..7 / cols 0..7), tid_in_group = lane & 3.
-// ----------------------------------------------------------------------------
+// --------------------------------------------------------------------------------
 extern "C" __global__ void ling_mla_prefill_attn_mma(
     const __nv_bfloat16* __restrict__ Q,
     const __nv_bfloat16* __restrict__ K,
@@ -652,8 +660,6 @@ extern "C" __global__ void ling_mla_prefill_attn_mma(
     const unsigned int kv_run = kv_base + seq_len;
 
     __shared__ __nv_bfloat16 q_smem[16u * 576u];
-    __shared__ __nv_bfloat16 k_smem[32u * 576u];
-    __shared__ __nv_bfloat16 v_smem[32u * 512u];
     __shared__ float score_smem[16u * 32u];
     __shared__ __nv_bfloat16 p_smem[16u * 32u];
     // per-row m_new, l_prev, alpha (slot 3 unused)
@@ -691,39 +697,19 @@ extern "C" __global__ void ling_mla_prefill_attn_mma(
         causal ? (kv_base + q_row_hi + 1u) : kv_run;
 
     for (unsigned int tile_start = 0u; tile_start < kv_limit; tile_start += 32u) {
-        // --- cooperatively load the K/V tiles (zeros past kv_run) ---
-        #pragma unroll 4
-        for (unsigned int i = tid; i < 32u * 72u; i += 128u) {
-            const unsigned int r = i / 72u;
-            const unsigned int c = i % 72u;
-            const unsigned int pos = tile_start + r;
-            uint4 dst = make_uint4(0u, 0u, 0u, 0u);
-            if (pos < kv_run) {
-                dst = *reinterpret_cast<const uint4*>(
-                    K + ((unsigned long long)(batch * kv_run + pos)) * 576u + c * 8u);
-            }
-            *reinterpret_cast<uint4*>(&k_smem[r * 576u + c * 8u]) = dst;
-        }
-        #pragma unroll 4
-        for (unsigned int i = tid; i < 32u * 64u; i += 128u) {
-            const unsigned int r = i / 64u;
-            const unsigned int c = i % 64u;
-            const unsigned int pos = tile_start + r;
-            uint4 dst = make_uint4(0u, 0u, 0u, 0u);
-            if (pos < kv_run) {
-                dst = *reinterpret_cast<const uint4*>(
-                    V + ((unsigned long long)(batch * kv_run + pos)) * 512u + c * 8u);
-            }
-            *reinterpret_cast<uint4*>(&v_smem[r * 512u + c * 8u]) = dst;
-        }
-        __syncthreads();
-
         // --- QK^T (4 warps; warp w covers tile cols [w*8, w*8+8)) ---
         float acc_s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         {
             const unsigned short* q_u16 = reinterpret_cast<const unsigned short*>(q_smem);
-            const unsigned short* k_u16 = reinterpret_cast<const unsigned short*>(k_smem);
+            const unsigned short* k_u16 = reinterpret_cast<const unsigned short*>(K);
             const unsigned int n_col = warp * 8u + group_id;
+            // K row this warp's n-tile reads (0..31 within the tile). Rows
+            // past kv_run are skipped; their scores are masked downstream.
+            const unsigned int k_row = tile_start + n_col;
+            const bool k_row_ok = k_row < kv_run;
+            const unsigned int k_row_c = min(k_row, kv_run - 1u);
+            const unsigned long long k_row_off =
+                ((unsigned long long)(batch * kv_run + k_row_c)) * 576u;
             #pragma unroll 4
             for (unsigned int kc = 0; kc < 36u; ++kc) {
                 const unsigned int k_base = kc * 16u;
@@ -737,14 +723,13 @@ extern "C" __global__ void ling_mla_prefill_attn_mma(
                     *reinterpret_cast<const unsigned int*>(&q_u16[group_id * 576u + ac1]);
                 const unsigned int a3 =
                     *reinterpret_cast<const unsigned int*>(&q_u16[(group_id + 8u) * 576u + ac1]);
-                const unsigned int k0 = k_base + tid_in_group * 2u;
-                const unsigned int k1 = k0 + 8u;
-                const unsigned int b0 =
-                    ((unsigned int)k_u16[n_col * 576u + k0 + 1u] << 16) |
-                    (unsigned int)k_u16[n_col * 576u + k0];
-                const unsigned int b1 =
-                    ((unsigned int)k_u16[n_col * 576u + k1 + 1u] << 16) |
-                    (unsigned int)k_u16[n_col * 576u + k1];
+                unsigned int b0 = 0u, b1 = 0u;
+                if (k_row_ok) {
+                    b0 = *reinterpret_cast<const unsigned int*>(
+                        &k_u16[k_row_off + k_base + tid_in_group * 2u]);
+                    b1 = *reinterpret_cast<const unsigned int*>(
+                        &k_u16[k_row_off + k_base + tid_in_group * 2u + 8u]);
+                }
                 asm volatile(
                     "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
@@ -812,13 +797,39 @@ extern "C" __global__ void ling_mla_prefill_attn_mma(
         }
         {
             const unsigned short* p_u16 = reinterpret_cast<const unsigned short*>(p_smem);
-            const unsigned short* v_u16 = reinterpret_cast<const unsigned short*>(v_smem);
+            const unsigned short* v_u16 = reinterpret_cast<const unsigned short*>(V);
             #pragma unroll 1
             for (unsigned int nt = 0; nt < 16u; ++nt) {
                 const unsigned int vdim = warp * 128u + nt * 8u + group_id;
                 #pragma unroll
                 for (unsigned int ks = 0; ks < 2u; ++ks) {
                     const unsigned int k_off = ks * 16u;
+                    const unsigned int k0 = k_off + tid_in_group * 2u;
+                    const unsigned int k1 = k0 + 8u;
+                    const unsigned int g_k0 = tile_start + k0;
+                    const unsigned int g_k1 = tile_start + k1;
+                    const bool ok0 = g_k0 < kv_run;
+                    const bool ok1 = (g_k0 + 1u) < kv_run;
+                    const bool ok2 = g_k1 < kv_run;
+                    const bool ok3 = (g_k1 + 1u) < kv_run;
+                    // Clamp addresses for rows past kv_run; the values are
+                    // discarded by the ok-predicates, only the address needs
+                    // to stay in bounds.
+                    const unsigned int g_k0c = min(g_k0, kv_run - 1u);
+                    const unsigned int g_k1c = min(g_k1, kv_run - 1u);
+                    const unsigned short* v_base =
+                        v_u16 + ((unsigned long long)(batch * kv_run + g_k0c)) * 512u + vdim;
+                    const unsigned short* v_base1 =
+                        v_u16 + ((unsigned long long)(batch * kv_run + min(g_k0 + 1u, kv_run - 1u))) * 512u + vdim;
+                    const unsigned short* v_base2 =
+                        v_u16 + ((unsigned long long)(batch * kv_run + g_k1c)) * 512u + vdim;
+                    const unsigned short* v_base3 =
+                        v_u16 + ((unsigned long long)(batch * kv_run + min(g_k1 + 1u, kv_run - 1u))) * 512u + vdim;
+                    unsigned int b0 = 0u, b1 = 0u;
+                    if (ok0) b0 |= (unsigned int)v_base[0];
+                    if (ok1) b0 |= (unsigned int)v_base1[0] << 16;
+                    if (ok2) b1 |= (unsigned int)v_base2[0];
+                    if (ok3) b1 |= (unsigned int)v_base3[0] << 16;
                     const unsigned int ac0 = k_off + tid_in_group * 2u;
                     const unsigned int ac1 = ac0 + 8u;
                     const unsigned int a0 =
@@ -829,14 +840,6 @@ extern "C" __global__ void ling_mla_prefill_attn_mma(
                         *reinterpret_cast<const unsigned int*>(&p_u16[group_id * 32u + ac1]);
                     const unsigned int a3 =
                         *reinterpret_cast<const unsigned int*>(&p_u16[(group_id + 8u) * 32u + ac1]);
-                    const unsigned int k0 = k_off + tid_in_group * 2u;
-                    const unsigned int k1 = k0 + 8u;
-                    const unsigned int b0 =
-                        ((unsigned int)v_u16[(k0 + 1u) * 512u + vdim] << 16) |
-                        (unsigned int)v_u16[k0 * 512u + vdim];
-                    const unsigned int b1 =
-                        ((unsigned int)v_u16[(k1 + 1u) * 512u + vdim] << 16) |
-                        (unsigned int)v_u16[k1 * 512u + vdim];
                     asm volatile(
                         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                         "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
