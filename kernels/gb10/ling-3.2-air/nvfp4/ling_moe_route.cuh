@@ -65,16 +65,9 @@ __device__ __forceinline__ void ling_route_topk_row(
     const unsigned int lane = threadIdx.x % 32u;
     const unsigned int k = top_k;
 
-    // The fused launcher's winner CTA reads the router CTAs' logits through
-    // L2 (`__ldcg`): they were written by other CTAs of the same launch.
-    for (unsigned int i = lane; i < E; i += 32u) {
-        const float logit = __ldcg(logits_row + i);
-        const float s = 1.0f / (1.0f + __expf(-logit));
-        sig[i] = s;
-        sel[i] = s + s_bias[i];
-    }
-    __syncwarp();
-
+    // Dead rows contribute nothing downstream; skip the sigmoid/bias build
+    // and the selection scan entirely. The ids are dead (E) and the
+    // weights exactly 0 so the row sorts to the tail partition.
     if (row_live != nullptr && row_live[row] == 0u) {
         if (lane == 0) {
             for (unsigned int t = 0; t < k; ++t) {
@@ -85,6 +78,25 @@ __device__ __forceinline__ void ling_route_topk_row(
         __syncwarp();
         return;
     }
+
+    // The fused launcher's winner CTA reads the router CTAs' logits through
+    // L2 (`__ldcg`): they were written by other CTAs of the same launch.
+    // Loads are 16-byte aligned (E is a multiple of 32), stored as float4.
+    #pragma unroll 4
+    for (unsigned int i = lane * 4u; i < E; i += 128u) {
+        const float4 logit4 = __ldcg((const float4*)(logits_row + i));
+        const float4 bias4 = *(const float4*)(s_bias + i);
+        const float* ln = (const float*)&logit4;
+        const float* bn = (const float*)&bias4;
+        #pragma unroll
+        for (unsigned int j = 0; j < 4u; ++j) {
+            // Same sigmoid arithmetic as the scalar form, per element.
+            const float sg = 1.0f / (1.0f + __expf(-ln[j]));
+            sig[i + j] = sg;
+            sel[i + j] = sg + bn[j];
+        }
+    }
+    __syncwarp();
 
     // Group scores: sum of the top-2 selection scores inside each group
     // (group_limited_topk's `topk(2).sum`), one group at a time, each lane
@@ -102,10 +114,11 @@ __device__ __forceinline__ void ling_route_topk_row(
         gsel[g] = m1 + m2;
     }
 
-    // Lane 0 picks the top `topk_group` groups (ties -> lowest group index)
-    // and masks the experts of the rest out of the selection scan.
+    // Lane 0 picks the top `topk_group` groups (ties -> lowest group index);
+    // the picked mask is broadcast and the non-picked groups are masked out
+    // of the selection scan by all lanes in parallel.
+    unsigned int picked = 0u;
     if (lane == 0) {
-        unsigned int picked = 0u;
         for (unsigned int t = 0; t < topk_group; ++t) {
             unsigned int best_g = 0u;
             float best = -1e30f;
@@ -116,9 +129,14 @@ __device__ __forceinline__ void ling_route_topk_row(
                 }
             picked |= (1u << best_g);
         }
-        for (unsigned int g = 0; g < n_group; ++g)
-            if (!(picked & (1u << g)))
-                for (unsigned int j = 0; j < gsize; ++j) sel[g * gsize + j] = -1e30f;
+    }
+    picked = __shfl_sync(0xFFFFFFFFu, picked, 0u);
+    const unsigned int deadmask = ~picked & ((n_group >= 32u) ? 0xFFFFFFFFu : ((1u << n_group) - 1u));
+    for (unsigned int g = 0; g < n_group; ++g) {
+        if (deadmask & (1u << g)) {
+            for (unsigned int j = lane; j < gsize; j += 32u)
+                sel[g * gsize + j] = -1e30f;
+        }
     }
     __syncwarp();
 
@@ -129,8 +147,10 @@ __device__ __forceinline__ void ling_route_topk_row(
     for (unsigned int t = 0; t < k && t < E; ++t) {
         float best = -1e30f;
         unsigned int at = 0;
-        for (unsigned int i = lane; i < E; i += 32u) {
-            const float v = sel[i];
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const unsigned int i = lane + 32u * (unsigned int)j;
+            const float v = (i < E) ? sel[i] : -1e30f;
             if (v > best) { best = v; at = i; }
         }
         #pragma unroll

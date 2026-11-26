@@ -107,7 +107,39 @@ extern "C" __global__ void __launch_bounds__(256) ling_moe_route(
         const unsigned int e = blockIdx.x * 8u + warp;
         if (e < E) {
             const float* __restrict__ w = gate_w + (unsigned long long)e * K;
-            for (unsigned int r = 0; r < M; ++r) {
+            // Rows are processed in blocks of 16: one weight float4 load
+            // amortized over 16 independent row accumulators (ILP), each row
+            // keeping the exact fp32 warp-sliced accumulation order of the
+            // per-row loop below.
+            const unsigned int rb = M / 16u;
+            for (unsigned int r0 = 0u; r0 < rb * 16u; r0 += 16u) {
+                float acc[16] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+                const __nv_bfloat16* __restrict__ x = A + (unsigned long long)r0 * K;
+                for (unsigned int k0 = lane * 4u; k0 < K; k0 += 128u) {
+                    const float4 wv = *(const float4*)(w + k0);
+                    #pragma unroll
+                    for (int j = 0; j < 16; ++j) {
+                        const uint2 xv = *(const uint2*)(x + (unsigned long long)j * K + k0);
+                        const __nv_bfloat16* xb = (const __nv_bfloat16*)&xv;
+                        acc[j] += __bfloat162float(xb[0]) * wv.x
+                               + __bfloat162float(xb[1]) * wv.y
+                               + __bfloat162float(xb[2]) * wv.z
+                               + __bfloat162float(xb[3]) * wv.w;
+                    }
+                }
+                #pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    float a = acc[j];
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1)
+                        a += __shfl_xor_sync(0xFFFFFFFFu, a, off);
+                    if (lane == 0u)
+                        logits[(unsigned long long)(r0 + j) * E + e] = a;
+                }
+            }
+            // Tail rows (M not a multiple of 16), same arithmetic per row.
+            for (unsigned int r = rb * 16u; r < M; ++r) {
                 const __nv_bfloat16* __restrict__ x = A + (unsigned long long)r * K;
                 float acc = 0.0f;
                 for (unsigned int k0 = lane * 4u; k0 < K; k0 += 128u) {
@@ -148,9 +180,9 @@ extern "C" __global__ void __launch_bounds__(256) ling_moe_route(
     __threadfence();
 
     // ── Selection: 8 warps, a row each ────────────────────────────────────
-    __shared__ float s_sig[LMOE_ROUTE_WARPS][LMOE_ROUTE_MAX_E];
-    __shared__ float s_sel[LMOE_ROUTE_WARPS][LMOE_ROUTE_MAX_E];
-    __shared__ float s_bias[LMOE_ROUTE_MAX_E];
+    __shared__ __align__(16) float s_sig[LMOE_ROUTE_WARPS][LMOE_ROUTE_MAX_E];
+    __shared__ __align__(16) float s_sel[LMOE_ROUTE_WARPS][LMOE_ROUTE_MAX_E];
+    __shared__ __align__(16) float s_bias[LMOE_ROUTE_MAX_E];
     for (unsigned int i = t; i < E; i += 256u) s_bias[i] = __ldcg(bias + i);
     __syncthreads();
     const unsigned int warp = t / 32u;
@@ -164,11 +196,25 @@ extern "C" __global__ void __launch_bounds__(256) ling_moe_route(
     // ── Sort: counting sort over the (row, slot) assignments ──────────────
     __shared__ unsigned int s_cnt[LMOE_ROUTE_MAX_E];
     __shared__ unsigned int s_cur[LMOE_ROUTE_MAX_E];
+    const unsigned int slots = M * top_k;
+    // Stage the ids in smem (the selection phase's s_sel is dead by now) so
+    // the counting and serial assignment loops read smem, not global. Only
+    // fits 16 KiB (4096 ids): fall back to the global reads otherwise.
+    const bool staged = slots <= (unsigned int)(LMOE_ROUTE_WARPS * LMOE_ROUTE_MAX_E);
+    if (staged) {
+        unsigned int* s_ids = reinterpret_cast<unsigned int*>(&s_sel[0][0]);
+        for (unsigned int i = t; i < slots; i += 256u) s_ids[i] = topk_ids[i];
+    }
     for (unsigned int e = t; e < E; e += 256u) s_cnt[e] = 0u;
     __syncthreads();
-    const unsigned int slots = M * top_k;
-    for (unsigned int i = t; i < slots; i += 256u)
-        if (topk_ids[i] < E) atomicAdd(&s_cnt[topk_ids[i]], 1u);
+    if (staged) {
+        const unsigned int* s_ids = reinterpret_cast<const unsigned int*>(&s_sel[0][0]);
+        for (unsigned int i = t; i < slots; i += 256u)
+            if (s_ids[i] < E) atomicAdd(&s_cnt[s_ids[i]], 1u);
+    } else {
+        for (unsigned int i = t; i < slots; i += 256u)
+            if (topk_ids[i] < E) atomicAdd(&s_cnt[topk_ids[i]], 1u);
+    }
     __syncthreads();
 
     if (t == 0u) {
@@ -180,14 +226,33 @@ extern "C" __global__ void __launch_bounds__(256) ling_moe_route(
             run += s_cnt[e];
         }
         expert_offsets[E] = (int)run;
-        for (unsigned int s = 0; s < slots; ++s) {
-            const unsigned int e = topk_ids[s];
-            if (e < E) {
-                const unsigned int p = s_cur[e]++;
-                sorted_token_ids[p] = (int)(s / top_k);
-                token_to_perm[s] = (int)p;
-            } else {
-                token_to_perm[s] = (int)(run + dead++);
+        // Track row = s / top_k incrementally (the compiler cannot turn the
+        // runtime-divisor division into a shift); the outputs are unchanged.
+        unsigned int row = 0u, row_pos = 0u;
+        if (staged) {
+            const unsigned int* s_ids = reinterpret_cast<const unsigned int*>(&s_sel[0][0]);
+            for (unsigned int s = 0; s < slots; ++s) {
+                const unsigned int e = s_ids[s];
+                if (e < E) {
+                    const unsigned int p = s_cur[e]++;
+                    sorted_token_ids[p] = (int)row;
+                    token_to_perm[s] = (int)p;
+                } else {
+                    token_to_perm[s] = (int)(run + dead++);
+                }
+                if (++row_pos >= top_k) { row_pos = 0u; ++row; }
+            }
+        } else {
+            for (unsigned int s = 0; s < slots; ++s) {
+                const unsigned int e = topk_ids[s];
+                if (e < E) {
+                    const unsigned int p = s_cur[e]++;
+                    sorted_token_ids[p] = (int)row;
+                    token_to_perm[s] = (int)p;
+                } else {
+                    token_to_perm[s] = (int)(run + dead++);
+                }
+                if (++row_pos >= top_k) { row_pos = 0u; ++row; }
             }
         }
         // Worklist: (expert, mt) per m_tile rows; grid.x of the expert
