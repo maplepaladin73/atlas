@@ -2,9 +2,10 @@
 
 # Ling-3.2-air: MLA prefill fast path — assessment
 
-Status: assessment / roadmap. The scalar-load vectorization (the first item
-below) lands with its own PR; the tensor-core rewrite is explicitly NOT in
-this document's scope to land in one session.
+Status: assessment / roadmap. Scalar-load vectorization landed (PR #141,
+default-on); the tensor-core rewrite below lands with this PR as an
+env-gated opt-in (`ATLAS_LING_MLA_PREFILL_MMA=1`), NOT as a default flip —
+its measured win at this shape is modest, so it ships behind the flag.
 
 ## Where prefill time goes (GB10, #130/#131/#139 posture)
 
@@ -58,16 +59,38 @@ contiguous elements as 8B uint2 slices, which preserves the scalar FMA order
 bit-for-bit). Option B is the one big remaining prefill win and is the
 scoping target for the next slice. Option C is a fallback if A under-delivers.
 
+## Option B landed — env-gated (this PR)
+
+Status: **landed as a flag-gated opt-in, NOT as a default flip.**
+
+- New `ling_mla_prefill_attn_mma` in gated_mla.cu (same signature, grid
+  and arg order as the scalar kernel): 128 threads (4 warps), 16-row
+  CTA tiles against 32-row KV tiles. QK^T and PV are mma.m16n8k16 flash
+  attention (bf16 in/f32 out), no ldmatrix (SM121 manual fragments, the
+  house workaround), no cp.async. Online-softmax bookkeeping (m/l/alpha,
+  per-row limit masking for causal and partial tiles) is identical in
+  arithmetic to the scalar kernel's.
+- Dispatch: `ATLAS_LING_MLA_PREFILL_MMA=1` flips `prefill_attn_contig`
+  to this kernel (128-thread block); every other lane is unchanged.
+- Kept default-off: measured wall-clock improvement at 2638-token prompt
+  on the f341 dev box was ~6% (4.17-4.29 s vs 4.45-4.46 s), not the 3-5x
+  the kernel-level estimate suggested — the scalar kernel is fast at
+  these shapes and the launch overheads/L2 behaviour dominate at this
+  concurrency. The mma lane should be re-measured on longer prompts
+  (4k-16k) before any default flip, and it stays parity-gated (harness
+  + e2e oracle) regardless.
+- Verified: `mla_layer5_prefill_fast_parity` 25 stage checks CLEAN (mma
+  env on), `bailing_e2e_oracle_parity` PASS (~295 s, same layer-3
+  baseline ULP signature), 2553 unit tests green.
+
 ## Recommended sequence
 
 1. Option A (this PR's subject): land the uint2 vectorization, verify
    mla_layer5_prefill_fast_parity green + serve smoke.
-2. Option B (multi-day slice): new flash-attention-style kernel alongside the
-   existing one, parity harness extension for the packed shape
-   (mla_layer5_prefill_fast_parity already exercises the contiguous
-   path; a packed-context parity harness is needed for the mma form), then
-   e2e oracle in all three arms (eager/captured/staged), kernel audit
-   unresolved:0, then enable behind the default flag.
+2. Option B follow-up (measurement, not wiring): compare mma vs scalar at
+   ISL 4096 and beyond; enable the default flip only if the win is real
+   (harness and e2e oracle green already; prefer a default flip once
+   ISL 16k+ is better). Do not flip on a 6% win.
 3. Re-measure ISL 4096 prefill after each step; decide whether the next
    target is 2nd-largest hotspot (ling_moe_route ~1.3 s @ 4096) or pool/
    scheduler overheads.
