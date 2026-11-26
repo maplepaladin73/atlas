@@ -419,3 +419,7 @@ required-features = ["cuda", "gpu-examples"]
 [[example]]
 name = "mla_prefill_attn_bench"
 required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "moe_route_bench"
+required-features = ["cuda", "gpu-examples"]
