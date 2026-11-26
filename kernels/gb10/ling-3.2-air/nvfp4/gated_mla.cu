@@ -612,6 +612,276 @@ extern "C" __global__ void ling_mla_prefill_attn(
     }
 }
 
+// ----------------------------------------------------------------------------
+// Tensor-core (mma.m16n8k16, bf16) prefill attention — same layout and
+// signature as `ling_mla_prefill_attn`. Kept as a separate entry so the
+// proven scalar kernel stays the default; env ATLAS_LING_MLA_PREFILL_MMA=1
+// flips the dispatch (see `prefill_attn_contig` in mla.rs).
+//
+// Grid: (heads, ceil(seq_len / 16), 1)   Block: (128, 1, 1)
+//
+// CTA = 16 query rows (one m-tile) against 32-row KV tiles. The four warps
+// split the 32-wide score tile into 8-column n-tiles for QK^T and the
+// 512-dim V axis into 128-column quarters for the PV pass. Score/softmax
+// are shadowed in smem; P is stored bf16 for the PV mma.
+//
+// Fragment layout mirrors the house SM121 workaround (no ldmatrix):
+//   group_id = lane >> 2 (rows 0..7 / cols 0..7), tid_in_group = lane & 3.
+// ----------------------------------------------------------------------------
+extern "C" __global__ void ling_mla_prefill_attn_mma(
+    const __nv_bfloat16* __restrict__ Q,
+    const __nv_bfloat16* __restrict__ K,
+    const __nv_bfloat16* __restrict__ V,
+    __nv_bfloat16* __restrict__ O,
+    const unsigned int seq_len,
+    const unsigned int causal,
+    const float inv_sqrt_d,
+    const unsigned int kv_base
+) {
+    atlas_pdl_enter();
+    const unsigned int head = blockIdx.x;
+    const unsigned int q_block = blockIdx.y;
+    const unsigned int batch = blockIdx.z;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5;
+    const unsigned int group_id = lane >> 2;
+    const unsigned int tid_in_group = lane & 3;
+
+    const unsigned int q_row0 = q_block * 16u;
+    const unsigned int kv_run = kv_base + seq_len;
+
+    __shared__ __nv_bfloat16 q_smem[16u * 576u];
+    __shared__ __nv_bfloat16 k_smem[32u * 576u];
+    __shared__ __nv_bfloat16 v_smem[32u * 512u];
+    __shared__ float score_smem[16u * 32u];
+    __shared__ __nv_bfloat16 p_smem[16u * 32u];
+    // per-row m_new, l_prev, alpha (slot 3 unused)
+    __shared__ float ml_smem[16u * 4u];
+
+    // --- Q tile: [16 rows][576], zero-filled for rows >= seq_len ---
+    {
+        #pragma unroll 4
+        for (unsigned int i = tid; i < 16u * 72u; i += 128u) {
+            const unsigned int r = i / 72u;
+            const unsigned int c = i % 72u;
+            const unsigned int q_row = q_row0 + r;
+            uint4 dst = make_uint4(0u, 0u, 0u, 0u);
+            if (q_row < seq_len) {
+                const __nv_bfloat16* src =
+                    Q + ((unsigned long long)(batch * seq_len + q_row) * gridDim.x + head) * 576u + c * 8u;
+                dst = *reinterpret_cast<const uint4*>(src);
+            }
+            *reinterpret_cast<uint4*>(&q_smem[r * 576u + c * 8u]) = dst;
+        }
+    }
+    if (tid < 16u) {
+        ml_smem[tid * 4u + 0] = -1e30f;
+        ml_smem[tid * 4u + 1] = 0.0f;
+    }
+    __syncthreads();
+
+    float o_acc[64];
+    #pragma unroll
+    for (unsigned int i = 0; i < 64u; ++i) o_acc[i] = 0.0f;
+
+    // CTA-wide KV loop bound: the highest valid row's causal limit.
+    const unsigned int q_row_hi = min(q_row0 + 15u, seq_len - 1u);
+    const unsigned int kv_limit =
+        causal ? (kv_base + q_row_hi + 1u) : kv_run;
+
+    for (unsigned int tile_start = 0u; tile_start < kv_limit; tile_start += 32u) {
+        // --- cooperatively load the K/V tiles (zeros past kv_run) ---
+        #pragma unroll 4
+        for (unsigned int i = tid; i < 32u * 72u; i += 128u) {
+            const unsigned int r = i / 72u;
+            const unsigned int c = i % 72u;
+            const unsigned int pos = tile_start + r;
+            uint4 dst = make_uint4(0u, 0u, 0u, 0u);
+            if (pos < kv_run) {
+                dst = *reinterpret_cast<const uint4*>(
+                    K + ((unsigned long long)(batch * kv_run + pos)) * 576u + c * 8u);
+            }
+            *reinterpret_cast<uint4*>(&k_smem[r * 576u + c * 8u]) = dst;
+        }
+        #pragma unroll 4
+        for (unsigned int i = tid; i < 32u * 64u; i += 128u) {
+            const unsigned int r = i / 64u;
+            const unsigned int c = i % 64u;
+            const unsigned int pos = tile_start + r;
+            uint4 dst = make_uint4(0u, 0u, 0u, 0u);
+            if (pos < kv_run) {
+                dst = *reinterpret_cast<const uint4*>(
+                    V + ((unsigned long long)(batch * kv_run + pos)) * 512u + c * 8u);
+            }
+            *reinterpret_cast<uint4*>(&v_smem[r * 512u + c * 8u]) = dst;
+        }
+        __syncthreads();
+
+        // --- QK^T (4 warps; warp w covers tile cols [w*8, w*8+8)) ---
+        float acc_s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        {
+            const unsigned short* q_u16 = reinterpret_cast<const unsigned short*>(q_smem);
+            const unsigned short* k_u16 = reinterpret_cast<const unsigned short*>(k_smem);
+            const unsigned int n_col = warp * 8u + group_id;
+            #pragma unroll 4
+            for (unsigned int kc = 0; kc < 36u; ++kc) {
+                const unsigned int k_base = kc * 16u;
+                const unsigned int ac0 = k_base + tid_in_group * 2u;
+                const unsigned int ac1 = ac0 + 8u;
+                const unsigned int a0 =
+                    *reinterpret_cast<const unsigned int*>(&q_u16[group_id * 576u + ac0]);
+                const unsigned int a1 =
+                    *reinterpret_cast<const unsigned int*>(&q_u16[(group_id + 8u) * 576u + ac0]);
+                const unsigned int a2 =
+                    *reinterpret_cast<const unsigned int*>(&q_u16[group_id * 576u + ac1]);
+                const unsigned int a3 =
+                    *reinterpret_cast<const unsigned int*>(&q_u16[(group_id + 8u) * 576u + ac1]);
+                const unsigned int k0 = k_base + tid_in_group * 2u;
+                const unsigned int k1 = k0 + 8u;
+                const unsigned int b0 =
+                    ((unsigned int)k_u16[n_col * 576u + k0 + 1u] << 16) |
+                    (unsigned int)k_u16[n_col * 576u + k0];
+                const unsigned int b1 =
+                    ((unsigned int)k_u16[n_col * 576u + k1 + 1u] << 16) |
+                    (unsigned int)k_u16[n_col * 576u + k1];
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                    : "+f"(acc_s[0]), "+f"(acc_s[1]), "+f"(acc_s[2]), "+f"(acc_s[3])
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            }
+            #pragma unroll
+            for (unsigned int i = 0; i < 4u; ++i) acc_s[i] *= inv_sqrt_d;
+        }
+        {
+            // float2 pairs: cols tid_in_group*2 and +1 within the warp's n-tile
+            const unsigned int base = warp * 8u + tid_in_group * 2u;
+            *reinterpret_cast<float2*>(&score_smem[group_id * 32u + base]) =
+                make_float2(acc_s[0], acc_s[1]);
+            *reinterpret_cast<float2*>(&score_smem[(group_id + 8u) * 32u + base]) =
+                make_float2(acc_s[2], acc_s[3]);
+        }
+        __syncthreads();
+
+        // --- online softmax; writes P (bf16) to smem; warp 0, lanes 0-15 ---
+        if (warp == 0 && lane < 16u) {
+            const unsigned int row = lane;
+            const unsigned int q_row = q_row0 + row;
+            const bool row_valid = q_row < seq_len;
+            const unsigned int limit =
+                causal ? (kv_base + q_row + 1u) : kv_run;
+            float rmax = -1e30f;
+            #pragma unroll 4
+            for (unsigned int c = 0; c < 32u; ++c) {
+                const unsigned int pos = tile_start + c;
+                const bool valid = row_valid && (pos < limit);
+                rmax = fmaxf(rmax, valid ? score_smem[row * 32u + c] : -1e30f);
+            }
+            const float m_prev = ml_smem[row * 4u + 0];
+            const float m_new = fmaxf(m_prev, rmax);
+            const float alpha = __expf(m_prev - m_new);
+            const float l_prev = ml_smem[row * 4u + 1];
+            float l_tile = 0.0f;
+            #pragma unroll 4
+            for (unsigned int c = 0; c < 32u; ++c) {
+                const unsigned int pos = tile_start + c;
+                const bool valid = row_valid && (pos < limit);
+                const float p =
+                    valid ? __expf(score_smem[row * 32u + c] - m_new) : 0.0f;
+                p_smem[row * 32u + c] = __float2bfloat16(p);
+                l_tile += p;
+            }
+            ml_smem[row * 4u + 0] = m_new;
+            ml_smem[row * 4u + 1] = alpha * l_prev + l_tile;
+            ml_smem[row * 4u + 2] = alpha;
+        }
+        __syncthreads();
+
+        // --- rescale running accumulator, then PV mma (all warps) ---
+        {
+            const float alpha0 = ml_smem[group_id * 4u + 2];
+            const float alpha1 = ml_smem[(group_id + 8u) * 4u + 2];
+            #pragma unroll
+            for (unsigned int nt = 0; nt < 16u; ++nt) {
+                o_acc[nt * 4u + 0] = alpha0 * o_acc[nt * 4u + 0];
+                o_acc[nt * 4u + 1] = alpha0 * o_acc[nt * 4u + 1];
+                o_acc[nt * 4u + 2] = alpha1 * o_acc[nt * 4u + 2];
+                o_acc[nt * 4u + 3] = alpha1 * o_acc[nt * 4u + 3];
+            }
+        }
+        {
+            const unsigned short* p_u16 = reinterpret_cast<const unsigned short*>(p_smem);
+            const unsigned short* v_u16 = reinterpret_cast<const unsigned short*>(v_smem);
+            #pragma unroll 1
+            for (unsigned int nt = 0; nt < 16u; ++nt) {
+                const unsigned int vdim = warp * 128u + nt * 8u + group_id;
+                #pragma unroll
+                for (unsigned int ks = 0; ks < 2u; ++ks) {
+                    const unsigned int k_off = ks * 16u;
+                    const unsigned int ac0 = k_off + tid_in_group * 2u;
+                    const unsigned int ac1 = ac0 + 8u;
+                    const unsigned int a0 =
+                        *reinterpret_cast<const unsigned int*>(&p_u16[group_id * 32u + ac0]);
+                    const unsigned int a1 =
+                        *reinterpret_cast<const unsigned int*>(&p_u16[(group_id + 8u) * 32u + ac0]);
+                    const unsigned int a2 =
+                        *reinterpret_cast<const unsigned int*>(&p_u16[group_id * 32u + ac1]);
+                    const unsigned int a3 =
+                        *reinterpret_cast<const unsigned int*>(&p_u16[(group_id + 8u) * 32u + ac1]);
+                    const unsigned int k0 = k_off + tid_in_group * 2u;
+                    const unsigned int k1 = k0 + 8u;
+                    const unsigned int b0 =
+                        ((unsigned int)v_u16[(k0 + 1u) * 512u + vdim] << 16) |
+                        (unsigned int)v_u16[k0 * 512u + vdim];
+                    const unsigned int b1 =
+                        ((unsigned int)v_u16[(k1 + 1u) * 512u + vdim] << 16) |
+                        (unsigned int)v_u16[k1 * 512u + vdim];
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                        : "+f"(o_acc[nt * 4u + 0]), "+f"(o_acc[nt * 4u + 1]),
+                          "+f"(o_acc[nt * 4u + 2]), "+f"(o_acc[nt * 4u + 3])
+                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // --- final write: rows [0,16) of this CTA, all warps split V dims ---
+    {
+        const float l0 = ml_smem[group_id * 4u + 1];
+        const float l1 = ml_smem[(group_id + 8u) * 4u + 1];
+        const float inv_l0 = (l0 > 0.0f) ? 1.0f / l0 : 0.0f;
+        const float inv_l1 = (l1 > 0.0f) ? 1.0f / l1 : 0.0f;
+        const unsigned int q_rowA = q_row0 + group_id;
+        const unsigned int q_rowB = q_row0 + group_id + 8u;
+        #pragma unroll
+        for (unsigned int nt = 0; nt < 16u; ++nt) {
+            const unsigned int col0 = warp * 128u + nt * 8u + tid_in_group * 2u;
+            if (q_rowA < seq_len) {
+                const unsigned int lo =
+                    (unsigned int)__bfloat16_as_ushort(__float2bfloat16(o_acc[nt * 4u + 0] * inv_l0));
+                const unsigned int hi =
+                    (unsigned int)__bfloat16_as_ushort(__float2bfloat16(o_acc[nt * 4u + 1] * inv_l0));
+                *reinterpret_cast<unsigned int*>(
+                    O + ((unsigned long long)(batch * seq_len + q_rowA) * gridDim.x + head) * 512u + col0) =
+                    lo | (hi << 16);
+            }
+            if (q_rowB < seq_len) {
+                const unsigned int lo =
+                    (unsigned int)__bfloat16_as_ushort(__float2bfloat16(o_acc[nt * 4u + 2] * inv_l1));
+                const unsigned int hi =
+                    (unsigned int)__bfloat16_as_ushort(__float2bfloat16(o_acc[nt * 4u + 3] * inv_l1));
+                *reinterpret_cast<unsigned int*>(
+                    O + ((unsigned long long)(batch * seq_len + q_rowB) * gridDim.x + head) * 512u + col0) =
+                    lo | (hi << 16);
+            }
+        }
+    }
+}
+
 // Refill the packed prefill context's prefix rows [0, rows) from the paged
 // pools, through the block table the paged attention path itself walks: row
 // `pos`'s physical pool row is table[pos / block_size] * block_size +

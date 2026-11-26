@@ -57,6 +57,10 @@ pub(crate) struct LingKernels {
     pub mla_paged_attn_k: KernelHandle,
     pub mla_v_gated_k: KernelHandle,
     pub mla_prefill_attn_k: KernelHandle,
+    /// Tensor-core (mma) variant of the same prefill attention — only
+    /// launched when `ATLAS_LING_MLA_PREFILL_MMA=1` (default off; scalar
+    /// stays the parity-proven default).
+    pub mla_prefill_attn_mma_k: KernelHandle,
     /// `ling_mla_ctx_gather`: copies a sequence's cached prefix rows from
     /// the paged pools into the layer's contiguous prefill context so a
     /// continuing chunk can run `ling_mla_prefill_attn` over prefix+chunk.
@@ -123,6 +127,7 @@ impl LingKernels {
             mla_paged_attn_k: required(gpu, "gated_mla", "ling_mla_paged_attn")?,
             mla_v_gated_k: required(gpu, "gated_mla", "ling_mla_v_extract_gated")?,
             mla_prefill_attn_k: required(gpu, "gated_mla", "ling_mla_prefill_attn")?,
+            mla_prefill_attn_mma_k: required(gpu, "gated_mla", "ling_mla_prefill_attn_mma")?,
             mla_ctx_gather_k: required(gpu, "gated_mla", "ling_mla_ctx_gather")?,
             moe_route_k: required(gpu, "moe_decode", "ling_moe_route")?,
             moe_gate_up_k: required(gpu, "moe_decode", "ling_moe_gate_up_silu")?,

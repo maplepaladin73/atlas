@@ -599,9 +599,18 @@ impl LingMlaLayer {
     ) -> Result<()> {
         let s = &self.scratch;
         let k = &self.kernels;
-        KernelLaunch::new(gpu, k.mla_prefill_attn_k)
+        // Optional tensor-core lane (default off): the mma kernel shares the
+        // scalar kernel's launch contract (grid, arg order), differing only
+        // in block size (128 threads = 4 warps).
+        let use_mma = std::env::var("ATLAS_LING_MLA_PREFILL_MMA").as_deref() == Ok("1");
+        let (kernel, block) = if use_mma {
+            (k.mla_prefill_attn_mma_k, 128u32)
+        } else {
+            (k.mla_prefill_attn_k, 256u32)
+        };
+        KernelLaunch::new(gpu, kernel)
             .grid([self.heads, div_ceil(seq_len, 16), 1])
-            .block([256, 1, 1])
+            .block([block, 1, 1])
             .arg_ptr(s.mla_q_final)
             .arg_ptr(k_ctx)
             .arg_ptr(v_ctx)
