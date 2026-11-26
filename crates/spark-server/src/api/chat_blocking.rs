@@ -20,6 +20,7 @@ use crate::tool_parser;
 use super::chat_blocking_choice::{build_choice_message, build_logprobs, native_opener_opens_call};
 use super::compact::openai_error_response;
 use super::inference_impl::{extract_thinking, strip_stop_sequences};
+use super::inference_repair::{disable_mtp_for_tools_gate_on, tools_gate_disable_mtp};
 use super::inference_types::{GrammarSpec, InferenceRequest};
 
 pub(super) struct BlockingPathArgs {
@@ -169,7 +170,11 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             require_tool_call: tool_choice_required,
             tools_present: tools_active,
             suppress_tool_call,
-            disable_mtp: req.disable_mtp,
+            disable_mtp: tools_gate_disable_mtp(
+                tools_active,
+                req.disable_mtp,
+                disable_mtp_for_tools_gate_on(),
+            ),
             grammar_spec: grammar_spec.clone(),
             seed: req.seed.map(|s| s.wrapping_add(choice_idx as u64)),
             top_logprobs,

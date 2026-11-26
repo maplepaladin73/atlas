@@ -16,6 +16,7 @@ use crate::tool_parser;
 
 use super::chat_stream::run_chat_stream;
 use super::compact::openai_error_response;
+use super::inference_repair::{disable_mtp_for_tools_gate_on, tools_gate_disable_mtp};
 use super::inference_types::GrammarSpec;
 
 pub(super) async fn dispatch_streaming(
@@ -95,7 +96,11 @@ pub(super) async fn dispatch_streaming(
         max_tokens,
         req.min_tokens,
         req.ignore_eos,
-        req.disable_mtp,
+        tools_gate_disable_mtp(
+            tools_active,
+            req.disable_mtp,
+            disable_mtp_for_tools_gate_on(),
+        ),
         temperature,
         top_k,
         top_p,
