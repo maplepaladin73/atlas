@@ -10,6 +10,7 @@ pub(super) struct BatchScratch<'a> {
     _memory: Owned<'a>,
     tokens: DevicePtr,
     hashes: DevicePtr,
+    hashes_verify: DevicePtr,
     lookup: DevicePtr,
     keys: DevicePtr,
     norm_keys: DevicePtr,
@@ -23,6 +24,7 @@ impl<'a> BatchScratch<'a> {
         Ok(Self {
             tokens: m.alloc(rows * 3 * 4)?,
             hashes: m.alloc(rows * e.layout.sizes.len() * 4)?,
+            hashes_verify: m.alloc(rows * e.layout.sizes.len() * 4)?,
             lookup: m.alloc(rows * e.heads.len() * e.dim * 2)?,
             keys: m.alloc(rows * 4 * e.h * 2)?,
             norm_keys: m.alloc(rows * 4 * e.h * 2)?,
@@ -100,9 +102,15 @@ impl<'a> Hy4Engram<'a> {
                     let row_hashes = self.host_hashes(&context, history[p])?;
                     matrix[r * heads..(r + 1) * heads].copy_from_slice(&row_hashes);
                 }
+                let preslot = verify_hashes().then(|| matrix.clone());
                 let guard = self.resolve_hash_matrix(&mut matrix)?;
                 let bytes: Vec<u8> = matrix.iter().flat_map(|v| v.to_le_bytes()).collect();
                 gpu.copy_h2d_async(&bytes, b.hashes, stream)?;
+                if let Some(preslot) = preslot {
+                    verify_kernel_hashes(
+                        self, history, start, rows, heads, &preslot, b, gpu, stream,
+                    )?;
+                }
                 guard
             } else {
                 // One H2D of the (token, previous, older) window plus one
@@ -268,4 +276,90 @@ impl<'a> Hy4Engram<'a> {
         }
         Ok(())
     }
+}
+
+/// `ATLAS_HY4_ENGRAM_ROW_CACHE_VERIFY=1`: in the exact-row cache path, ALSO
+/// run the GPU hash kernel and bit-compare its absolute row ids against the
+/// host-computed pre-resolve matrix. Opt-in debug validation; costs one
+/// synchronizing copyback per layer-chunk.
+fn verify_hashes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ATLAS_HY4_ENGRAM_ROW_CACHE_VERIFY")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_kernel_hashes(
+    e: &Hy4Engram<'_>,
+    history: &[u32],
+    start: usize,
+    rows: usize,
+    heads: usize,
+    preslot: &[i32],
+    b: &BatchScratch<'_>,
+    gpu: &dyn spark_runtime::gpu::GpuBackend,
+    stream: u64,
+) -> Result<()> {
+    let mut window = Vec::with_capacity(rows * 3);
+    for r in 0..rows {
+        let p = start + r;
+        window.push(history[p] as i32);
+        window.push(p.checked_sub(1).map_or(-1, |i| history[i] as i32));
+        window.push(p.checked_sub(2).map_or(-1, |i| history[i] as i32));
+    }
+    gpu.copy_h2d_async(
+        &window
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>(),
+        b.tokens,
+        stream,
+    )?;
+    KernelLaunch::new(gpu, e.kernels[5])
+        .grid([rows as u32, 1, 1])
+        .block([32, 1, 1])
+        .arg_ptr(b.tokens)
+        .arg_ptr(e.map)
+        .arg_ptr(e.multipliers)
+        .arg_ptr(e.sizes)
+        .arg_ptr(e.offsets)
+        .arg_ptr(b.hashes_verify)
+        .arg_u32(e.layout.map.len() as u32)
+        .arg_u32(heads as u32)
+        .arg_u32(e.layout.heads_per_order as u32)
+        .arg_u32(e.layout.pad)
+        .arg_u32(rows as u32)
+        .launch(stream)?;
+    let mut kernel_out = vec![0u8; rows * heads * 4];
+    gpu.copy_d2h(b.hashes_verify, &mut kernel_out)?;
+    let mut mismatches = 0usize;
+    let mut first = None;
+    for (i, b4) in kernel_out.chunks_exact(4).enumerate() {
+        let k = i32::from_le_bytes(b4.try_into().unwrap());
+        if k != preslot[i] {
+            mismatches += 1;
+            if first.is_none() {
+                first = Some((i, preslot[i], k));
+            }
+        }
+    }
+    if mismatches > 0 {
+        let (i, host, kern) = first.unwrap();
+        tracing::error!(
+            "rowcache hash verify: {mismatches}/{} MISMATCHES, first at flat {i} (row {} head {}): host {host} vs kernel {kern}",
+            rows * heads,
+            i / heads,
+            i % heads
+        );
+    } else {
+        tracing::info!(
+            "rowcache hash verify: 0/{} mismatches (rows={rows} heads={heads})",
+            rows * heads
+        );
+    }
+    Ok(())
 }
