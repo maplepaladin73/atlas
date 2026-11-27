@@ -62,6 +62,8 @@ impl Hy4Engram<'_> {
             .arg_ptr(self.table);
         let lookup = if self.fp8_table {
             lookup.arg_ptr(self.scales)
+        } else if let Some(hc) = &self.hotcache {
+            lookup.arg_ptr(hc.keys).arg_ptr(hc.rows).arg_ptr(hc.offs)
         } else {
             lookup
         };

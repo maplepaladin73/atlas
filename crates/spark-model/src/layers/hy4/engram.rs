@@ -13,6 +13,7 @@ use spark_runtime::{
 
 mod batch;
 mod forward;
+mod hotcache;
 mod nvmap;
 #[cfg(test)]
 mod tests;
@@ -31,6 +32,10 @@ pub struct Hy4Engram<'a> {
     /// it must outlive every launch. Held for its Drop (the unmap), never
     /// read — hence the underscore name.
     _table_nvmap: Option<nvmap::TableMap>,
+    /// Frequency-ordered device-resident hot rows (bf16 tables only, opt-in
+    /// via env): the lookup kernels probe it first and fall through to
+    /// `table` on a miss, so output is bit-identical either way.
+    hotcache: Option<hotcache::HotCache>,
     scales: DevicePtr,
     lookup_norm: DevicePtr,
     map: DevicePtr,
@@ -181,6 +186,23 @@ impl<'a> Hy4Engram<'a> {
         } else {
             DevicePtr::NULL
         };
+        let hotcache = if fp8_table {
+            None
+        } else {
+            let mut ids = cfg.engram_layer_ids.clone();
+            ids.sort_unstable();
+            let layer_pos = ids.iter().position(|&id| id == layer + 1).unwrap_or(0);
+            let head_offsets: Vec<usize> = {
+                let mut v = Vec::with_capacity(layout.sizes.len());
+                let mut acc = 0usize;
+                for s in &layout.sizes {
+                    v.push(acc);
+                    acc += s;
+                }
+                v
+            };
+            hotcache::load(&mut mem, layer_pos, heads.clone(), &head_offsets, dim)?
+        };
         let lookup_norm = join(
             &mut mem,
             store,
@@ -265,6 +287,8 @@ impl<'a> Hy4Engram<'a> {
             "hy4_engram_hash",
             if fp8_table {
                 "hy4_engram_lookup"
+            } else if hotcache.is_some() {
+                "hy4_engram_lookup_bf16_hot"
             } else {
                 "hy4_engram_lookup_bf16"
             },
@@ -274,6 +298,8 @@ impl<'a> Hy4Engram<'a> {
             "hy4_engram_hash_batch",
             if fp8_table {
                 "hy4_engram_lookup_batch"
+            } else if hotcache.is_some() {
+                "hy4_engram_lookup_batch_bf16_hot"
             } else {
                 "hy4_engram_lookup_batch_bf16"
             },
@@ -296,6 +322,7 @@ impl<'a> Hy4Engram<'a> {
             fp8_table,
             table,
             _table_nvmap: table_nvmap,
+            hotcache,
             scales,
             lookup_norm,
             map,
