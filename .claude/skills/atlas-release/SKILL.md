@@ -7,6 +7,13 @@ allowed-tools: Bash, Read, Write, Grep, Glob, Agent, Edit
 
 # /atlas-release — Atlas build → verify → ship pipeline
 
+> **Namespace warning (2026-11-27 incident):** the `azeezish/atlas-gb10` tags
+> throughout this skill are the *upstream* publisher namespace, written for
+> the upstream maintainers pipeline. If you are working on a fork, substitute
+> the fork owner Docker Hub org everywhere (e.g. `maplepaladin73/atlas-gb10`
+> for the maplepaladin73 fork) before tagging anything. Copying the upstream
+> namespace verbatim mislabels provenance even when nothing is ever pushed.
+
 One entry point for turning **merged code into a pullable, verified image**. The
 gap this closes: today `azeezish/atlas-gb10:latest` is cut by hand on a GB10 build
 host and drifts weeks behind `main` because nothing rebuilds/re-verifies/re-tags on merge.
