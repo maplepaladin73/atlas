@@ -118,6 +118,24 @@ pub fn fp8_gemm_act_weight_t_blkscaled(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn bf16_grouped_gemm_act_weight_t_strided_in_order(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _g: u32,
+    _n: u32,
+    _k: u32,
+    _a_stride: u32,
+    _c_stride: u32,
+    _a_batch_stride: u32,
+    _c_batch_stride: u32,
+    _stream: u64,
+) -> Result<bool> {
+    anyhow::bail!("cublaslt::bf16_grouped_gemm_act_weight_t_strided_in_order requires CUDA")
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn bf16_grouped_gemm_act_weight_t(
     _act: u64,
     _weight: u64,

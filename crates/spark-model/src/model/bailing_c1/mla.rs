@@ -426,6 +426,52 @@ impl LingMlaLayer {
     ) -> Result<()> {
         let s = &self.scratch;
         let k = &self.kernels;
+        // Tensor-core lane (default on, ATLAS_LING_QABSORB_GEMM=0 opts out):
+        // one strided batched cuBLASLt GEMM absorbs all 32 heads (batch
+        // stride 192 on the q_nope rows, 576 on the output rows) on the
+        // split-K-free workspace-free algorithm, then the rope-stitch kernel
+        // writes the [512, 576) tail bit-identically to the scalar kernel's
+        // rope section. Fallback: the scalar fused kernel below.
+        let gemm_ok = !matches!(
+            std::env::var("ATLAS_LING_QABSORB_GEMM").as_deref(),
+            Ok("0") | Ok("false")
+        )
+            && spark_runtime::cublaslt::bf16_grouped_gemm_act_weight_t_strided_in_order(
+                s.mla_q.0,
+                self.weights.w_uk.weight.0,
+                s.mla_q_final.0,
+                rows,
+                self.heads,
+                self.kv_lora,
+                self.nope,
+                self.heads * (self.nope + self.rope),
+                self.heads * (self.kv_lora + self.rope),
+                self.nope + self.rope,
+                self.kv_lora + self.rope,
+                stream,
+            )
+            .unwrap_or_else(|e| {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        "ling q_absorb TC lane unavailable ({e}); falling back to the scalar kernel"
+                    );
+                }
+                false
+            });
+        if gemm_ok {
+            let pairs = rows * self.heads * (self.rope / 2);
+            return KernelLaunch::new(gpu, k.mla_q_rope_stitch_k)
+                .grid([div_ceil(pairs, 256), 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(s.mla_q)
+                .arg_ptr(s.mla_q_final)
+                .arg_ptr(positions)
+                .arg_u32(rows)
+                .arg_words(&[self.rope_theta.to_bits()])
+                .launch(stream);
+        }
         let row_tile = rows.min(64);
         KernelLaunch::new(gpu, k.mla_q_absorb_k)
             .grid([

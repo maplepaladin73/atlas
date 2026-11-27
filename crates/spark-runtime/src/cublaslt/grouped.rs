@@ -216,6 +216,191 @@ pub fn bf16_grouped_gemm_act_weight_t(
     Ok(())
 }
 
+/// [`bf16_grouped_gemm_act_weight_t`] generalized with explicit per-head
+/// batch strides (elements) for the activation and the output, and pinned
+/// to the heuristic's first split-K-free, reduction-free algorithm that
+/// reports zero workspace bytes -- the serve-safety contract: concurrent
+/// lanes cannot race through the shared cuBLASLt workspace when the kernel
+/// does not use one. `Ok(false)`: cuBLASLt offered no such algorithm for
+/// the shape; nothing was launched and the caller runs its fallback.
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_grouped_gemm_act_weight_t_strided_in_order(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    g: u32,
+    n: u32,
+    k: u32,
+    a_stride: u32,
+    c_stride: u32,
+    a_batch_stride: u32,
+    c_batch_stride: u32,
+    stream: u64,
+) -> Result<bool> {
+    ensure!(m > 0 && g > 0 && n > 0 && k > 0, "empty grouped GEMM");
+    let batches = i32::try_from(g)?;
+    ensure!(
+        u64::from(a_batch_stride) >= u64::from(k)
+            && u64::from(a_stride) >= u64::from(g - 1) * u64::from(a_batch_stride) + u64::from(k),
+        "grouped GEMM input rows overlap"
+    );
+    ensure!(
+        u64::from(c_batch_stride) >= u64::from(n)
+            && u64::from(c_stride) >= u64::from(g - 1) * u64::from(c_batch_stride) + u64::from(n),
+        "grouped GEMM output rows overlap"
+    );
+
+    let weight_stride = i64::try_from(u64::from(n) * u64::from(k))?;
+    let context = ctx()?;
+    let mut handles = Descriptors::default();
+    unsafe {
+        chk(
+            cublasLtMatmulDescCreate(&mut handles.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+            "strided DescCreate",
+        )?;
+        for (attr, value) in [(DESC_TRANSA, CUBLAS_OP_T), (DESC_TRANSB, CUBLAS_OP_N)] {
+            chk(
+                cublasLtMatmulDescSetAttribute(
+                    handles.desc,
+                    attr,
+                    (&value as *const i32).cast(),
+                    size_of::<i32>(),
+                ),
+                "strided transpose",
+            )?;
+        }
+        for (i, (rows, cols, ld, stride)) in [
+            (k, n, i64::from(k), weight_stride),
+            (k, m, i64::from(a_stride), i64::from(a_batch_stride)),
+            (n, m, i64::from(c_stride), i64::from(c_batch_stride)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            chk(
+                cublasLtMatrixLayoutCreate(
+                    &mut handles.layouts[i],
+                    CUDA_R_16BF,
+                    u64::from(rows),
+                    u64::from(cols),
+                    ld,
+                ),
+                "strided LayoutCreate",
+            )?;
+            chk(
+                cublasLtMatrixLayoutSetAttribute(
+                    handles.layouts[i],
+                    LAYOUT_BATCH_COUNT,
+                    (&batches as *const i32).cast(),
+                    size_of::<i32>(),
+                ),
+                "strided batch count",
+            )?;
+            chk(
+                cublasLtMatrixLayoutSetAttribute(
+                    handles.layouts[i],
+                    LAYOUT_STRIDED_BATCH_OFFSET,
+                    (&stride as *const i64).cast(),
+                    size_of::<i64>(),
+                ),
+                "strided batch stride",
+            )?;
+        }
+        chk(
+            cublasLtMatmulPreferenceCreate(&mut handles.pref),
+            "strided PreferenceCreate",
+        )?;
+        chk(
+            cublasLtMatmulPreferenceSetAttribute(
+                handles.pref,
+                PREF_MAX_WORKSPACE_BYTES,
+                (&context.ws_size as *const usize).cast(),
+                size_of::<usize>(),
+            ),
+            "strided workspace",
+        )?;
+        for (attr, address_bits) in [
+            (5, weight | (weight_stride as u64 * 2) | (u64::from(k) * 2)),
+            (
+                6,
+                act | (u64::from(a_batch_stride) * 2) | (u64::from(a_stride) * 2),
+            ),
+            (
+                7,
+                out | (u64::from(c_batch_stride) * 2) | (u64::from(c_stride) * 2),
+            ),
+            (
+                8,
+                out | (u64::from(c_batch_stride) * 2) | (u64::from(c_stride) * 2),
+            ),
+        ] {
+            let alignment = 1u32 << address_bits.trailing_zeros().min(8);
+            chk(
+                cublasLtMatmulPreferenceSetAttribute(
+                    handles.pref,
+                    attr,
+                    (&alignment as *const u32).cast(),
+                    size_of::<u32>(),
+                ),
+                "strided minimum alignment",
+            )?;
+        }
+        let mut result = [0u8; 128 * kchain_pin::CANDIDATES];
+        let mut returned = 0;
+        let [la, lb, lc] = handles.layouts;
+        chk(
+            cublasLtMatmulAlgoGetHeuristic(
+                context.handle,
+                handles.desc,
+                la,
+                lb,
+                lc,
+                lc,
+                handles.pref,
+                kchain_pin::CANDIDATES as i32,
+                result.as_mut_ptr().cast(),
+                &mut returned,
+            ),
+            "strided AlgoGetHeuristic",
+        )?;
+        let found = (returned.max(0) as usize).min(result.len() / kchain_pin::RESULT_BYTES);
+        let Some(pick) = (0..found).find(|&i| {
+            kchain_pin::state_success(&result, i)
+                && kchain_pin::in_order(
+                    result[i * kchain_pin::RESULT_BYTES..].as_ptr() as *const c_void
+                )
+                && kchain_pin::workspace_bytes(&result, i) == 0
+        }) else {
+            return Ok(false);
+        };
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        chk(
+            cublasLtMatmul(
+                context.handle,
+                handles.desc,
+                (&alpha as *const f32).cast(),
+                weight as *const c_void,
+                la,
+                act as *const c_void,
+                lb,
+                (&beta as *const f32).cast(),
+                out as *const c_void,
+                lc,
+                out as *mut c_void,
+                lc,
+                result[pick * kchain_pin::RESULT_BYTES..].as_ptr().cast(),
+                context.workspace()? as *mut c_void,
+                context.ws_size,
+                stream as *mut c_void,
+            ),
+            "strided Matmul",
+        )?;
+    }
+    Ok(true)
+}
+
 fn end_address(ptr: u64, elements: u64) -> Result<u64> {
     ensure!(
         ptr > 0 && ptr.is_multiple_of(2),

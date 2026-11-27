@@ -251,7 +251,7 @@ pub fn bf16_gemm_act_weight_t_in_order_no_workspace(
 
 /// Whether heuristic result `i` is a successful result (offset 72 after the
 /// algo blob and `size_t workspaceSize`; `CUBLAS_STATUS_SUCCESS` is zero).
-fn state_success(results: &[u8], i: usize) -> bool {
+pub(super) fn state_success(results: &[u8], i: usize) -> bool {
     let base = i * RESULT_BYTES + 72;
     i32::from_ne_bytes(results[base..base + 4].try_into().unwrap()) == 0
 }
@@ -259,7 +259,7 @@ fn state_success(results: &[u8], i: usize) -> bool {
 /// Workspace size field of heuristic result `i` (the C struct is the 64-byte
 /// algo blob followed by `size_t workspaceSize` at offset 64; `RESULT_BYTES`
 /// is the padded 96-byte CUDA 12/13 size).
-fn workspace_bytes(results: &[u8], i: usize) -> usize {
+pub(super) fn workspace_bytes(results: &[u8], i: usize) -> usize {
     let base = i * RESULT_BYTES + 64;
     usize::from_ne_bytes(results[base..base + 8].try_into().unwrap())
 }
