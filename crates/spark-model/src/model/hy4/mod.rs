@@ -5,7 +5,7 @@
 use crate::layers::hy4::{
     Hy4FfnScratch,
     attention::{AttentionCache, Hy4Attention, memory::Owned},
-    engram::{EngramScratch, Hy4Engram},
+    engram::{BatchPurpose, EngramScratch, Hy4Engram},
     ffn::Hy4Ffn,
     hc::IndependentHc,
 };

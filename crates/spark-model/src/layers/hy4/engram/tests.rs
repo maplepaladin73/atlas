@@ -192,17 +192,41 @@ fn batched_keys_respect_n_by_h_collective_capacity_and_reject_empty_batches() {
     };
     assert!(
         block
-            .forward_batch(hidden, &[], 0, &mut scratch, Some(&comm), 0)
+            .forward_batch(
+                hidden,
+                &[],
+                0,
+                BatchPurpose::Prefill,
+                &mut scratch,
+                Some(&comm),
+                0
+            )
             .is_err()
     );
     assert!(
         block
-            .forward_batch(hidden, &history, 58, &mut scratch, Some(&comm), 0)
+            .forward_batch(
+                hidden,
+                &history,
+                58,
+                BatchPurpose::Prefill,
+                &mut scratch,
+                Some(&comm),
+                0
+            )
             .is_err()
     );
     assert_eq!(gpu.launch_count(), 0);
     block
-        .forward_batch(hidden, &history, 0, &mut scratch, Some(&comm), 0)
+        .forward_batch(
+            hidden,
+            &history,
+            0,
+            BatchPurpose::Prefill,
+            &mut scratch,
+            Some(&comm),
+            0,
+        )
         .unwrap();
     assert_eq!(comm.calls.load(Ordering::Relaxed), 5);
     let launches = gpu.launch_count();
@@ -212,6 +236,7 @@ fn batched_keys_respect_n_by_h_collective_capacity_and_reject_empty_batches() {
                 hidden,
                 &vec![1; crate::layers::hy4::batch::PREFILL_ROWS + 1],
                 0,
+                BatchPurpose::Prefill,
                 &mut scratch,
                 Some(&comm),
                 0,
@@ -449,7 +474,15 @@ fn bf16_table_batch_matches_fp8_launches_except_scale_arg() {
             bytes: history.len() * c.hidden_size * 2,
         };
         block
-            .forward_batch(hidden, &history, 0, &mut scratch, Some(&comm), 0)
+            .forward_batch(
+                hidden,
+                &history,
+                0,
+                BatchPurpose::Prefill,
+                &mut scratch,
+                Some(&comm),
+                0,
+            )
             .unwrap();
         gpu.free(hidden).unwrap();
         (comm.calls.load(Ordering::Relaxed), gpu.launches_snapshot())

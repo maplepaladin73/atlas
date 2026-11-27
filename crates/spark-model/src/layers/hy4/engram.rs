@@ -17,6 +17,16 @@ mod hotcache;
 mod nvmap;
 #[cfg(test)]
 mod tests;
+
+/// Which serving phase a batched Engram lookup belongs to. Verify rows and
+/// prefill rows use the same kernel shape but must not be blended in the
+/// hot-cache hit-rate measurement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchPurpose {
+    Prefill,
+    Verify,
+}
+
 pub struct Hy4Engram<'a> {
     mem: Owned<'a>,
     kernels: [KernelHandle; 9],
@@ -221,6 +231,7 @@ impl<'a> Hy4Engram<'a> {
             hotcache::load(
                 &mut mem,
                 layer_pos,
+                layer + 1,
                 heads.clone(),
                 &head_offsets,
                 dim,

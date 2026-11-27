@@ -159,6 +159,7 @@ template<bool FP8_TABLE>
 static __device__ __forceinline__ void eg_lookup_hot(
     const int* hashes,const void* table,
     const unsigned* hc_keys,const __nv_bfloat16* hc_rows,const unsigned* hc_offs,
+    unsigned long long* hc_stats,unsigned hc_stats_kind,
     const __nv_bfloat16* gamma,__nv_bfloat16* output,
     unsigned first_head,unsigned base_row,unsigned local_rows,unsigned dim) {
     unsigned head=blockIdx.x;int row=hashes[first_head+head];
@@ -169,6 +170,8 @@ static __device__ __forceinline__ void eg_lookup_hot(
         v=0.f;
     } else {
         long hit=valid?eg_hot_probe(hc_keys,hc_offs,first_head+head,(unsigned)row):-1;
+        if(valid && threadIdx.x==0 && hc_stats)
+            atomicAdd(hc_stats+hc_stats_kind+(hit>=0?0:1),1ULL);
         if(hit>=0)
             v=(threadIdx.x<dim)?__bfloat162float(hc_rows[(size_t)hit*dim+threadIdx.x]):0.f;
         else
@@ -182,9 +185,10 @@ static __device__ __forceinline__ void eg_lookup_hot(
 extern "C" __global__ void hy4_engram_lookup_bf16_hot(
     const int* hashes,const __nv_bfloat16* table,
     const unsigned* hc_keys,const __nv_bfloat16* hc_rows,const unsigned* hc_offs,
+    unsigned long long* hc_stats,unsigned hc_stats_kind,
     const __nv_bfloat16* gamma,__nv_bfloat16* output,
     unsigned first_head,unsigned base_row,unsigned local_rows,unsigned dim) {
-    eg_lookup_hot<false>(hashes,table,hc_keys,hc_rows,hc_offs,gamma,output,
+    eg_lookup_hot<false>(hashes,table,hc_keys,hc_rows,hc_offs,hc_stats,hc_stats_kind,gamma,output,
         first_head,base_row,local_rows,dim);
 }
 
@@ -192,6 +196,7 @@ template<bool FP8_TABLE>
 static __device__ __forceinline__ void eg_lookup_batch_hot(
     const int* hashes,const void* table,
     const unsigned* hc_keys,const __nv_bfloat16* hc_rows,const unsigned* hc_offs,
+    unsigned long long* hc_stats,unsigned hc_stats_kind,
     const __nv_bfloat16* gamma,__nv_bfloat16* output,
     unsigned first_head,unsigned base_row,unsigned local_rows,unsigned dim,
     unsigned hash_stride,unsigned local,unsigned rows) {
@@ -205,6 +210,8 @@ static __device__ __forceinline__ void eg_lookup_batch_hot(
         v=0.f;
     } else {
         long hit=valid?eg_hot_probe(hc_keys,hc_offs,first_head+head,(unsigned)h):-1;
+        if(valid && threadIdx.x==0 && hc_stats)
+            atomicAdd(hc_stats+hc_stats_kind+(hit>=0?0:1),1ULL);
         if(hit>=0)
             v=(threadIdx.x<dim)?__bfloat162float(hc_rows[(size_t)hit*dim+threadIdx.x]):0.f;
         else
@@ -218,10 +225,11 @@ static __device__ __forceinline__ void eg_lookup_batch_hot(
 extern "C" __global__ void hy4_engram_lookup_batch_bf16_hot(
     const int* hashes,const __nv_bfloat16* table,
     const unsigned* hc_keys,const __nv_bfloat16* hc_rows,const unsigned* hc_offs,
+    unsigned long long* hc_stats,unsigned hc_stats_kind,
     const __nv_bfloat16* gamma,__nv_bfloat16* output,
     unsigned first_head,unsigned base_row,unsigned local_rows,unsigned dim,
     unsigned hash_stride,unsigned local,unsigned rows) {
-    eg_lookup_batch_hot<false>(hashes,table,hc_keys,hc_rows,hc_offs,gamma,output,
+    eg_lookup_batch_hot<false>(hashes,table,hc_keys,hc_rows,hc_offs,hc_stats,hc_stats_kind,gamma,output,
         first_head,base_row,local_rows,dim,hash_stride,local,rows);
 }
 

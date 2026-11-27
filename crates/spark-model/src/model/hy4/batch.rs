@@ -113,6 +113,11 @@ impl Runtime<'_> {
                             w.highway,
                             &history,
                             start,
+                            if mode == VERIFY {
+                                BatchPurpose::Verify
+                            } else {
+                                BatchPurpose::Prefill
+                            },
                             state.engram.as_mut().context("Hy4 batch Engram scratch")?,
                             s.comm.as_deref(),
                             stream,
