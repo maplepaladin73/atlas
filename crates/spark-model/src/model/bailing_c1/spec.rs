@@ -21,10 +21,10 @@ pub(crate) const MLA_K_ROW_BF16: usize = 576;
 pub(crate) const MLA_V_ROW_BF16: usize = 512;
 
 /// Default per-layer prefill sub-chunk the shared scratch is sized for
-/// (`ATLAS_LING_PREFILL_ROWS` overrides). 512 keeps every decode/verify
-/// buffer small while an ISL-4096 prompt takes 8 sub-chunks — conservative
-/// on the 121.6 GiB unified box.
-pub(crate) const DEFAULT_PREFILL_ROWS: usize = 512;
+/// (`ATLAS_LING_PREFILL_ROWS` overrides). 4096 amortizes the routed-expert
+/// table streams over a full ISL-4096-class prompt on the 121.6 GiB unified
+/// box; decode/verify rows still use only their small row slices.
+pub(crate) const DEFAULT_PREFILL_ROWS: usize = 4096;
 
 /// Hard prompt cap the driver accepts without a recompile-grade override
 /// (`ATLAS_LING_PREFILL_ROWS`): ISL 4096-class prompts per the campaign
