@@ -39,22 +39,40 @@ impl Hy4Engram<'_> {
             .checked_sub(2)
             .map(|i| history[i])
             .unwrap_or(u32::MAX);
-        KernelLaunch::new(self.mem.gpu, self.kernels[0])
-            .grid([1, 1, 1])
-            .block([32, 1, 1])
-            .arg_u32(token)
-            .arg_u32(previous)
-            .arg_u32(older)
-            .arg_ptr(self.map)
-            .arg_ptr(self.multipliers)
-            .arg_ptr(self.sizes)
-            .arg_ptr(self.offsets)
-            .arg_ptr(scratch.hashes)
-            .arg_u32(self.layout.map.len() as u32)
-            .arg_u32(self.layout.sizes.len() as u32)
-            .arg_u32(self.layout.heads_per_order as u32)
-            .arg_u32(self.layout.pad)
-            .launch(stream)?;
+        let rowcache_guard = if self.rowcache_slots > 0 {
+            let mut context = Vec::with_capacity(2);
+            if let Some(i) = history.len().checked_sub(2) {
+                context.push(history[i]);
+            }
+            if let Some(&prev) = history.last() {
+                context.push(prev);
+            }
+            let mut hashes = self.host_hashes(&context, token)?;
+            let guard = self.resolve_hash_matrix(&mut hashes)?;
+            let bytes: Vec<u8> = hashes.iter().flat_map(|v| v.to_le_bytes()).collect();
+            self.mem
+                .gpu
+                .copy_h2d_async(&bytes, scratch.hashes, stream)?;
+            guard
+        } else {
+            KernelLaunch::new(self.mem.gpu, self.kernels[0])
+                .grid([1, 1, 1])
+                .block([32, 1, 1])
+                .arg_u32(token)
+                .arg_u32(previous)
+                .arg_u32(older)
+                .arg_ptr(self.map)
+                .arg_ptr(self.multipliers)
+                .arg_ptr(self.sizes)
+                .arg_ptr(self.offsets)
+                .arg_ptr(scratch.hashes)
+                .arg_u32(self.layout.map.len() as u32)
+                .arg_u32(self.layout.sizes.len() as u32)
+                .arg_u32(self.layout.heads_per_order as u32)
+                .arg_u32(self.layout.pad)
+                .launch(stream)?;
+            None
+        };
         let lookup = KernelLaunch::new(self.mem.gpu, self.kernels[1])
             .grid([self.heads.len() as u32, 1, 1])
             .block([128, 1, 1])
@@ -65,14 +83,17 @@ impl Hy4Engram<'_> {
         } else {
             lookup
         };
+        let (base_row, local_rows) = self.lookup_bounds();
         lookup
             .arg_ptr(self.lookup_norm)
             .arg_ptr(scratch.lookup)
             .arg_u32(self.heads.start as u32)
-            .arg_u32(self.rows.start as u32)
-            .arg_u32(self.rows.len() as u32)
+            .arg_u32(base_row)
+            .arg_u32(local_rows)
             .arg_u32(self.dim as u32)
             .launch(stream)?;
+        self.record_lookup_event(stream)?;
+        drop(rowcache_guard);
         for i in 0..5 {
             let out = if i == 4 {
                 scratch.value

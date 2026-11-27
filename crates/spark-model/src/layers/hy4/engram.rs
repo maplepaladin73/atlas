@@ -14,6 +14,7 @@ use spark_runtime::{
 mod batch;
 mod forward;
 mod nvmap;
+mod rowcache;
 #[cfg(test)]
 mod tests;
 pub struct Hy4Engram<'a> {
@@ -27,6 +28,14 @@ pub struct Hy4Engram<'a> {
     rows: std::ops::Range<usize>,
     fp8_table: bool,
     table: DevicePtr,
+    #[cfg(feature = "cuda")]
+    rowcache: Option<std::sync::Mutex<spark_storage::NgramRowCache>>,
+    #[cfg(not(feature = "cuda"))]
+    rowcache: Option<std::sync::Mutex<()>>,
+    rowcache_slots: usize,
+    /// Stream event of the latest cache-backed lookup launch; the next
+    /// resolve synchronizes it before releasing that batch's pins.
+    rowcache_event: std::sync::Mutex<Option<u64>>,
     /// NVMe-mmap of the rank's bf16 table slice: `table` reads into it, so
     /// it must outlive every launch. Held for its Drop (the unmap), never
     /// read — hence the underscore name.
@@ -134,39 +143,66 @@ impl<'a> Hy4Engram<'a> {
         // off NVMe via mmap (GB10 reads host memory coherently through the
         // page cache — see nvmap) instead of copying it into device memory.
         // fp8 tables and knob-off loads stay device-resident, as before.
+        let rowcache_open = match store.deferred(&table_name) {
+            Some(d) => rowcache::open_table(
+                fp8_table,
+                d,
+                &table_name,
+                dtype,
+                &[n, dim],
+                rows.start * dim * width,
+                rows.len(),
+                dim * width,
+            )?,
+            None => None,
+        };
         let mut table_nvmap = None;
-        let table = match nvmap::enabled(fp8_table)
-            .then(|| store.deferred(&table_name))
-            .flatten()
-        {
-            Some(d) => {
-                let m = nvmap::TableMap::open(
-                    d,
+        let mut rowcache = None;
+        let mut rowcache_slots = 0usize;
+        let table = if let Some((ptr, cache, slots)) = rowcache_open {
+            tracing::info!(
+                "engram exact-row cache: rank slice rows={} slots={} (~{:.1} MiB pinned/layer)",
+                rows.len(),
+                slots,
+                (slots * dim * width) as f64 / 1048576.0
+            );
+            rowcache_slots = slots;
+            rowcache = Some(std::sync::Mutex::new(cache));
+            DevicePtr(ptr)
+        } else {
+            match nvmap::enabled(fp8_table)
+                .then(|| store.deferred(&table_name))
+                .flatten()
+            {
+                Some(d) => {
+                    let m = nvmap::TableMap::open(
+                        d,
+                        &table_name,
+                        dtype,
+                        &[n, dim],
+                        rows.start * dim * width,
+                        rows.len() * dim * width,
+                    )?;
+                    tracing::info!(
+                        "engram tables NVMe-mmap: rank slice rows={} bytes={} (~{:.1} GB resident-free)",
+                        rows.len(),
+                        m.bytes(),
+                        m.bytes() as f64 / 1073741824.0
+                    );
+                    let ptr = m.table_ptr(mem.gpu);
+                    table_nvmap = Some(m);
+                    ptr
+                }
+                None => table_slice(
+                    &mut mem,
+                    store,
                     &table_name,
-                    dtype,
                     &[n, dim],
+                    dtype,
                     rows.start * dim * width,
                     rows.len() * dim * width,
-                )?;
-                tracing::info!(
-                    "engram tables NVMe-mmap: rank slice rows={} bytes={} (~{:.1} GB resident-free)",
-                    rows.len(),
-                    m.bytes(),
-                    m.bytes() as f64 / 1073741824.0
-                );
-                let ptr = m.table_ptr(mem.gpu);
-                table_nvmap = Some(m);
-                ptr
+                )?,
             }
-            None => table_slice(
-                &mut mem,
-                store,
-                &table_name,
-                &[n, dim],
-                dtype,
-                rows.start * dim * width,
-                rows.len() * dim * width,
-            )?,
         };
         let scales = if fp8_table {
             table_slice(
@@ -295,6 +331,9 @@ impl<'a> Hy4Engram<'a> {
             rows,
             fp8_table,
             table,
+            rowcache,
+            rowcache_slots,
+            rowcache_event: std::sync::Mutex::new(None),
             _table_nvmap: table_nvmap,
             scales,
             lookup_norm,
