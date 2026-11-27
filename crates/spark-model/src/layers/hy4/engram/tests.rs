@@ -210,7 +210,7 @@ fn batched_keys_respect_n_by_h_collective_capacity_and_reject_empty_batches() {
         block
             .forward_batch(
                 hidden,
-                &vec![1; crate::layers::hy4::batch::PREFILL_ROWS + 1],
+                &vec![1; crate::layers::hy4::batch::prefill_rows() + 1],
                 0,
                 &mut scratch,
                 Some(&comm),

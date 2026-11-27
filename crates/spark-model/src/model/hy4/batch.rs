@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
-use crate::layers::hy4::batch::{self, MAX_ROWS, PREFILL_ROWS};
+use crate::layers::hy4::batch::{self, MAX_ROWS};
 use crate::layers::hy4::timing;
 use spark_runtime::kernel_args::KernelLaunch;
 use std::sync::atomic::Ordering;

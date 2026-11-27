@@ -11,7 +11,26 @@ pub const MAX_ROWS: usize = 256;
 /// The expert FFN streams its weights once per chunk, so wider chunks cut
 /// per-token weight traffic; attention and Engram still process each chunk
 /// in MAX_ROWS slices, and VERIFY keeps using the MAX_ROWS-wide workspace.
-pub const PREFILL_ROWS: usize = 1024;
+/// ATLAS_HY4_PREFILL_ROWS overrides the width at startup (default 1024) so
+/// chunk-width sweeps do not need a rebuild per width.
+pub fn prefill_rows() -> usize {
+    static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WIDTH.get_or_init(|| {
+        let rows = match std::env::var("ATLAS_HY4_PREFILL_ROWS") {
+            Ok(v) => v
+                .parse::<usize>()
+                .expect("ATLAS_HY4_PREFILL_ROWS must be an integer"),
+            Err(_) => 1024,
+        };
+        // The expert batching tiles in 64-row blocks and the workspace must
+        // hold at least one MAX_ROWS slice; 8192 matches the ling driver cap.
+        assert!(
+            rows >= MAX_ROWS && rows.is_multiple_of(64) && rows <= 8192,
+            "ATLAS_HY4_PREFILL_ROWS must be a multiple of 64 in [256, 8192], got {rows}"
+        );
+        rows
+    })
+}
 
 pub(crate) fn gemm(
     gpu: &dyn GpuBackend,

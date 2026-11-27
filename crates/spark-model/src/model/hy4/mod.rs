@@ -286,7 +286,7 @@ impl Hy4Model {
                 )?,
                 prefill: batch::Workspace::new(
                     s,
-                    crate::layers::hy4::batch::PREFILL_ROWS.min(s.max_seq),
+                    crate::layers::hy4::batch::prefill_rows().min(s.max_seq),
                 )?,
                 verify_logits: std::sync::atomic::AtomicBool::new(false),
                 head_rows: std::sync::atomic::AtomicUsize::new(0),
@@ -350,7 +350,7 @@ impl Runtime<'_> {
                         )?,
                         ffn: Hy4FfnScratch::new(
                             &b.ffn,
-                            crate::layers::hy4::batch::PREFILL_ROWS.min(s.max_seq),
+                            crate::layers::hy4::batch::prefill_rows().min(s.max_seq),
                         )?,
                         engram: b.engram.as_ref().map(Hy4Engram::scratch).transpose()?,
                     });
