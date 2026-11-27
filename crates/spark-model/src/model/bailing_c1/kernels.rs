@@ -54,6 +54,7 @@ pub(crate) struct LingKernels {
     // gated_mla.cu
     pub mla_kv_a_cache_k: KernelHandle,
     pub mla_q_absorb_k: KernelHandle,
+    pub mla_q_rope_stitch_k: KernelHandle,
     pub mla_paged_attn_k: KernelHandle,
     pub mla_v_gated_k: KernelHandle,
     pub mla_prefill_attn_k: KernelHandle,
@@ -124,6 +125,7 @@ impl LingKernels {
             kda_recurrent_indexed_k: required(gpu, "kda", "ling_kda_recurrent_indexed")?,
             mla_kv_a_cache_k: required(gpu, "gated_mla", "ling_mla_kv_a_norm_rope_cache")?,
             mla_q_absorb_k: required(gpu, "gated_mla", "ling_mla_q_absorb_rope")?,
+            mla_q_rope_stitch_k: required(gpu, "gated_mla", "ling_mla_q_rope_stitch")?,
             mla_paged_attn_k: required(gpu, "gated_mla", "ling_mla_paged_attn")?,
             mla_v_gated_k: required(gpu, "gated_mla", "ling_mla_v_extract_gated")?,
             mla_prefill_attn_k: required(gpu, "gated_mla", "ling_mla_prefill_attn")?,

@@ -273,6 +273,48 @@ extern "C" __global__ void ling_mla_q_absorb_rope(
     }
 }
 
+// rope-only companion of the batched cuBLASLt absorb GEMM: the GEMM writes
+// q_final[row, head, 0:kv_lora) and this kernel stitches the roped q_rope
+// slice into [kv_lora, kv_lora + rope_dim). Same arithmetic, bit-for-bit, as
+// the rope section of ling_mla_q_absorb_rope. One thread per (row, head,
+// pair).
+//
+// Grid: (ceil(rows * heads * rope_dim/2 / 256), 1, 1)   Block: (256, 1, 1)
+extern "C" __global__ void ling_mla_q_rope_stitch(
+    const __nv_bfloat16* __restrict__ q_full,    // [rows, heads * 192]
+    __nv_bfloat16* __restrict__ q_final,         // [rows, heads, 576]
+    const unsigned int* __restrict__ positions, // [rows]
+    const unsigned int rows,
+    const double rope_theta
+) {
+    atlas_pdl_enter();
+    const unsigned int pairs = LING_MLA_ROPE / 2u;
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * LING_MLA_HEADS * pairs) return;
+    const unsigned int p = idx % pairs;
+    const unsigned int rest = idx / pairs;
+    const unsigned int head = rest % LING_MLA_HEADS;
+    const unsigned int r = rest / LING_MLA_HEADS;
+    const unsigned int qk = LING_MLA_NOPE + LING_MLA_ROPE;
+    const unsigned long long q_row = (unsigned long long)LING_MLA_HEADS * qk;
+    const unsigned long long qf_row =
+        (unsigned long long)LING_MLA_HEADS * (LING_MLA_LORA + LING_MLA_ROPE);
+    const float freq = ling_mla_rope_pair_freq(p, LING_MLA_ROPE, rope_theta);
+    const float ang = (float)positions[r] * freq;
+    const float cos_v = cosf(ang);
+    const float sin_v = sinf(ang);
+    const __nv_bfloat16* qr = q_full + (unsigned long long)r * q_row
+                            + (unsigned long long)head * qk + LING_MLA_NOPE;
+    float re, ro;
+    ling_mla_rope_rotate_pair(__bfloat162float(qr[2u * p]),
+                              __bfloat162float(qr[2u * p + 1u]), cos_v, sin_v, re, ro);
+    __nv_bfloat16* dst = q_final + (unsigned long long)r * qf_row
+                       + (unsigned long long)head * (LING_MLA_LORA + LING_MLA_ROPE)
+                       + LING_MLA_LORA;
+    dst[2u * p] = __float2bfloat16(re);
+    dst[2u * p + 1u] = __float2bfloat16(ro);
+}
+
 // ============================================================================
 // attention: paged decode / MTP verify
 // ============================================================================
