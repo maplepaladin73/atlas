@@ -72,13 +72,16 @@ Status: **landed as a flag-gated opt-in, NOT as a default flip.**
   arithmetic to the scalar kernel's.
 - Dispatch: `ATLAS_LING_MLA_PREFILL_MMA=1` flips `prefill_attn_contig`
   to this kernel (128-thread block); every other lane is unchanged.
-- Kept default-off: measured wall-clock improvement at 2638-token prompt
-  on the f341 dev box was ~6% (4.17-4.29 s vs 4.45-4.46 s), not the 3-5x
-  the kernel-level estimate suggested — the scalar kernel is fast at
-  these shapes and the launch overheads/L2 behaviour dominate at this
-  concurrency. The mma lane should be re-measured on longer prompts
-  (4k-16k) before any default flip, and it stays parity-gated (harness
-  + e2e oracle) regardless.
+- Kept default-off: the first implementation's measured wall-clock
+  improvement at a 2638-token prompt on the f341 dev box was ~6%
+  (4.17-4.29 s vs 4.45-4.46 s), not the 3-5x the kernel-level estimate
+  suggested. Forensics then found the cause: the 64-float PV accumulator
+  was indexed through a rolled loop, so ptxas materialized it as a 256 B
+  local-memory stack frame. The current lane fully unrolls that tile loop
+  and uses `__launch_bounds__(128, 4)` to keep the accumulator register
+  resident inside the four-CTA occupancy target (128 registers, only an
+  8 B residual spill). It still stays parity-gated (harness + e2e oracle)
+  and env-gated until the default-flip validation reruns.
 - Verified: `mla_layer5_prefill_fast_parity` 25 stage checks CLEAN (mma
   env on), `bailing_e2e_oracle_parity` PASS (~295 s, same layer-3
   baseline ULP signature), 2553 unit tests green.

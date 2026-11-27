@@ -629,14 +629,14 @@ extern "C" __global__ void ling_mla_prefill_attn(
 // of staged in smem: the smem-staged design held 91,392 B per CTA, which
 // capped GB10 at 1 CTA/SM (4 warps in flight). Staging only the query tile
 // (18,432 B) plus the score/P/softmax shadow (~3.3 KB) leaves 21,760 B per
-// CTA, so 4 CTAs fit a 102,400 B-SM — 16 warps in flight. K rows past kv_run
+// CTA, so shared memory alone allows 4 CTAs on a 102,400 B SM. K rows past kv_run
 // are skipped outright (their scores are masked downstream anyway) and the
 // Q rows past seq_len are zero-filled, so no OOB read is ever performed.
 //
 // Fragment layout mirrors the house SM121 workaround (no ldmatrix):
 //   group_id = lane >> 2 (rows 0..7 / cols 0..7), tid_in_group = lane & 3.
 // --------------------------------------------------------------------------------
-extern "C" __global__ void ling_mla_prefill_attn_mma(
+extern "C" __global__ void __launch_bounds__(128, 4) ling_mla_prefill_attn_mma(
     const __nv_bfloat16* __restrict__ Q,
     const __nv_bfloat16* __restrict__ K,
     const __nv_bfloat16* __restrict__ V,
@@ -798,7 +798,7 @@ extern "C" __global__ void ling_mla_prefill_attn_mma(
         {
             const unsigned short* p_u16 = reinterpret_cast<const unsigned short*>(p_smem);
             const unsigned short* v_u16 = reinterpret_cast<const unsigned short*>(V);
-            #pragma unroll 1
+            #pragma unroll
             for (unsigned int nt = 0; nt < 16u; ++nt) {
                 const unsigned int vdim = warp * 128u + nt * 8u + group_id;
                 #pragma unroll
