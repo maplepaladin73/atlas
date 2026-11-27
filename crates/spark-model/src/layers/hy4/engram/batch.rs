@@ -169,6 +169,7 @@ impl<'a> Hy4Engram<'a> {
                 .arg_u32(local as u32)
                 .arg_u32(rows as u32)
                 .launch(stream)?;
+            self.record_lookup_event(stream)?;
             drop(rowcache_guard);
         }
         // Tensor-core path for the projections (same GEMM as the scalar

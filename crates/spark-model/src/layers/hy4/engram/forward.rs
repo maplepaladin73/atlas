@@ -92,6 +92,7 @@ impl Hy4Engram<'_> {
             .arg_u32(local_rows)
             .arg_u32(self.dim as u32)
             .launch(stream)?;
+        self.record_lookup_event(stream)?;
         drop(rowcache_guard);
         for i in 0..5 {
             let out = if i == 4 {

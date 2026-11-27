@@ -33,6 +33,9 @@ pub struct Hy4Engram<'a> {
     #[cfg(not(feature = "cuda"))]
     rowcache: Option<std::sync::Mutex<()>>,
     rowcache_slots: usize,
+    /// Stream event of the latest cache-backed lookup launch; the next
+    /// resolve synchronizes it before releasing that batch's pins.
+    rowcache_event: std::sync::Mutex<Option<u64>>,
     /// NVMe-mmap of the rank's bf16 table slice: `table` reads into it, so
     /// it must outlive every launch. Held for its Drop (the unmap), never
     /// read — hence the underscore name.
@@ -330,6 +333,7 @@ impl<'a> Hy4Engram<'a> {
             table,
             rowcache,
             rowcache_slots,
+            rowcache_event: std::sync::Mutex::new(None),
             _table_nvmap: table_nvmap,
             scales,
             lookup_norm,

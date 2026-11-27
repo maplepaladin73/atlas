@@ -11,7 +11,6 @@
 use super::Hy4Engram;
 use anyhow::{Result, ensure};
 #[cfg(feature = "cuda")]
-use std::sync::MutexGuard;
 
 /// Opt-in exact-row cache. Off preserves the existing mmap/device-resident
 /// table behavior bit-for-bit.
@@ -90,20 +89,17 @@ pub(crate) fn open_table(
     Ok(None)
 }
 
-/// A resolved batch's pin guard. The lookup kernel is launched while this
-/// guard is alive; dropping it ends the pin batch exactly as the existing
-/// n-gram embedders do. The faulted bytes are already host-visible before the
-/// launch, and the slots cannot be evicted while the guard is held.
+/// A resolved batch's pin guard. Pins are NOT released at drop: the lookup
+/// kernel runs asynchronously after the launch, so a slot dropped at launch
+/// time could be evicted and overwritten before the kernel reads it. Instead
+/// the batch stays pinned until the NEXT resolve on the same cache, which
+/// first synchronizes the event recorded after the previous lookup launch —
+/// stream-order proof that kernel completed — and only then ends the batch.
+/// This keeps at most one batch of pins outstanding per cache and preserves
+/// the single-batch pin model of `NgramRowCache`.
 #[cfg(feature = "cuda")]
 pub(crate) struct RowBatchGuard<'a> {
-    cache: MutexGuard<'a, spark_storage::NgramRowCache>,
-}
-
-#[cfg(feature = "cuda")]
-impl Drop for RowBatchGuard<'_> {
-    fn drop(&mut self) {
-        self.cache.end_batch();
-    }
+    _marker: std::marker::PhantomData<&'a ()>,
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -153,6 +149,20 @@ impl Hy4Engram<'_> {
         let mut cache = cache
             .lock()
             .map_err(|_| anyhow::anyhow!("Hy4 Engram row cache mutex poisoned"))?;
+        // Release the PREVIOUS batch's pins, but only after the event recorded
+        // after its lookup launch proves the kernel finished reading the slots.
+        // First resolve on this cache has no outstanding batch.
+        {
+            let mut pending = self
+                .rowcache_event
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Hy4 Engram row-cache event mutex poisoned"))?;
+            if let Some(event) = pending.take() {
+                self.mem.gpu.event_synchronize(event)?;
+                self.mem.gpu.destroy_event(event)?;
+                cache.end_batch();
+            }
+        }
         let mut slots = Vec::with_capacity(ids.len());
         cache.resolve(&ids, &mut slots)?;
         ensure!(
@@ -162,7 +172,9 @@ impl Hy4Engram<'_> {
         for (pos, slot) in positions.into_iter().zip(slots) {
             matrix[pos] = slot as i32;
         }
-        Ok(Some(RowBatchGuard { cache }))
+        Ok(Some(RowBatchGuard {
+            _marker: std::marker::PhantomData,
+        }))
     }
 
     #[cfg(not(feature = "cuda"))]
@@ -181,6 +193,36 @@ impl Hy4Engram<'_> {
         } else {
             (self.rows.start as u32, self.rows.len() as u32)
         }
+    }
+
+    /// Record the stream event that completes when the just-launched lookup
+    /// has finished reading the pinned slots. The next resolve synchronizes it
+    /// before releasing that batch's pins. No-op without the cache.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn record_lookup_event(&self, stream: u64) -> Result<()> {
+        if self.rowcache_slots == 0 {
+            return Ok(());
+        }
+        let event = self.mem.gpu.create_event()?;
+        self.mem.gpu.record_event(event, stream)?;
+        let mut pending = self
+            .rowcache_event
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Hy4 Engram row-cache event mutex poisoned"))?;
+        // The pin batch is released one resolve later; an event still pending
+        // here means a lookup launch was missed, which would leak pins — the
+        // release ordering is the correctness invariant, so fail loudly.
+        ensure!(
+            pending.is_none(),
+            "Hy4 Engram row-cache lookup event already pending"
+        );
+        *pending = Some(event);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub(crate) fn record_lookup_event(&self, _stream: u64) -> Result<()> {
+        Ok(())
     }
 
     /// Host-side HY4 n-gram hashes for one row. `context` is the oldest-first
