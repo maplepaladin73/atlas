@@ -297,11 +297,20 @@ extern "C" __global__ void hy4_index_scores_batch(const uint8_t* query,
     }
 }
 
+// Exact float ordering key for radix threshold selection. Zero is normalized
+// because IEEE equality treats -0.0 and +0.0 as ties while their bit patterns
+// differ. Physical DSA scores are finite; NaNs are not part of the model contract.
+static __device__ __forceinline__ unsigned eg_score_key(float x) {
+    if (x==0.0f) x=0.0f;
+    unsigned u=__float_as_uint(x);
+    return (u&0x80000000u)?~u:(u|0x80000000u);
+}
+
 // Batched top-K selection: one 256-thread block per row. Output is identical to
 // hy4_index_select (kept set = top 511 groups by score with ties broken toward
 // the lower group id; kept groups are written in ascending group-id order, each
-// emitting four consecutive token ids), but computed in O(groups log groups):
-// threshold bisection plus one ordered compaction sweep, instead of the
+// emitting four consecutive token ids), but computed with a fixed-width
+// radix threshold search plus one ordered compaction sweep, instead of the
 // O(groups^2) rank scan of the serial kernel.
 extern "C" __global__ void hy4_index_select_batch(const float* scores, int* output,
     unsigned groups_base, unsigned position_base, unsigned max_groups, unsigned rows) {
@@ -314,40 +323,22 @@ extern "C" __global__ void hy4_index_select_batch(const float* scores, int* outp
     const float* sc=scores+(size_t)row*max_groups;
     int* out=output+(size_t)row*2048;
     __shared__ unsigned prefix[256];
-    __shared__ float smin,smax,sT;
     __shared__ unsigned s_total,s_wbase,s_ewbase;
-    __shared__ float red[8];
     if (groups<=511) {
         for (unsigned g=tid;g<groups;g+=256)
             for (unsigned j=0;j<4;++j) out[g*4+j]=(int)(g*4+j);
     } else {
-        float lmin=INFINITY,lmax=-INFINITY;
-        for (unsigned g=tid;g<groups;g+=256) {float v=sc[g];lmin=fminf(lmin,v);lmax=fmaxf(lmax,v);}
-        for (unsigned off=16;off;off>>=1) {
-            lmin=fminf(lmin,__shfl_down_sync(0xffffffff,lmin,off));
-            lmax=fmaxf(lmax,__shfl_down_sync(0xffffffff,lmax,off));
-        }
-        if (lane==0) red[warp]=lmin;
-        __syncthreads();
-        if (tid<8) {
-            float v=red[tid];
-            for (unsigned off=4;off;off>>=1) v=fminf(v,__shfl_down_sync(0xff,v,off));
-            if (tid==0) smin=v;
-        }
-        __syncthreads();
-        if (lane==0) red[warp]=lmax;
-        __syncthreads();
-        if (tid<8) {
-            float v=red[tid];
-            for (unsigned off=4;off;off>>=1) v=fmaxf(v,__shfl_down_sync(0xff,v,off));
-            if (tid==0) smax=v;
-        }
-        __syncthreads();
-        float lo=smin-1.f,hi=smax;
-        for (unsigned it=0;it<64;++it) {
-            float mid=0.5f*(lo+hi);
+        // Exact radix threshold selection over the float-order keys. Binary
+        // search the 32-bit key space for the greatest T with at least 511
+        // scores >= T. This is exact for finite floats (unlike floating-point
+        // midpoint bisection, which can converge to a representable value that
+        // is not a score and lose the tie cohort), and needs 32 ordered-count
+        // sweeps instead of the serial kernel's groups-squared rank scan.
+        unsigned klo=0,khi=0xffffffffu;
+        for (unsigned it=0;it<32;++it) {
+            unsigned mid=(unsigned)(((unsigned long long)klo+(unsigned long long)khi+1ULL)>>1);
             unsigned c=0;
-            for (unsigned g=tid;g<groups;g+=256) c+=(sc[g]>mid)?1u:0u;
+            for (unsigned g=tid;g<groups;g+=256) c+=(eg_score_key(sc[g])>=mid)?1u:0u;
             for (unsigned off=16;off;off>>=1) c+=__shfl_down_sync(0xffffffff,c,off);
             if (lane==0) prefix[warp]=c;
             __syncthreads();
@@ -357,13 +348,11 @@ extern "C" __global__ void hy4_index_select_batch(const float* scores, int* outp
                 if (tid==0) s_total=v;
             }
             __syncthreads();
-            if (s_total>511u) lo=mid; else hi=mid;
+            if (s_total>=511u) klo=mid; else khi=mid-1u;
         }
-        if (tid==0) sT=hi;
-        __syncthreads();
-        float T=sT;
+        unsigned Tkey=klo;
         unsigned cnt=0;
-        for (unsigned g=tid;g<groups;g+=256) cnt+=(sc[g]>T)?1u:0u;
+        for (unsigned g=tid;g<groups;g+=256) cnt+=(eg_score_key(sc[g])>Tkey)?1u:0u;
         prefix[tid]=cnt;
         __syncthreads();
         for (unsigned stride=1;stride<256;stride*=2) {
@@ -380,8 +369,9 @@ extern "C" __global__ void hy4_index_select_batch(const float* scores, int* outp
         for (unsigned k=0;k<groups;k+=256) {
             unsigned g=k+tid;
             bool in=g<groups;
-            bool gt=in&&sc[g]>T;
-            bool eq=in&&sc[g]==T;
+            unsigned key=in?eg_score_key(sc[g]):0u;
+            bool gt=in&&key>Tkey;
+            bool eq=in&&key==Tkey;
             unsigned eqrank=0,eqtotal=0,keep=0;
             // scan eq bits first to know the tie order within this slab
             prefix[tid]=eq?1u:0u;
