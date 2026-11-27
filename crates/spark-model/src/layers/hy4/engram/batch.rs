@@ -84,40 +84,61 @@ impl<'a> Hy4Engram<'a> {
         let rows = history.len() - start;
         let heads = self.layout.sizes.len();
         let local = self.heads.len() * self.dim;
-        // One H2D of the (token, previous, older) window plus one launch per
-        // stage for the whole chunk, replacing two launches per row.
-        let mut window = Vec::with_capacity(rows * 3);
-        for r in 0..rows {
-            let p = start + r;
-            window.push(history[p] as i32);
-            window.push(p.checked_sub(1).map_or(-1, |i| history[i] as i32));
-            window.push(p.checked_sub(2).map_or(-1, |i| history[i] as i32));
-        }
-        gpu.copy_h2d_async(
-            &window
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect::<Vec<_>>(),
-            b.tokens,
-            stream,
-        )?;
         {
             let _lookup = super::super::timing::span("engram_lookup", stream)?;
-            KernelLaunch::new(gpu, self.kernels[5])
-                .grid([rows as u32, 1, 1])
-                .block([32, 1, 1])
-                .arg_ptr(b.tokens)
-                .arg_ptr(self.map)
-                .arg_ptr(self.multipliers)
-                .arg_ptr(self.sizes)
-                .arg_ptr(self.offsets)
-                .arg_ptr(b.hashes)
-                .arg_u32(self.layout.map.len() as u32)
-                .arg_u32(heads as u32)
-                .arg_u32(self.layout.heads_per_order as u32)
-                .arg_u32(self.layout.pad)
-                .arg_u32(rows as u32)
-                .launch(stream)?;
+            let rowcache_guard = if self.rowcache_slots > 0 {
+                let mut matrix = vec![-1i32; rows * heads];
+                for r in 0..rows {
+                    let p = start + r;
+                    let mut context = Vec::with_capacity(2);
+                    if p >= 2 {
+                        context.push(history[p - 2]);
+                    }
+                    if p >= 1 {
+                        context.push(history[p - 1]);
+                    }
+                    let row_hashes = self.host_hashes(&context, history[p])?;
+                    matrix[r * heads..(r + 1) * heads].copy_from_slice(&row_hashes);
+                }
+                let guard = self.resolve_hash_matrix(&mut matrix)?;
+                let bytes: Vec<u8> = matrix.iter().flat_map(|v| v.to_le_bytes()).collect();
+                gpu.copy_h2d_async(&bytes, b.hashes, stream)?;
+                guard
+            } else {
+                // One H2D of the (token, previous, older) window plus one
+                // hash launch for the whole chunk, replacing per-row launches.
+                let mut window = Vec::with_capacity(rows * 3);
+                for r in 0..rows {
+                    let p = start + r;
+                    window.push(history[p] as i32);
+                    window.push(p.checked_sub(1).map_or(-1, |i| history[i] as i32));
+                    window.push(p.checked_sub(2).map_or(-1, |i| history[i] as i32));
+                }
+                gpu.copy_h2d_async(
+                    &window
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                    b.tokens,
+                    stream,
+                )?;
+                KernelLaunch::new(gpu, self.kernels[5])
+                    .grid([rows as u32, 1, 1])
+                    .block([32, 1, 1])
+                    .arg_ptr(b.tokens)
+                    .arg_ptr(self.map)
+                    .arg_ptr(self.multipliers)
+                    .arg_ptr(self.sizes)
+                    .arg_ptr(self.offsets)
+                    .arg_ptr(b.hashes)
+                    .arg_u32(self.layout.map.len() as u32)
+                    .arg_u32(heads as u32)
+                    .arg_u32(self.layout.heads_per_order as u32)
+                    .arg_u32(self.layout.pad)
+                    .arg_u32(rows as u32)
+                    .launch(stream)?;
+                None
+            };
             let lookup = KernelLaunch::new(gpu, self.kernels[6])
                 .grid([self.heads.len() as u32, rows as u32, 1])
                 .block([128, 1, 1])
@@ -128,17 +149,19 @@ impl<'a> Hy4Engram<'a> {
             } else {
                 lookup
             };
+            let (base_row, local_rows) = self.lookup_bounds();
             lookup
                 .arg_ptr(self.lookup_norm)
                 .arg_ptr(b.lookup)
                 .arg_u32(self.heads.start as u32)
-                .arg_u32(self.rows.start as u32)
-                .arg_u32(self.rows.len() as u32)
+                .arg_u32(base_row)
+                .arg_u32(local_rows)
                 .arg_u32(self.dim as u32)
                 .arg_u32(heads as u32)
                 .arg_u32(local as u32)
                 .arg_u32(rows as u32)
                 .launch(stream)?;
+            drop(rowcache_guard);
         }
         // Tensor-core path for the projections (same GEMM as the scalar
         // kernel: bias iff topology[0]==0, weight column window starting at

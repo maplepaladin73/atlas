@@ -98,6 +98,12 @@ impl HashLayout {
     /// masks injection but remains ordinary mapped context for later tokens.
     pub fn hash(&self, history: &[i64], token: i64) -> Result<Vec<i32>> {
         self.validate()?;
+        self.hash_validated(history, token)
+    }
+    /// `hash` without the per-call `validate`: the layout is validated once
+    /// at load, and the serving loop hashes every row of every chunk —
+    /// re-walking the vocab map each time would dwarf the hash itself.
+    pub fn hash_validated(&self, history: &[i64], token: i64) -> Result<Vec<i32>> {
         if token < 0 || token as usize >= self.map.len() || token == self.pad as i64 {
             return Ok(vec![-1; self.sizes.len()]);
         }
