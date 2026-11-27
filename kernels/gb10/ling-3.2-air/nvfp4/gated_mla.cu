@@ -623,12 +623,18 @@ extern "C" __global__ void ling_mla_prefill_attn(
 // CTA = 16 query rows (one m-tile) against 32-row KV tiles. The four warps
 // split the 32-wide score tile into 8-column n-tiles for QK^T and the
 // 512-dim V axis into 128-column quarters for the PV pass. Score/softmax
-// are shadowed in smem; P is stored bf16 for the PV mma.
+// are shadowed in smem; P is stored as a bf16 hi/lo split pair for the
+// PV mma: a plain bf16 P carries only 8 mantissa bits against the scalar
+// kernel's fp32 probabilities, which measurably flips borderline greedy
+// tokens downstream (the tools e2e email-copy check fails with a plain
+// bf16 P), so the PV pass runs a second accumulating mma over the lo
+// residual. hi + lo costs one extra mma per step and restores ~16
+// mantissa bits of P precision.
 //
 // K and V are streamed straight from global memory (L2/L1-cached) instead
 // of staged in smem: the smem-staged design held 91,392 B per CTA, which
 // capped GB10 at 1 CTA/SM (4 warps in flight). Staging only the query tile
-// (18,432 B) plus the score/P/softmax shadow (~3.3 KB) leaves 21,760 B per
+// (18,432 B) plus the score/P/softmax shadow leaves 22,784 B per
 // CTA, so shared memory alone allows 4 CTAs on a 102,400 B SM. K rows past kv_run
 // are skipped outright (their scores are masked downstream anyway) and the
 // Q rows past seq_len are zero-filled, so no OOB read is ever performed.
@@ -662,6 +668,7 @@ extern "C" __global__ void __launch_bounds__(128, 4) ling_mla_prefill_attn_mma(
     __shared__ __nv_bfloat16 q_smem[16u * 576u];
     __shared__ float score_smem[16u * 32u];
     __shared__ __nv_bfloat16 p_smem[16u * 32u];
+    __shared__ __nv_bfloat16 p_lo_smem[16u * 32u];
     // per-row m_new, l_prev, alpha (slot 3 unused)
     __shared__ float ml_smem[16u * 4u];
 
@@ -774,7 +781,10 @@ extern "C" __global__ void __launch_bounds__(128, 4) ling_mla_prefill_attn_mma(
                 const bool valid = row_valid && (pos < limit);
                 const float p =
                     valid ? __expf(score_smem[row * 32u + c] - m_new) : 0.0f;
-                p_smem[row * 32u + c] = __float2bfloat16(p);
+                const __nv_bfloat16 p_hi = __float2bfloat16(p);
+                p_smem[row * 32u + c] = p_hi;
+                p_lo_smem[row * 32u + c] =
+                    __float2bfloat16(p - __bfloat162float(p_hi));
                 l_tile += p;
             }
             ml_smem[row * 4u + 0] = m_new;
@@ -797,6 +807,7 @@ extern "C" __global__ void __launch_bounds__(128, 4) ling_mla_prefill_attn_mma(
         }
         {
             const unsigned short* p_u16 = reinterpret_cast<const unsigned short*>(p_smem);
+            const unsigned short* p_lo_u16 = reinterpret_cast<const unsigned short*>(p_lo_smem);
             const unsigned short* v_u16 = reinterpret_cast<const unsigned short*>(V);
             #pragma unroll
             for (unsigned int nt = 0; nt < 16u; ++nt) {
@@ -846,6 +857,20 @@ extern "C" __global__ void __launch_bounds__(128, 4) ling_mla_prefill_attn_mma(
                         : "+f"(o_acc[nt * 4u + 0]), "+f"(o_acc[nt * 4u + 1]),
                           "+f"(o_acc[nt * 4u + 2]), "+f"(o_acc[nt * 4u + 3])
                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                    const unsigned int l0 =
+                        *reinterpret_cast<const unsigned int*>(&p_lo_u16[group_id * 32u + ac0]);
+                    const unsigned int l1 =
+                        *reinterpret_cast<const unsigned int*>(&p_lo_u16[(group_id + 8u) * 32u + ac0]);
+                    const unsigned int l2 =
+                        *reinterpret_cast<const unsigned int*>(&p_lo_u16[group_id * 32u + ac1]);
+                    const unsigned int l3 =
+                        *reinterpret_cast<const unsigned int*>(&p_lo_u16[(group_id + 8u) * 32u + ac1]);
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                        : "+f"(o_acc[nt * 4u + 0]), "+f"(o_acc[nt * 4u + 1]),
+                          "+f"(o_acc[nt * 4u + 2]), "+f"(o_acc[nt * 4u + 3])
+                        : "r"(l0), "r"(l1), "r"(l2), "r"(l3), "r"(b0), "r"(b1));
                 }
             }
         }
