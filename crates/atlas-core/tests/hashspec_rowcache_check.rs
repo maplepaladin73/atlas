@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 // quick check: transliteration of the CUDA hy4_engram_hash_batch kernel vs HashLayout::hash_validated
 #[test]
 fn cuda_kernel_spec_matches_host_hash() {
