@@ -127,6 +127,9 @@ pub(super) enum Pick {
     /// A k-chain kernel, preferring the fast tiles, or nothing -- to replace
     /// a k-chain GEMM of another library ([`bf16_gemm_act_weight_t_kchain`]).
     Force,
+    /// The heuristic's first split-K-free, reduction-free algorithm that
+    /// reports no workspace requirement, whatever its implementation tile.
+    InOrderNoWorkspace,
 }
 
 impl Pick {
@@ -134,7 +137,7 @@ impl Pick {
     pub(super) fn requested(self) -> i32 {
         match self {
             Pick::First => 1,
-            Pick::Pin | Pick::Force => CANDIDATES as i32,
+            Pick::Pin | Pick::Force | Pick::InOrderNoWorkspace => CANDIDATES as i32,
         }
     }
 
@@ -148,6 +151,9 @@ impl Pick {
             Pick::Pin => pick(results, found),
             Pick::Force => FORCE_TILES.iter().find_map(|&tile| {
                 (0..found).find(|&i| kchain(at(i)) && attr(at(i), CONFIG_TILE_ID) == Some(tile))
+            })?,
+            Pick::InOrderNoWorkspace => (0..found).find(|&i| {
+                state_success(results, i) && in_order(at(i)) && workspace_bytes(results, i) == 0
             })?,
         };
         Some(i * RESULT_BYTES)
@@ -213,6 +219,51 @@ pub fn bf16_gemm_act_weight_t_kchain_any(
     )
 }
 
+/// `out[M,N] = act[M,K] @ weight[N,K]^T` (BF16) on the heuristic's first
+/// split-K-free, reduction-free algorithm that reports zero workspace bytes.
+/// The workspace filter is the serve-safety contract: concurrent lanes cannot
+/// race through the shared cuBLASLt workspace when the selected kernel does
+/// not use one. Tensor-core implementations may still order their FP32 MMA
+/// accumulation differently from the scalar GEMM, so this is a numerically
+/// close production GEMM lane, not a byte-identity promise. `Ok(false)`:
+/// unavailable or no such algorithm offered; nothing was launched.
+pub fn bf16_gemm_act_weight_t_in_order_no_workspace(
+    act: u64,
+    weight: u64,
+    out: u64,
+    [m, n, k]: [u32; 3],
+    stream: u64,
+) -> anyhow::Result<bool> {
+    if super::version() < 130000 || !super::available() {
+        return Ok(false);
+    }
+    super::gemm_bf16::gemm_bf16_pick(
+        act,
+        weight,
+        out,
+        [m, n, k],
+        super::CUBLAS_OP_T,
+        Pick::InOrderNoWorkspace,
+        super::CUDA_R_16BF,
+        stream,
+    )
+}
+
+/// Whether heuristic result `i` is a successful result (offset 72 after the
+/// algo blob and `size_t workspaceSize`; `CUBLAS_STATUS_SUCCESS` is zero).
+fn state_success(results: &[u8], i: usize) -> bool {
+    let base = i * RESULT_BYTES + 72;
+    i32::from_ne_bytes(results[base..base + 4].try_into().unwrap()) == 0
+}
+
+/// Workspace size field of heuristic result `i` (the C struct is the 64-byte
+/// algo blob followed by `size_t workspaceSize` at offset 64; `RESULT_BYTES`
+/// is the padded 96-byte CUDA 12/13 size).
+fn workspace_bytes(results: &[u8], i: usize) -> usize {
+    let base = i * RESULT_BYTES + 64;
+    usize::from_ne_bytes(results[base..base + 8].try_into().unwrap())
+}
+
 /// The pin's index among `found` heuristic results packed at `RESULT_BYTES`
 /// in `results`.
 fn pick(results: &[u8], found: usize) -> usize {
@@ -230,7 +281,18 @@ fn pick(results: &[u8], found: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::unsplit;
+    use super::{RESULT_BYTES, state_success, unsplit, workspace_bytes};
+
+    #[test]
+    fn heuristic_result_layout_reads_state_then_workspace() {
+        let mut results = [0u8; RESULT_BYTES];
+        results[64..72].copy_from_slice(&123usize.to_ne_bytes());
+        results[72..76].copy_from_slice(&0i32.to_ne_bytes());
+        assert!(state_success(&results, 0));
+        assert_eq!(workspace_bytes(&results, 0), 123);
+        results[72..76].copy_from_slice(&7i32.to_ne_bytes());
+        assert!(!state_success(&results, 0));
+    }
 
     #[test]
     fn only_split_k_zero_or_one_without_a_reduction_is_in_order() {
