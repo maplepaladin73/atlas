@@ -201,7 +201,31 @@ impl<'a> Hy4Engram<'a> {
                 }
                 v
             };
-            hotcache::load(&mut mem, layer_pos, heads.clone(), &head_offsets, dim)?
+            // Verify sampled cache rows against the live table slice so a
+            // stale sidecar fails startup loudly instead of mixing old and
+            // new weights. Rows outside this rank's slice — and the
+            // device-resident path, which has no host bytes — skip.
+            let ver_closure = |rowid: u32, expect: &[u8]| -> bool {
+                let r = rowid as usize;
+                if r < rows.start || r >= rows.end {
+                    return true;
+                }
+                match table_nvmap
+                    .as_ref()
+                    .and_then(|m| m.row_bytes(r - rows.start, dim * 2))
+                {
+                    Some(actual) => actual == expect,
+                    None => true,
+                }
+            };
+            hotcache::load(
+                &mut mem,
+                layer_pos,
+                heads.clone(),
+                &head_offsets,
+                dim,
+                Some(&ver_closure),
+            )?
         };
         let lookup_norm = join(
             &mut mem,
