@@ -51,6 +51,7 @@ pub(crate) fn load(
     heads: std::ops::Range<usize>,
     head_offsets: &[usize],
     dim: usize,
+    verify: Option<&dyn Fn(u32, &[u8]) -> bool>,
 ) -> Result<Option<HotCache>> {
     let path = match std::env::var(PATH_ENV) {
         Ok(p) if !p.is_empty() => p,
@@ -66,7 +67,23 @@ pub(crate) fn load(
     let (layers, nheads, row_bytes, k) =
         (hdr[2] as usize, hdr[3] as usize, hdr[4] as usize, hdr[5] as usize);
     ensure!(layer_pos < layers && heads.end <= nheads, "hotcache layer/head range");
-    let sec_bytes = 4 + k * 4 + k * row_bytes;
+    // Sections are variable-length (`count` rows each), so the only sound
+    // way to reach one is walking the file in order — a fixed stride
+    // misreads everything after a short section.
+    let mut cursor = 24usize;
+    let mut sections: std::collections::HashMap<(usize, usize), (usize, usize)> =
+        std::collections::HashMap::new();
+    for l in 0..layers {
+        for h in 0..nheads {
+            ensure!(cursor + 4 <= file.len(), "hotcache section truncated");
+            let count = u32::from_le_bytes(file[cursor..cursor + 4].try_into().unwrap()) as usize;
+            ensure!(count <= k, "hotcache count over k");
+            let bytes = 4 + count * 4 + count * row_bytes;
+            ensure!(cursor + bytes <= file.len(), "hotcache section data truncated");
+            sections.insert((l, h), (cursor, count));
+            cursor += bytes;
+        }
+    }
     // Gather this rank's head sections in head order: layer-wide ids
     // (adding the constant head offset preserves the ascending sort).
     let mut keys: Vec<u32> = Vec::new();
@@ -77,18 +94,38 @@ pub(crate) fn load(
         if !heads.contains(&h) {
             continue;
         }
-        let at = 24 + (layer_pos * nheads + h) * sec_bytes;
-        ensure!(at + sec_bytes <= file.len(), "hotcache section truncated");
-        let count = u32::from_le_bytes(file[at..at + 4].try_into().unwrap()) as usize;
-        ensure!(count <= k, "hotcache count over k");
+        let (at, count) = sections[&(layer_pos, h)];
         let ids_at = at + 4;
         let rows_at = ids_at + count * 4;
         let hoff = head_offsets[h] as u32;
         keys.extend(u32s(&file[ids_at..rows_at]).map(|r| r + hoff));
         rows.extend_from_slice(&file[rows_at..rows_at + count * row_bytes]);
+        if let Some(verify) = verify {
+            // Up to 8 evenly spaced rows per section: enough that a stale
+            // sidecar cannot plausibly survive, cheap enough that the
+            // startup cost is a handful of page faults.
+            let samples = count.min(8);
+            for i in 0..samples {
+                let r = i * count / samples;
+                let rowid = u32::from_le_bytes(
+                    file[ids_at + r * 4..ids_at + r * 4 + 4].try_into().unwrap(),
+                ) + hoff;
+                let expect =
+                    &file[rows_at + r * row_bytes..rows_at + (r + 1) * row_bytes];
+                ensure!(
+                    verify(rowid, expect),
+                    "engram hotcache row {rowid} does not match the checkpoint table —                      the sidecar is stale; rebuild it for this checkpoint"
+                );
+            }
+        }
     }
     offs[nheads] = keys.len() as u32;
     let count = keys.len();
+    if count == 0 {
+        // No hot rows for this rank's heads: run uncached rather than fail
+        // startup on the empty upload.
+        return Ok(None);
+    }
     let keys_b: Vec<u8> = keys.iter().flat_map(|v| v.to_le_bytes()).collect();
     let offs_b: Vec<u8> = offs.iter().flat_map(|v| v.to_le_bytes()).collect();
     let dkeys = mem.upload(&keys_b)?;
