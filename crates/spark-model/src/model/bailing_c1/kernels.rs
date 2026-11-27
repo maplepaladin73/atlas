@@ -68,6 +68,8 @@ pub(crate) struct LingKernels {
     pub mla_ctx_gather_k: KernelHandle,
     // moe_decode.cu
     pub moe_route_k: KernelHandle,
+    pub moe_route_select_k: KernelHandle,
+    pub moe_xwiden_k: KernelHandle,
     pub moe_gate_up_k: KernelHandle,
     pub moe_down_k: KernelHandle,
     pub moe_unpermute_k: KernelHandle,
@@ -132,6 +134,8 @@ impl LingKernels {
             mla_prefill_attn_mma_k: required(gpu, "gated_mla", "ling_mla_prefill_attn_mma")?,
             mla_ctx_gather_k: required(gpu, "gated_mla", "ling_mla_ctx_gather")?,
             moe_route_k: required(gpu, "moe_decode", "ling_moe_route")?,
+            moe_route_select_k: required(gpu, "moe_decode", "ling_moe_route_select")?,
+            moe_xwiden_k: required(gpu, "moe_decode", "ling_moe_xwiden")?,
             moe_gate_up_k: required(gpu, "moe_decode", "ling_moe_gate_up_silu")?,
             moe_down_k: required(gpu, "moe_decode", "ling_moe_down")?,
             moe_unpermute_k: required(gpu, "moe_decode", "ling_moe_unpermute")?,

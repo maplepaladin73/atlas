@@ -59,6 +59,26 @@
 #define LMOE_ROUTE_WARPS 8
 #define LMOE_MAX_TOPK 8
 
+// ── Widen: BF16 activation rows to FP32 for the router GEMM ───────────────
+//
+// The router logits now come from a cuBLASLt TF32 tensor-core GEMM (the
+// fused kernel's warp-per-expert GEMV dataflow re-streamed the activation
+// rows per expert and serialized rows within each warp). FP32 out,
+// elementwise; grid covers ceil(M*K / (256*4)) CTAs, thread handles 4 bf16.
+extern "C" __global__ void __launch_bounds__(256) ling_moe_xwiden(
+    const __nv_bfloat16* __restrict__ x,     // [M, K] bf16
+    float* __restrict__ out,                 // [M, K] fp32
+    unsigned int total                       // M * K
+) {
+    const unsigned int i0 = (blockIdx.x * 256u + threadIdx.x) * 4u;
+    if (i0 >= total) return;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const unsigned int i = i0 + (unsigned int)j;
+        if (i < total) out[i] = __bfloat162float(x[i]);
+    }
+}
+
 // ── Route: one launch for router GEMV + input quant + select + sort ────────
 //
 // Grid (router_ctas + quant_ctas, 1, 1), block (256, 1, 1):
@@ -91,18 +111,19 @@ extern "C" __global__ void __launch_bounds__(256) ling_moe_route(
     unsigned int top_k, unsigned int n_group, unsigned int topk_group,
     float routed_scaling_factor,
     const unsigned int* __restrict__ row_live,  // [M], or null (all live)
-    unsigned int* __restrict__ done              // zeroed between launches
+    unsigned int* __restrict__ done,             // zeroed between launches
+    unsigned int skip_gemv                       // nonzero: logits precomputed
 ) {
     atlas_pdl_enter();
     if (E > LMOE_ROUTE_MAX_E || E % n_group != 0u || n_group > 16u || top_k > 16u
         || K % LMOE_KS != 0u || M == 0u || (E / n_group) % 32u != 0u)
         return;
-    const unsigned int router_ctas = (E + 7u) / 8u;
+    const unsigned int router_ctas = skip_gemv ? 0u : (E + 7u) / 8u;
     const unsigned int groups = M * (K / 16u);
     const unsigned int quant_ctas = (groups + 255u) / 256u;
     const unsigned int t = threadIdx.x;
 
-    if (blockIdx.x < router_ctas) {
+    if (!skip_gemv && blockIdx.x < router_ctas) {
         const unsigned int warp = t / 32u, lane = t % 32u;
         const unsigned int e = blockIdx.x * 8u + warp;
         if (e < E) {
@@ -170,7 +191,57 @@ extern "C" __global__ void __launch_bounds__(256) ling_moe_route(
         }
     }
 
-    // Every CTA fences and counts; the last one to finish runs selection.
+    (void)done;
+}
+
+// ── Select: grid-parallel top-k selection + single-CTA sort ───────────────
+//
+// The selection scan is per-row independent, so unlike the fused design's
+// single trailing CTA (8 warps for the whole chunk) this kernel gives every
+// CTA 8 rows -- ceil(M/8) CTAs, 512 at rows 4096 against the fused 1. The
+// per-row arithmetic is bit-identical to the fused kernel's, as is the
+// single-CTA counting sort / worklist tail the last-finishing CTA runs.
+//
+// Grid: (ceil(M / 8), 1, 1), block (256, 1, 1); warp w of CTA c selects row
+// c * 8 + w.
+extern "C" __global__ void __launch_bounds__(256) ling_moe_route_select(
+    float* __restrict__ logits,              // [M, E] fp32 scratch
+    const float* __restrict__ bias,          // [E] fp32
+    unsigned int* __restrict__ topk_ids,      // [M, top_k]
+    float* __restrict__ topk_weights,         // [M, top_k]
+    int* __restrict__ sorted_token_ids,      // [M, top_k]
+    int* __restrict__ token_to_perm,         // [M, top_k]
+    int* __restrict__ expert_offsets,        // [E + 1]
+    unsigned int* __restrict__ worklist,     // [1 + 2 * max_items]
+    unsigned int max_items, unsigned int m_tile,
+    unsigned int M, unsigned int E,
+    unsigned int top_k, unsigned int n_group, unsigned int topk_group,
+    float routed_scaling_factor,
+    const unsigned int* __restrict__ row_live,  // [M], or null (all live)
+    unsigned int* __restrict__ done              // zeroed between launches
+) {
+    atlas_pdl_enter();
+    if (E > LMOE_ROUTE_MAX_E || E % n_group != 0u || n_group > 16u || top_k > 16u
+        || M == 0u || (E / n_group) % 32u != 0u)
+        return;
+    const unsigned int t = threadIdx.x;
+
+    // ── Selection: 8 warps per CTA, one row each ──────────────────────────
+    __shared__ __align__(16) float s_sig[LMOE_ROUTE_WARPS][LMOE_ROUTE_MAX_E];
+    __shared__ __align__(16) float s_sel[LMOE_ROUTE_WARPS][LMOE_ROUTE_MAX_E];
+    __shared__ __align__(16) float s_bias[LMOE_ROUTE_MAX_E];
+    for (unsigned int i = t; i < E; i += 256u) s_bias[i] = __ldcg(bias + i);
+    __syncthreads();
+    const unsigned int warp = t / 32u;
+    const unsigned int row = blockIdx.x * 8u + warp;
+    if (row < M) {
+        ling_route_topk_row(logits + (unsigned long long)row * E, s_bias,
+                            s_sig[warp], s_sel[warp], topk_ids, topk_weights,
+                            row_live, row, E, top_k, n_group, topk_group,
+                            routed_scaling_factor);
+    }
+
+    // Every CTA fences and counts; the last one to finish runs the sort.
     __shared__ unsigned int s_last;
     __threadfence();
     __syncthreads();
@@ -178,20 +249,6 @@ extern "C" __global__ void __launch_bounds__(256) ling_moe_route(
     __syncthreads();
     if (s_last == 0u) return;
     __threadfence();
-
-    // ── Selection: 8 warps, a row each ────────────────────────────────────
-    __shared__ __align__(16) float s_sig[LMOE_ROUTE_WARPS][LMOE_ROUTE_MAX_E];
-    __shared__ __align__(16) float s_sel[LMOE_ROUTE_WARPS][LMOE_ROUTE_MAX_E];
-    __shared__ __align__(16) float s_bias[LMOE_ROUTE_MAX_E];
-    for (unsigned int i = t; i < E; i += 256u) s_bias[i] = __ldcg(bias + i);
-    __syncthreads();
-    const unsigned int warp = t / 32u;
-    for (unsigned int row = warp; row < M; row += LMOE_ROUTE_WARPS)
-        ling_route_topk_row(logits + (unsigned long long)row * E, s_bias,
-                            s_sig[warp], s_sel[warp], topk_ids, topk_weights,
-                            row_live, row, E, top_k, n_group, topk_group,
-                            routed_scaling_factor);
-    __syncthreads();
 
     // ── Sort: counting sort over the (row, slot) assignments ──────────────
     __shared__ unsigned int s_cnt[LMOE_ROUTE_MAX_E];
