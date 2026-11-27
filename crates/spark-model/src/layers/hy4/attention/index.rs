@@ -124,13 +124,15 @@ impl AttentionCache<'_, '_> {
                 .launch(stream)?;
         }
         let _phase = timing::span("dsa_select", stream)?;
-        KernelLaunch::new(gpu, a.kernels.select)
+        KernelLaunch::new(gpu, a.kernels.select_batch)
             .grid([1, 1, 1])
             .block([256, 1, 1])
             .arg_ptr(s.scores)
             .arg_ptr(s.indices)
-            .arg_u32(groups as u32)
             .arg_u32(self.len as u32)
+            .arg_u32(self.len as u32)
+            .arg_u32(groups.max(1) as u32)
+            .arg_u32(1)
             .launch(stream)
     }
 
