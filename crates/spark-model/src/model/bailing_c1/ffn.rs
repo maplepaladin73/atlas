@@ -13,8 +13,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 pub(crate) use super::spec::FfnKind;
-use super::{LingKernels, LingScratch};
-use crate::layers::ops;
+use super::{LingKernels, LingScratch, prefill_gemm};
 use crate::weight_map::DenseWeight;
 
 /// One module's routed-expert device tables: repacked packed/scale pointers
@@ -184,9 +183,9 @@ impl LingFfn {
         let m = rows as u32;
         let inter = self.inter as u32;
         let hidden = self.hidden as u32;
-        ops::bf16_gemm(x, gate.weight.0, h, m, inter, hidden, stream)?;
+        prefill_gemm::proj_gemm(gpu, k, x, gate, h, m, inter, hidden, stream)?;
         let up_buf = s.mla_latent;
-        ops::bf16_gemm(x, up.weight.0, up_buf, m, inter, hidden, stream)?;
+        prefill_gemm::proj_gemm(gpu, k, x, up, up_buf, m, inter, hidden, stream)?;
         KernelLaunch::new(gpu, k.moe_swiglu_epilogue_k)
             .grid([div_ceil((rows * self.inter) as u32, 256), 1, 1])
             .block([256, 1, 1])
@@ -196,7 +195,7 @@ impl LingFfn {
             .arg_u64((rows * self.inter) as u64)
             .arg_f32(limit)
             .launch(stream)?;
-        ops::bf16_gemm(h, down.weight.0, y, m, hidden, inter, stream)
+        prefill_gemm::proj_gemm(gpu, k, h, down, y, m, hidden, inter, stream)
     }
 
     fn forward_dense(

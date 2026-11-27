@@ -125,6 +125,7 @@ mod ffn;
 mod kda;
 mod kernels;
 mod mla;
+mod prefill_gemm;
 mod scratch;
 mod spec;
 
