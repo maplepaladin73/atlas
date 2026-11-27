@@ -34,7 +34,7 @@ unsafe extern "C" {
 
 const HEADS: u32 = 32;
 const KV_DIM: u32 = 576; // kv_lora 512 | k rope raw 64
-const LAT: u32 = 512;   // latent dims per head
+const LAT: u32 = 512; // latent dims per head
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -141,7 +141,9 @@ fn main() -> Result<()> {
         ));
     }
     if std::env::var("MMA_BENCH_PROPS").as_deref() == Ok("1") {
-        unsafe extern "C" { fn cuFuncGetAttribute(value: *mut i32, attr: i32, func: u64) -> i32; }
+        unsafe extern "C" {
+            fn cuFuncGetAttribute(value: *mut i32, attr: i32, func: u64) -> i32;
+        }
         for (name, h) in [("scalar", h_scalar.0), ("mma", h_mma.0)] {
             let mut v: i32 = -1;
             let r = unsafe { cuFuncGetAttribute(&mut v, 1, h) };
@@ -161,7 +163,9 @@ fn main() -> Result<()> {
             println!("{name}: {v}  (status={r})");
         }
     }
-    println!("=== mla_prefill_attn_bench: seq_len={seq_len} heads={HEADS} causal={causal} kv_base={kv_base} reps={reps} ===");
+    println!(
+        "=== mla_prefill_attn_bench: seq_len={seq_len} heads={HEADS} causal={causal} kv_base={kv_base} reps={reps} ==="
+    );
     for line in &out {
         println!("{line}");
     }

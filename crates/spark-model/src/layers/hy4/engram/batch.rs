@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use super::{EngramScratch, Hy4Engram};
+use super::{BatchPurpose, EngramScratch, Hy4Engram, hotcache};
 use crate::layers::hy4::{attention::memory::Owned, batch};
 use anyhow::{Result, ensure};
 use spark_comm::CommBackend;
@@ -39,6 +39,7 @@ impl<'a> Hy4Engram<'a> {
         hidden: DevicePtr,
         history: &[u32],
         start: usize,
+        purpose: BatchPurpose,
         scratch: &mut EngramScratch<'a>,
         comm: Option<&dyn CommBackend>,
         stream: u64,
@@ -66,7 +67,7 @@ impl<'a> Hy4Engram<'a> {
             Some(b) => b,
             None => BatchScratch::new(self)?,
         };
-        let result = self.batch_rows(hidden, history, start, &b, comm, stream);
+        let result = self.batch_rows(hidden, history, start, purpose, &b, comm, stream);
         scratch.batch = Some(b);
         result
     }
@@ -76,6 +77,7 @@ impl<'a> Hy4Engram<'a> {
         hidden: DevicePtr,
         history: &[u32],
         start: usize,
+        purpose: BatchPurpose,
         b: &BatchScratch<'_>,
         comm: Option<&dyn CommBackend>,
         stream: u64,
@@ -125,6 +127,16 @@ impl<'a> Hy4Engram<'a> {
                 .arg_ptr(self.table);
             let lookup = if self.fp8_table {
                 lookup.arg_ptr(self.scales)
+            } else if let Some(hc) = &self.hotcache {
+                lookup
+                    .arg_ptr(hc.keys)
+                    .arg_ptr(hc.rows)
+                    .arg_ptr(hc.offs)
+                    .arg_ptr(hc.stats)
+                    .arg_u32(match purpose {
+                        BatchPurpose::Prefill => hotcache::STATS_KIND_PREFILL,
+                        BatchPurpose::Verify => hotcache::STATS_KIND_VERIFY,
+                    })
             } else {
                 lookup
             };
@@ -242,6 +254,9 @@ impl<'a> Hy4Engram<'a> {
                 .arg_u32(heads as u32)
                 .arg_u32(rows as u32)
                 .launch(stream)?;
+        }
+        if let Some(hc) = &self.hotcache {
+            hc.maybe_report_stats(gpu, self.topology[0], stream)?;
         }
         Ok(())
     }

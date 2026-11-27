@@ -95,24 +95,38 @@ extern "C" __global__ void hy4_group_init(unsigned* groups,unsigned rows,unsigne
 }
 extern "C" __global__ void hy4_group_rows(const unsigned* ids,unsigned* groups,
     unsigned rows,unsigned slots) {
+    // 256-thread block scans the rows in 256-row tiles with a running carry:
+    // wide prefill chunks exceed the block width, and rows past the first
+    // tile must still enter their expert's list or their outputs stay
+    // unwritten scratch.
     __shared__ unsigned prefix[256];
-    unsigned t=threadIdx.x,e=blockIdx.x,slot=slots;
-    if(t<rows)for(unsigned s=0;s<slots;s++)
-        if(!ids || ids[(size_t)t*slots+s]==e){slot=s;break;}
-    prefix[t]=slot<slots;__syncthreads();
-    for(unsigned d=1;d<256;d*=2) {
-        unsigned v=t>=d?prefix[t-d]:0;__syncthreads();
-        prefix[t]+=v;__syncthreads();
-    }
+    __shared__ unsigned carry;
+    unsigned t=threadIdx.x,e=blockIdx.x;
     unsigned* list=groups+(size_t)e*(rows+1);
+    if(t==0)carry=0;
+    __syncthreads();
+    for(unsigned base=0;base<rows;base+=256) {
+        unsigned r=base+t,slot=slots;
+        if(r<rows)for(unsigned s=0;s<slots;s++)
+            if(!ids || ids[(size_t)r*slots+s]==e){slot=s;break;}
+        unsigned flag=slot<slots;
+        prefix[t]=flag;__syncthreads();
+        for(unsigned d=1;d<256;d*=2) {
+            unsigned v=t>=d?prefix[t-d]:0;__syncthreads();
+            prefix[t]+=v;__syncthreads();
+        }
+        if(flag)list[carry+prefix[t]]=r*slots+slot;
+        __syncthreads();
+        if(t==255)carry+=prefix[255];
+        __syncthreads();
+    }
     if(t==0) {
-        list[0]=prefix[255];
-        if(prefix[255]) {
+        list[0]=carry;
+        if(carry) {
             unsigned* active=groups+(size_t)gridDim.x*(rows+1);
             active[1+atomicAdd(active,1u)]=e;
         }
     }
-    if(slot<slots)list[prefix[t]] = t*slots+slot;
 }
 
 __device__ __forceinline__ void hy4_qdots(const __nv_bfloat16* x,Hy4Q4 q,unsigned o,unsigned k,

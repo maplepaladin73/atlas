@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use super::{EngramScratch, Hy4Engram};
+use super::{EngramScratch, Hy4Engram, hotcache};
 use crate::layers::hy4::timing;
 use anyhow::{Context, Result, ensure};
 use spark_comm::CommBackend;
@@ -62,6 +62,13 @@ impl Hy4Engram<'_> {
             .arg_ptr(self.table);
         let lookup = if self.fp8_table {
             lookup.arg_ptr(self.scales)
+        } else if let Some(hc) = &self.hotcache {
+            lookup
+                .arg_ptr(hc.keys)
+                .arg_ptr(hc.rows)
+                .arg_ptr(hc.offs)
+                .arg_ptr(hc.stats)
+                .arg_u32(hotcache::STATS_KIND_DECODE)
         } else {
             lookup
         };
@@ -121,6 +128,10 @@ impl Hy4Engram<'_> {
             .arg_ptr(self.hc_scales)
             .arg_ptr(scratch.hashes)
             .arg_u32(self.h as u32)
-            .launch(stream)
+            .launch(stream)?;
+        if let Some(hc) = &self.hotcache {
+            hc.maybe_report_stats(self.mem.gpu, self.topology[0], stream)?;
+        }
+        Ok(())
     }
 }
