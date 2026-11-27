@@ -599,10 +599,16 @@ impl LingMlaLayer {
     ) -> Result<()> {
         let s = &self.scratch;
         let k = &self.kernels;
-        // Optional tensor-core lane (default off): the mma kernel shares the
-        // scalar kernel's launch contract (grid, arg order), differing only
-        // in block size (128 threads = 4 warps).
-        let use_mma = std::env::var("ATLAS_LING_MLA_PREFILL_MMA").as_deref() == Ok("1");
+        // Tensor-core lane (default on): the mma kernel shares the scalar
+        // kernel's launch contract (grid, arg order), differing only in block
+        // size (128 threads = 4 warps). Its split-precision P keeps it within
+        // one bf16 ulp of the fp32 oracle on the layer-5 parity harness, and
+        // the scalar kernel remains available under
+        // ATLAS_LING_MLA_PREFILL_MMA=0.
+        let use_mma = !matches!(
+            std::env::var("ATLAS_LING_MLA_PREFILL_MMA").as_deref(),
+            Ok("0") | Ok("false")
+        );
         let (kernel, block) = if use_mma {
             (k.mla_prefill_attn_mma_k, 128u32)
         } else {

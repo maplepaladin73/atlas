@@ -3,9 +3,10 @@
 # Ling-3.2-air: MLA prefill fast path — assessment
 
 Status: assessment / roadmap. Scalar-load vectorization landed (PR #141,
-default-on); the tensor-core rewrite below lands with this PR as an
-env-gated opt-in (`ATLAS_LING_MLA_PREFILL_MMA=1`), NOT as a default flip —
-its measured win at this shape is modest, so it ships behind the flag.
+default-on); the tensor-core rewrite landed env-gated in PR #142, gained
+its register-resident accumulator in PR #146 and its split-precision P in
+PR #148, and is now the DEFAULT prefill attention lane
+(`ATLAS_LING_MLA_PREFILL_MMA=0` re-selects the scalar kernel).
 
 ## Where prefill time goes (GB10, #130/#131/#139 posture)
 
@@ -72,16 +73,25 @@ Status: **landed as a flag-gated opt-in, NOT as a default flip.**
   arithmetic to the scalar kernel's.
 - Dispatch: `ATLAS_LING_MLA_PREFILL_MMA=1` flips `prefill_attn_contig`
   to this kernel (128-thread block); every other lane is unchanged.
-- Kept default-off: the first implementation's measured wall-clock
+- Default-flip history: the first implementation's measured wall-clock
   improvement at a 2638-token prompt on the f341 dev box was ~6%
   (4.17-4.29 s vs 4.45-4.46 s), not the 3-5x the kernel-level estimate
   suggested. Forensics then found the cause: the 64-float PV accumulator
   was indexed through a rolled loop, so ptxas materialized it as a 256 B
-  local-memory stack frame. The current lane fully unrolls that tile loop
-  and uses `__launch_bounds__(128, 4)` to keep the accumulator register
+  local-memory stack frame. PR #146 fully unrolled that tile loop and
+  added `__launch_bounds__(128, 4)` to keep the accumulator register
   resident inside the four-CTA occupancy target (128 registers, only an
-  8 B residual spill). It still stays parity-gated (harness + e2e oracle)
-  and env-gated until the default-flip validation reruns.
+  8 B residual spill). A second blocker was numeric: a plain bf16 softmax
+  P (8 mantissa bits vs the scalar kernel's fp32) flipped borderline
+  greedy tokens — the tools e2e email-copy check failed with the lane
+  enabled. PR #148 stores P as a bf16 hi/lo split pair with a second
+  accumulating mma, bringing the lane within one bf16 ulp of the fp32
+  oracle on the layer-5 parity harness, and the flip PR then made the
+  lane the default: serve TTFT at rows=4096 on f341 went 5.11-5.13 s
+  (scalar) to 3.69-3.71 s (mma) in a same-binary one-variable A/B
+  (preliminary single-harness), tools e2e 9/9 with the lane on, and 5/8
+  long-greedy probes token-identical with the rest diverging only in
+  semantically equivalent phrasing after dozens of identical tokens.
 - Verified: `mla_layer5_prefill_fast_parity` 25 stage checks CLEAN (mma
   env on), `bailing_e2e_oracle_parity` PASS (~295 s, same layer-3
   baseline ULP signature), 2553 unit tests green.
