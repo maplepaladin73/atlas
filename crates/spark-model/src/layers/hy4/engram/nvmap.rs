@@ -160,8 +160,7 @@ impl TableMap {
     /// verification of the hot-row cache against the live table.
     pub(crate) fn row_bytes(&self, local_row: usize, row_bytes: usize) -> Option<&[u8]> {
         let at = self.skip + local_row * row_bytes;
-        (at + row_bytes <= self.skip + self.bytes)
-            .then(|| &self.map[at..at + row_bytes])
+        (at + row_bytes <= self.skip + self.bytes).then(|| &self.map[at..at + row_bytes])
     }
 }
 
