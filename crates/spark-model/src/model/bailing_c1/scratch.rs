@@ -91,6 +91,8 @@ pub(crate) struct LingScratch {
     pub moe_done: DevicePtr,
     /// MoE: `[rows, 512]` f32 router logits.
     pub moe_logits: DevicePtr,
+    /// FP32 widening of the MoE input rows feeding the router TF32 GEMM.
+    pub moe_xfp32: DevicePtr,
     /// MoE: `[rows, hidden / 2]` u8 quantized activation + `[.., hidden/16]`
     /// scale.
     pub a_packed: DevicePtr,
@@ -174,6 +176,7 @@ impl LingScratch {
             worklist: Self::alloc(gpu, (1 + 2 * (experts + (rows * top_k) / 16)) * 4)?,
             moe_done: Self::alloc(gpu, 4)?,
             moe_logits: Self::alloc(gpu, rows * experts * 4)?,
+            moe_xfp32: Self::alloc(gpu, rows * hidden * 4)?,
             a_packed: Self::alloc(gpu, rows * (hidden / 2))?,
             a_scale: Self::alloc(gpu, rows * (hidden / 16))?,
             gu_packed: Self::alloc(gpu, rows * top_k * (inter / 2))?,
