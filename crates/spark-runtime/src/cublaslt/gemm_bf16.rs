@@ -3,6 +3,41 @@
 //! 500-LoC cap).
 
 use super::*;
+use anyhow::ensure;
+
+// CUDA 13 cublasLt.h: CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK and the
+// cublasLtReductionScheme_t values NONE and MASK (every scheme, the default).
+const PREF_REDUCTION_SCHEME_MASK: u32 = 3;
+const SCHEME_NONE: u32 = 0;
+const SCHEME_ALL: u32 = 7;
+
+/// `ATLAS_LT_NO_SPLIT_K=1`: pin the heuristic to reduction scheme NONE
+/// (split-K 1, in-order accumulation). The default heuristic otherwise
+/// picks split-K kernels for small-M shapes (e.g. o 64x2560x4096 at
+/// splitK=8, numerically ~2.5x worse than the in-order reference); a shape
+/// with no in-order algorithm runs cuBLASLt's own choice instead.
+fn no_split_k() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("ATLAS_LT_NO_SPLIT_K").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
+/// `heuristic(mask)` for the split-K 1 pin, else (or when the pinned query
+/// finds no algorithm) for cuBLASLt's own choice. `None` leaves the
+/// preference's reduction mask untouched, exactly as without the pin.
+fn pinned_or_default<T>(
+    no_split_k: bool,
+    mut heuristic: impl FnMut(Option<u32>) -> Result<T>,
+) -> Result<T> {
+    if no_split_k && let Ok(algo) = heuristic(Some(SCHEME_NONE)) {
+        return Ok(algo);
+    }
+    heuristic(no_split_k.then_some(SCHEME_ALL))
+}
 
 /// Shared body. `op_a` selects the weight's stored layout: `CUBLAS_OP_T` for a
 /// row-major `[N,K]` weight, `CUBLAS_OP_N` for a row-major `[K,N]` one. The A
@@ -105,25 +140,37 @@ pub(super) fn gemm_bf16_pick(
         )?;
         // Heuristic results: 96 B each, algo at offset 0 (+ margin, `kchain_pin`).
         let mut result = [0u8; 128 * kchain_pin::CANDIDATES];
-        let mut returned: i32 = 0;
-        chk(
-            cublasLtMatmulAlgoGetHeuristic(
-                ctx.handle,
-                desc,
-                la,
-                lb,
-                ld_,
-                ld_,
-                pref,
-                pick.requested(),
-                result.as_mut_ptr() as *mut c_void,
-                &mut returned,
-            ),
-            "AlgoGetHeuristic",
-        )?;
-        if returned < 1 {
-            bail!("cuBLASLt: no algorithm for {m}x{n}x{k}");
-        }
+        let returned = pinned_or_default(no_split_k(), |mask| {
+            if let Some(mask) = mask {
+                chk(
+                    cublasLtMatmulPreferenceSetAttribute(
+                        pref,
+                        PREF_REDUCTION_SCHEME_MASK,
+                        &mask as *const u32 as *const c_void,
+                        std::mem::size_of::<u32>(),
+                    ),
+                    "PrefReductionMask",
+                )?;
+            }
+            let mut returned: i32 = 0;
+            chk(
+                cublasLtMatmulAlgoGetHeuristic(
+                    ctx.handle,
+                    desc,
+                    la,
+                    lb,
+                    ld_,
+                    ld_,
+                    pref,
+                    pick.requested(),
+                    result.as_mut_ptr() as *mut c_void,
+                    &mut returned,
+                ),
+                "AlgoGetHeuristic",
+            )?;
+            ensure!(returned >= 1, "cuBLASLt: no algorithm for {m}x{n}x{k}");
+            Ok(returned)
+        })?;
         let Some(algo_off) = pick.offset(&result, returned) else {
             cublasLtMatmulPreferenceDestroy(pref);
             cublasLtMatrixLayoutDestroy(la);
@@ -160,4 +207,37 @@ pub(super) fn gemm_bf16_pick(
         chk(status, "Matmul")?;
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `pinned_or_default` over a fake heuristic: the masks it was asked for.
+    fn masks(no_split_k: bool, answers: &[bool]) -> (Vec<Option<u32>>, Result<usize>) {
+        let mut asked = Vec::new();
+        let result = pinned_or_default(no_split_k, |mask| {
+            asked.push(mask);
+            ensure!(answers[asked.len() - 1], "no algorithm");
+            Ok(asked.len())
+        });
+        (asked, result)
+    }
+
+    #[test]
+    fn default_heuristic_leaves_the_reduction_mask_untouched() {
+        let (asked, result) = masks(false, &[true]);
+        assert_eq!((asked, result.unwrap()), (vec![None], 1));
+        assert!(masks(false, &[false]).1.is_err());
+    }
+
+    #[test]
+    fn split_k_pin_falls_back_to_every_scheme_when_it_finds_no_algorithm() {
+        let (asked, result) = masks(true, &[true]);
+        assert_eq!((asked, result.unwrap()), (vec![Some(SCHEME_NONE)], 1));
+        let (asked, result) = masks(true, &[false, true]);
+        assert_eq!(asked, [Some(SCHEME_NONE), Some(SCHEME_ALL)]);
+        assert_eq!(result.unwrap(), 2);
+        assert!(masks(true, &[false, false]).1.is_err());
+    }
 }
