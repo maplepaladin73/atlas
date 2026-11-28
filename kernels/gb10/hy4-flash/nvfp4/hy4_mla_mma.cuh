@@ -217,11 +217,11 @@ __device__ __forceinline__ void hy4_mla_mma_impl(
                 #pragma unroll
                 for (unsigned p = 0; p < 8; ++p) {
                     unsigned j = p * 2;
-                    __nv_fp8_e4m3 e0, e1;
-                    e0.__x = (unsigned char)(words[j / 4] >> ((j & 3) * 8));
-                    e1.__x = (unsigned char)(words[(j + 1) / 4] >> (((j + 1) & 3) * 8));
+                    float2 v = hy4_fp8x2_to_float2(
+                        (unsigned char)(words[j / 4] >> ((j & 3) * 8)),
+                        (unsigned char)(words[(j + 1) / 4] >> (((j + 1) & 3) * 8)));
                     __nv_bfloat162 pair = __float22bfloat162_rn(
-                        make_float2((float)e0 * scs[it], (float)e1 * scs[it]));
+                        make_float2(v.x * scs[it], v.y * scs[it]));
                     packed[p] = *(const unsigned*)&pair;
                 }
                 *(uint4*)dst = make_uint4(packed[0], packed[1], packed[2], packed[3]);

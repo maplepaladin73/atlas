@@ -48,6 +48,13 @@ extern "C" __global__ void hy4_gate(__nv_bfloat16* out,
 // FP8 latent-slot layout: dims 0..512 are E4M3 bytes with four FP32 scales
 // per slot (one per 128 dims); dims 512..576 stay BF16 at byte offset 512.
 // The BF16 path keeps the original vectorized loads.
+__device__ __forceinline__ float2 hy4_fp8x2_to_float2(unsigned char a,
+    unsigned char b) {
+    __nv_fp8x2_e4m3 v;
+    v.__x=(unsigned short)a|((unsigned short)b<<8);
+    return (float2)v;
+}
+
 template<bool FP8>
 __device__ __forceinline__ float hy4_mla_kv(const unsigned char* cache,
     const float* scales, size_t row, unsigned kv_stride, unsigned d) {
@@ -96,13 +103,13 @@ __device__ __forceinline__ void hy4_mla_partial_impl(const __nv_bfloat16* q,
                 const unsigned words[4]={raw.x,raw.y,raw.z,raw.w};
                 float scale=scales[4*row+lane/8];
                 #pragma unroll
-                for (unsigned w=0;w<4;w++) {
-                    #pragma unroll
-                    for (unsigned j=0;j<4;j++) {
-                        __nv_fp8_e4m3 v; v.__x=(unsigned char)(words[w]>>(j*8));
-                        unsigned d=lane*16+w*4+j;
-                        dot+=query[d]*(float)v*scale;
-                    }
+                for (unsigned p=0;p<8;p++) {
+                    unsigned d=lane*16+p*2;
+                    float2 v=hy4_fp8x2_to_float2(
+                        (unsigned char)(words[p/2]>>((p&1)*16)),
+                        (unsigned char)(words[p/2]>>((p&1)*16+8)));
+                    dot+=query[d]*v.x*scale;
+                    dot+=query[d+1]*v.y*scale;
                 }
                 const __nv_bfloat16* rope=(const __nv_bfloat16*)(base+512);
                 dot+=query[512+lane*2]*(float)rope[lane*2];
@@ -152,11 +159,10 @@ __device__ __forceinline__ void hy4_mla_partial_impl(const __nv_bfloat16* q,
             const unsigned char* base=cache+(size_t)rows[j]*640;
             unsigned d=tid*2;
             uchar2 raw=*(const uchar2*)(base+d);
-            __nv_fp8_e4m3 va,vb;
-            va.__x=raw.x;vb.__x=raw.y;
+            float2 v=hy4_fp8x2_to_float2(raw.x,raw.y);
             float sc=key_scales[j*4+d/128];
-            a+=scores[j]*(float)va*sc;
-            b+=scores[j]*(float)vb*sc;
+            a+=scores[j]*v.x*sc;
+            b+=scores[j]*v.y*sc;
         } else {
             const __nv_bfloat16* kv=(const __nv_bfloat16*)(cache+(size_t)rows[j]*kv_stride);
             a+=scores[j]*(float)kv[tid];b+=scores[j]*(float)kv[tid+256];
