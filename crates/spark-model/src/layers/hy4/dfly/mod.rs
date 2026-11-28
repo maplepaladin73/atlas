@@ -53,6 +53,8 @@ impl Config {
 #[derive(Clone, Copy)]
 pub struct TargetCache {
     pub latent: DevicePtr,
+    /// FP8 rowwise scales for `latent`; NULL when the target cache is BF16.
+    pub latent_scales: DevicePtr,
     pub indices: DevicePtr,
     pub len: usize,
     pub capacity: usize,

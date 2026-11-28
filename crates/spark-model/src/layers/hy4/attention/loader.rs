@@ -26,6 +26,8 @@ pub struct Hy4Attention<'a> {
     pub(super) rope: Hy4Rope,
     pub(super) window: Option<usize>,
     pub(super) eps: f32,
+    /// Opt-in FP8 (E4M3 tilewise) latent KV cache; false keeps the BF16 layout.
+    pub(super) kv_fp8: bool,
     pub(super) qa: DevicePtr,
     pub(super) qan: DevicePtr,
     pub(super) qb: DevicePtr,
@@ -62,6 +64,7 @@ impl<'a> Hy4Attention<'a> {
         layer: usize,
         c: &ModelConfig,
         gpu: &'a dyn GpuBackend,
+        kv_fp8: bool,
     ) -> Result<Self> {
         let hy = c.hy4.as_ref().context("Hy4 attention metadata required")?;
         let kind = hy
@@ -299,6 +302,7 @@ impl<'a> Hy4Attention<'a> {
             rope,
             window,
             eps: c.rms_norm_eps as f32,
+            kv_fp8,
             qa,
             qan,
             qb,

@@ -77,9 +77,15 @@ __device__ __forceinline__ void mlm_ldx2t(unsigned& r0, unsigned& r1, const void
                  : "=r"(r0), "=r"(r1) : "r"(saddr));
 }
 
-extern "C" __global__ void hy4_mla_batch_partial_mma(
+// FP8 KV: dims 0..512 are E4M3 in a 640-byte slot with four FP32 scales per
+// key (one per 128 dims); dims 512..576 stay BF16 at byte offset 512. The
+// gather dequantizes/copies both into the unchanged bf16 sK layout, so smem
+// layout and the mma path are untouched while global read traffic halves.
+template<bool FP8>
+__device__ __forceinline__ void hy4_mla_mma_impl(
     const __nv_bfloat16* __restrict__ q,
-    const __nv_bfloat16* __restrict__ cache,
+    const unsigned char* __restrict__ cache,
+    const float* __restrict__ scales,
     const unsigned* __restrict__ table,
     const int* __restrict__ indices,
     float* __restrict__ partials,
@@ -91,6 +97,9 @@ extern "C" __global__ void hy4_mla_batch_partial_mma(
     unsigned splits,
     unsigned heads,
     unsigned index_stride) {
+    constexpr unsigned SEGS = MLM_SCORE_DIMS / 8;
+    constexpr unsigned FP8_NOPE_SEGS = 32;  // 512 E4M3 bytes, 16 per segment
+    constexpr unsigned FP8_ROPE_SEGS = 8;   // 64 BF16 rope values, 8 per segment
     extern __shared__ unsigned char smem[];
     int* srows = (int*)(smem + MLM_OFF_ROWS);
     float* sMaxD = (float*)(smem + MLM_OFF_MAXD);
@@ -164,18 +173,74 @@ extern "C" __global__ void hy4_mla_batch_partial_mma(
 
     for (unsigned chunk = 0; chunk < 2; ++chunk) {
         // ---- gather this chunk's 64 keys x 576 dims ----
-        for (unsigned i = tid; i < MLM_KCH * (MLM_SCORE_DIMS / 8);
-             i += blockDim.x) {
-            unsigned k = i / (MLM_SCORE_DIMS / 8);
-            unsigned seg = i % (MLM_SCORE_DIMS / 8);
-            int phys = srows[chunk * MLM_KCH + k];
-            mlm_cp16(sK + k * MLM_KP + seg * 8,
-                     phys >= 0 ? cache + (size_t)phys * 576 + seg * 8
-                               : cache,
-                     phys >= 0);
+        if constexpr (FP8) {
+            // Rope is already BF16: start those 16-byte cp.async copies first,
+            // then overlap them with the synchronous E4M3->BF16 conversion.
+            for (unsigned i = tid; i < MLM_KCH * FP8_ROPE_SEGS; i += blockDim.x) {
+                unsigned k = i / FP8_ROPE_SEGS;
+                unsigned seg = i % FP8_ROPE_SEGS;
+                int phys = srows[chunk * MLM_KCH + k];
+                mlm_cp16(sK + k * MLM_KP + 512 + seg * 8,
+                         phys >= 0 ? cache + (size_t)phys * 640 + 512 + seg * 16
+                                   : cache,
+                         phys >= 0);
+            }
+            mlm_commit();
+            constexpr unsigned FP8_SEG_THREADS = 256;
+            constexpr unsigned FP8_KEY_STEP = FP8_SEG_THREADS / FP8_NOPE_SEGS;
+            constexpr unsigned FP8_SEG_ITERS =
+                (MLM_KCH * FP8_NOPE_SEGS) / FP8_SEG_THREADS;
+            static_assert(FP8_SEG_THREADS % FP8_NOPE_SEGS == 0);
+            static_assert((MLM_KCH * FP8_NOPE_SEGS) % FP8_SEG_THREADS == 0);
+            const unsigned seg = tid % FP8_NOPE_SEGS;
+            const unsigned kbase = tid / FP8_NOPE_SEGS;
+            uint4 raws[FP8_SEG_ITERS];
+            float scs[FP8_SEG_ITERS];
+            #pragma unroll
+            for (unsigned it = 0; it < FP8_SEG_ITERS; ++it) {
+                unsigned k = kbase + it * FP8_KEY_STEP;
+                int phys = srows[chunk * MLM_KCH + k];
+                size_t safe = phys >= 0 ? (size_t)phys : 0;
+                raws[it] = *(const uint4*)(cache + safe * 640 + seg * 16);
+                scs[it] = scales[4 * safe + seg / 8];
+                if (phys < 0) {
+                    raws[it] = make_uint4(0, 0, 0, 0);
+                    scs[it] = 0.f;
+                }
+            }
+            #pragma unroll
+            for (unsigned it = 0; it < FP8_SEG_ITERS; ++it) {
+                unsigned k = kbase + it * FP8_KEY_STEP;
+                __nv_bfloat16* dst = sK + k * MLM_KP + seg * 16;
+                const unsigned words[4] = {raws[it].x, raws[it].y, raws[it].z, raws[it].w};
+                unsigned packed[8];
+                #pragma unroll
+                for (unsigned p = 0; p < 8; ++p) {
+                    unsigned j = p * 2;
+                    float2 v = hy4_fp8x2_to_float2(
+                        (unsigned char)(words[j / 4] >> ((j & 3) * 8)),
+                        (unsigned char)(words[(j + 1) / 4] >> (((j + 1) & 3) * 8)));
+                    __nv_bfloat162 pair = __float22bfloat162_rn(
+                        make_float2(v.x * scs[it], v.y * scs[it]));
+                    packed[p] = *(const unsigned*)&pair;
+                }
+                *(uint4*)dst = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+                *(uint4*)(dst + 8) = make_uint4(packed[4], packed[5], packed[6], packed[7]);
+            }
+            mlm_wait0();
+        } else {
+            for (unsigned i = tid; i < MLM_KCH * SEGS; i += blockDim.x) {
+                unsigned k = i / SEGS;
+                unsigned seg = i % SEGS;
+                int phys = srows[chunk * MLM_KCH + k];
+                mlm_cp16(sK + k * MLM_KP + seg * 8,
+                         phys >= 0 ? ((const __nv_bfloat16*)cache) + (size_t)phys * 576 + seg * 8
+                                   : (const __nv_bfloat16*)cache,
+                         phys >= 0);
+            }
+            mlm_commit();
+            mlm_wait0();
         }
-        mlm_commit();
-        mlm_wait0();
         __syncthreads();
 
         // ---- GEMM1 chunk: sS[key][head] = 1/16 * K.Q over 576 dims ----
@@ -286,4 +351,45 @@ extern "C" __global__ void hy4_mla_batch_partial_mma(
         out[tid * splits * 514 + 512] = sMaxD[tid * 3];
         out[tid * splits * 514 + 513] = sMaxD[tid * 3 + 1];
     }
+}
+
+
+extern "C" __global__ void hy4_mla_batch_partial_mma(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ cache,
+    const unsigned* __restrict__ table,
+    const int* __restrict__ indices,
+    float* __restrict__ partials,
+    unsigned position,
+    unsigned page_size,
+    unsigned columns,
+    unsigned window,
+    unsigned count,
+    unsigned splits,
+    unsigned heads,
+    unsigned index_stride) {
+    hy4_mla_mma_impl<false>(q, (const unsigned char*)cache, nullptr, table,
+        indices, partials, position, page_size, columns, window, count, splits,
+        heads, index_stride);
+}
+
+// FP8 KV variant: same args, cache uses 640-byte fp8kv slots, plus the
+// trailing scale buffer (four FP32 per slot).
+extern "C" __global__ void hy4_mla_batch_partial_mma_fp8kv(
+    const __nv_bfloat16* __restrict__ q,
+    const unsigned char* __restrict__ cache,
+    const unsigned* __restrict__ table,
+    const int* __restrict__ indices,
+    float* __restrict__ partials,
+    unsigned position,
+    unsigned page_size,
+    unsigned columns,
+    unsigned window,
+    unsigned count,
+    unsigned splits,
+    unsigned heads,
+    unsigned index_stride,
+    const float* __restrict__ scales) {
+    hy4_mla_mma_impl<true>(q, cache, scales, table, indices, partials, position,
+        page_size, columns, window, count, splits, heads, index_stride);
 }

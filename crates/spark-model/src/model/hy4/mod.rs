@@ -15,6 +15,7 @@ use parking_lot::Mutex;
 use spark_comm::CommBackend;
 use spark_runtime::{
     gpu::{DevicePtr, GpuBackend, KernelHandle},
+    kv_cache::KvCacheDtype,
     weights::WeightStore,
 };
 use std::{collections::HashMap, sync::Arc};
@@ -40,6 +41,8 @@ struct Shared {
     comm: Option<Arc<dyn CommBackend>>,
     max_seq: usize,
     page_size: usize,
+    /// Opt-in FP8 (E4M3 tilewise) latent KV cache; false keeps the BF16 layout.
+    kv_fp8: bool,
 }
 impl Drop for Shared {
     fn drop(&mut self) {
@@ -135,9 +138,15 @@ impl Hy4Model {
         max_seq: usize,
         page_size: usize,
         max_batch: usize,
+        kv_dtype: KvCacheDtype,
     ) -> Result<Self> {
         let timing = crate::layers::hy4::timing::enabled();
         tracing::info!("HY4 CUDA-event timing enabled={timing}");
+        ensure!(
+            matches!(kv_dtype, KvCacheDtype::Bf16 | KvCacheDtype::Fp8),
+            "Hy4 latent cache dtype must be bf16 or fp8"
+        );
+        let kv_fp8 = kv_dtype == KvCacheDtype::Fp8;
         ensure!(
             max_seq > 0
                 && max_seq <= config.max_position_embeddings
@@ -171,6 +180,7 @@ impl Hy4Model {
             comm,
             max_seq,
             page_size,
+            kv_fp8,
         });
         ModelCell::try_new(owner, |s| {
             let gpu = s.gpu.as_ref();
@@ -204,7 +214,7 @@ impl Hy4Model {
                             c,
                             gpu,
                         )?,
-                        attn: Hy4Attention::load(store, *i, c, gpu)?,
+                        attn: Hy4Attention::load(store, *i, c, gpu, s.kv_fp8)?,
                         ffn: Hy4Ffn::load(store, *i, c, gpu)?,
                         engram: if has_engram {
                             Some(Hy4Engram::load(c, store, *i, gpu)?)

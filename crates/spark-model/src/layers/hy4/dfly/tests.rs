@@ -19,6 +19,7 @@ fn input() -> Input {
         count: 5,
         caches: [TargetCache {
             latent: DevicePtr(2),
+            latent_scales: DevicePtr::NULL,
             indices: DevicePtr(3),
             len: 57,
             capacity: 66,

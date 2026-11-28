@@ -21,6 +21,7 @@ impl AttentionCache<'_, '_> {
         );
         Ok(TargetCache {
             latent: self.latent,
+            latent_scales: self.latent_scales,
             indices: self.scratch.indices,
             len: self.len,
             capacity: self.max_tokens,

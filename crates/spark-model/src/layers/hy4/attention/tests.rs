@@ -198,7 +198,7 @@ fn tp2_shards_q_gate_sink_output_and_transposes_only_local_kv_heads() {
         let store = store(&gpu, &c, 0);
         let initial = gpu.alloc_count();
         {
-            let a = Hy4Attention::load(&store, 0, &c, &gpu).unwrap();
+            let a = Hy4Attention::load(&store, 0, &c, &gpu, false).unwrap();
             assert_eq!(a.heads, 1);
             assert_ne!(
                 a.qb,
@@ -255,7 +255,7 @@ fn swa_has_no_pool_reduces_before_post_norm_and_includes_sink_for_prefill_and_de
     let gpu = MockGpuBackend::new();
     let c = config(0, 2);
     let store = store(&gpu, &c, 2);
-    let a = Hy4Attention::load(&store, 2, &c, &gpu).unwrap();
+    let a = Hy4Attention::load(&store, 2, &c, &gpu, false).unwrap();
     assert_eq!(a.heads, 2);
     assert!(a.index.is_none());
     assert_eq!(a.rope.rope_theta, 10000.);
@@ -298,7 +298,7 @@ fn dsa_partial_group_survives_chunk_and_prefix_fork_and_uses_all_score_stages() 
     let gpu = MockGpuBackend::new();
     let c = config(0, 1);
     let store = store(&gpu, &c, 0);
-    let a = Hy4Attention::load(&store, 0, &c, &gpu).unwrap();
+    let a = Hy4Attention::load(&store, 0, &c, &gpu, false).unwrap();
     assert_eq!(a.rope.rope_theta, 10000000.);
     let mut cache = AttentionCache::new(&a, 8, 64).unwrap();
     cache
@@ -339,7 +339,7 @@ fn fp8_is_explicit_and_reclaims_sources_and_temporary_bf16_matrices() {
     let store = store(&gpu, &c, 0);
     let initial = gpu.alloc_count();
     {
-        let a = Hy4Attention::load(&store, 0, &c, &gpu).unwrap();
+        let a = Hy4Attention::load(&store, 0, &c, &gpu, false).unwrap();
         assert_eq!(a.scales.len(), 7);
         assert_eq!(gpu.alloc_count(), initial - 6 + 14);
         assert_eq!(store.reclaimed_count(), 6);
@@ -353,14 +353,14 @@ fn fp8_is_explicit_and_reclaims_sources_and_temporary_bf16_matrices() {
     assert_eq!(gpu.alloc_count(), initial - 6);
     assert_eq!(gpu.invalid_free_count(), 0);
     c.q_lora_rank = 17;
-    assert!(Hy4Attention::load(&store, 0, &c, &gpu).is_err());
+    assert!(Hy4Attention::load(&store, 0, &c, &gpu, false).is_err());
 }
 #[test]
 fn empty_and_malformed_batches_do_not_advance_or_launch_and_oom_cleans_partial_allocations() {
     let gpu = MockGpuBackend::new();
     let c = config(0, 1);
     let store = store(&gpu, &c, 0);
-    let a = Hy4Attention::load(&store, 0, &c, &gpu).unwrap();
+    let a = Hy4Attention::load(&store, 0, &c, &gpu, false).unwrap();
     let count = gpu.alloc_count();
     gpu.fail_alloc_after(6);
     assert!(AttentionCache::new(&a, 8, 64).is_err());
@@ -397,5 +397,28 @@ fn empty_and_malformed_batches_do_not_advance_or_launch_and_oom_cleans_partial_a
     assert_eq!(gpu.alloc_count(), count);
     assert!(AttentionCache::new(&a, 0, 64).is_err());
     assert!(AttentionCache::new(&a, 8, 0).is_err());
-    assert!(Hy4Attention::load(&WeightStore::empty(), 0, &c, &gpu).is_err());
+    assert!(Hy4Attention::load(&WeightStore::empty(), 0, &c, &gpu, false).is_err());
+}
+#[test]
+fn fp8_kv_cache_halves_latent_bytes_and_allocates_rowwise_scales() {
+    for layer in [0, 2] {
+        for (kv_fp8, stride) in [(false, 1152usize), (true, 640)] {
+            let gpu = MockGpuBackend::new();
+            let c = config(0, 1);
+            let store = store(&gpu, &c, layer);
+            let a = Hy4Attention::load(&store, layer, &c, &gpu, kv_fp8).unwrap();
+            assert_eq!(a.kv_fp8, kv_fp8);
+            assert_eq!(a.kv_stride(), stride);
+            let cache = AttentionCache::new(&a, 1024, 4).unwrap();
+            let slots = cache.layout.physical_pages * cache.layout.page_size;
+            assert_eq!(cache.kv_stride(), stride);
+            assert_eq!(cache.latent_bytes, slots * stride);
+            if kv_fp8 {
+                assert!(!cache.latent_scales.is_null());
+                assert_eq!(cache.latent_scales_bytes(), slots * 16);
+            } else {
+                assert!(cache.latent_scales.is_null());
+            }
+        }
+    }
 }
