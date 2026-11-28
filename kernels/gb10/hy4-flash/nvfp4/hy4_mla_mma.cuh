@@ -186,28 +186,46 @@ __device__ __forceinline__ void hy4_mla_mma_impl(
                          phys >= 0);
             }
             mlm_commit();
-            for (unsigned i = tid; i < MLM_KCH * FP8_NOPE_SEGS; i += blockDim.x) {
-                unsigned k = i / FP8_NOPE_SEGS;
-                unsigned seg = i % FP8_NOPE_SEGS;
+            constexpr unsigned FP8_SEG_THREADS = 256;
+            constexpr unsigned FP8_KEY_STEP = FP8_SEG_THREADS / FP8_NOPE_SEGS;
+            constexpr unsigned FP8_SEG_ITERS =
+                (MLM_KCH * FP8_NOPE_SEGS) / FP8_SEG_THREADS;
+            static_assert(FP8_SEG_THREADS % FP8_NOPE_SEGS == 0);
+            static_assert((MLM_KCH * FP8_NOPE_SEGS) % FP8_SEG_THREADS == 0);
+            const unsigned seg = tid % FP8_NOPE_SEGS;
+            const unsigned kbase = tid / FP8_NOPE_SEGS;
+            uint4 raws[FP8_SEG_ITERS];
+            float scs[FP8_SEG_ITERS];
+            #pragma unroll
+            for (unsigned it = 0; it < FP8_SEG_ITERS; ++it) {
+                unsigned k = kbase + it * FP8_KEY_STEP;
                 int phys = srows[chunk * MLM_KCH + k];
-                __nv_bfloat16* dst = sK + k * MLM_KP + seg * 16;
-                if (phys >= 0) {
-                    uint4 raw = *(const uint4*)(cache + (size_t)phys * 640 + seg * 16);
-                    const unsigned words[4] = {raw.x, raw.y, raw.z, raw.w};
-                    float sc = scales[4 * (size_t)phys + seg / 8];
-                    __nv_bfloat16 packed[16];
-                    #pragma unroll
-                    for (unsigned j = 0; j < 16; ++j) {
-                        __nv_fp8_e4m3 e;
-                        e.__x = (unsigned char)(words[j / 4] >> ((j & 3) * 8));
-                        packed[j] = __float2bfloat16_rn((float)e * sc);
-                    }
-                    *(uint4*)dst = *(const uint4*)&packed[0];
-                    *(uint4*)(dst + 8) = *(const uint4*)&packed[8];
-                } else {
-                    *(uint4*)dst = make_uint4(0, 0, 0, 0);
-                    *(uint4*)(dst + 8) = make_uint4(0, 0, 0, 0);
+                size_t safe = phys >= 0 ? (size_t)phys : 0;
+                raws[it] = *(const uint4*)(cache + safe * 640 + seg * 16);
+                scs[it] = scales[4 * safe + seg / 8];
+                if (phys < 0) {
+                    raws[it] = make_uint4(0, 0, 0, 0);
+                    scs[it] = 0.f;
                 }
+            }
+            #pragma unroll
+            for (unsigned it = 0; it < FP8_SEG_ITERS; ++it) {
+                unsigned k = kbase + it * FP8_KEY_STEP;
+                __nv_bfloat16* dst = sK + k * MLM_KP + seg * 16;
+                const unsigned words[4] = {raws[it].x, raws[it].y, raws[it].z, raws[it].w};
+                unsigned packed[8];
+                #pragma unroll
+                for (unsigned p = 0; p < 8; ++p) {
+                    unsigned j = p * 2;
+                    __nv_fp8_e4m3 e0, e1;
+                    e0.__x = (unsigned char)(words[j / 4] >> ((j & 3) * 8));
+                    e1.__x = (unsigned char)(words[(j + 1) / 4] >> (((j + 1) & 3) * 8));
+                    __nv_bfloat162 pair = __float22bfloat162_rn(
+                        make_float2((float)e0 * scs[it], (float)e1 * scs[it]));
+                    packed[p] = *(const unsigned*)&pair;
+                }
+                *(uint4*)dst = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+                *(uint4*)(dst + 8) = make_uint4(packed[4], packed[5], packed[6], packed[7]);
             }
             mlm_wait0();
         } else {

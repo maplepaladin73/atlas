@@ -74,6 +74,7 @@ __device__ __forceinline__ void hy4_mla_partial_impl(const __nv_bfloat16* q,
     unsigned columns, unsigned window, unsigned count, unsigned splits) {
     unsigned h=blockIdx.x,part=blockIdx.y,tid=threadIdx.x,lane=tid%32,warp=tid/32;
     __shared__ float scores[128],red[256],query[576],maximum,denominator;
+    __shared__ float key_scales[FP8?512:1];
     __shared__ int rows[128];
     for (unsigned d=tid;d<576;d+=256) query[d]=(float)q[(size_t)h*576+d];
     __syncthreads();
@@ -123,6 +124,12 @@ __device__ __forceinline__ void hy4_mla_partial_impl(const __nv_bfloat16* q,
         if (lane==0) { scores[j]=valid?dot*(1.f/16.f):-INFINITY;rows[j]=valid?(int)row:-1; }
     }
     __syncthreads();
+    if constexpr (FP8) {
+        for (unsigned i=tid;i<512;i+=256) {
+            unsigned j=i/4,tile=i%4;
+            key_scales[i]=rows[j]>=0?scales[4*(size_t)rows[j]+tile]:0.f;
+        }
+    }
     red[tid]=tid<128?scores[tid]:-INFINITY;
     for (unsigned s=128;s;s>>=1) {
         __syncthreads();
@@ -142,15 +149,25 @@ __device__ __forceinline__ void hy4_mla_partial_impl(const __nv_bfloat16* q,
     float a=0.f,b=0.f;
     for (unsigned j=0;j<128;j++) if (rows[j]>=0) {
         if constexpr (FP8) {
-            a+=scores[j]*hy4_mla_kv<true>(cache,scales,(size_t)rows[j],640,tid);
-            b+=scores[j]*hy4_mla_kv<true>(cache,scales,(size_t)rows[j],640,tid+256);
+            const unsigned char* base=cache+(size_t)rows[j]*640;
+            unsigned d=tid*2;
+            uchar2 raw=*(const uchar2*)(base+d);
+            __nv_fp8_e4m3 va,vb;
+            va.__x=raw.x;vb.__x=raw.y;
+            float sc=key_scales[j*4+d/128];
+            a+=scores[j]*(float)va*sc;
+            b+=scores[j]*(float)vb*sc;
         } else {
             const __nv_bfloat16* kv=(const __nv_bfloat16*)(cache+(size_t)rows[j]*kv_stride);
             a+=scores[j]*(float)kv[tid];b+=scores[j]*(float)kv[tid+256];
         }
     }
     float* out=partials+((size_t)h*splits+part)*514;
-    out[tid]=a;out[tid+256]=b;
+    if constexpr (FP8) {
+        out[tid*2]=a;out[tid*2+1]=b;
+    } else {
+        out[tid]=a;out[tid+256]=b;
+    }
     if (tid==0) {out[512]=maximum;out[513]=denominator;}
 }
 
