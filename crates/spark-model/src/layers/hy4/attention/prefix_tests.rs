@@ -9,7 +9,7 @@ fn append(cache: &mut AttentionCache<'_, '_>, gpu: &MockGpuBackend, value: u8) {
     gpu.copy_h2d(&vec![value; stride], cache.latent.offset(slot * stride))
         .unwrap();
     if cache.layer.kv_fp8 {
-        gpu.copy_h2d(&[value; 8], cache.latent_scales.offset(slot * 8))
+        gpu.copy_h2d(&[value; 16], cache.latent_scales.offset(slot * 16))
             .unwrap();
     }
     if cache.pool_bytes > 0 {
@@ -61,7 +61,7 @@ fn exact_prefix_restores_rejected_window_rows_pool_tail_indices_and_positions() 
                     cache.stream = Some(17);
                     cache.first_group_position = Some([(base / 4 * 4) as i64; 3]);
                     let scales_bytes = if kv_fp8 {
-                        cache.latent_bytes / cache.kv_stride() * 8
+                        cache.latent_scales_bytes()
                     } else {
                         0
                     };

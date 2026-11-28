@@ -26,7 +26,7 @@ pub struct Hy4Attention<'a> {
     pub(super) rope: Hy4Rope,
     pub(super) window: Option<usize>,
     pub(super) eps: f32,
-    /// Opt-in FP8 (E4M3 rowwise) latent KV cache; false keeps the BF16 layout.
+    /// Opt-in FP8 (E4M3 tilewise) latent KV cache; false keeps the BF16 layout.
     pub(super) kv_fp8: bool,
     pub(super) qa: DevicePtr,
     pub(super) qan: DevicePtr,

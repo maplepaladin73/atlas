@@ -402,7 +402,7 @@ fn empty_and_malformed_batches_do_not_advance_or_launch_and_oom_cleans_partial_a
 #[test]
 fn fp8_kv_cache_halves_latent_bytes_and_allocates_rowwise_scales() {
     for layer in [0, 2] {
-        for (kv_fp8, stride) in [(false, 1152usize), (true, 576)] {
+        for (kv_fp8, stride) in [(false, 1152usize), (true, 640)] {
             let gpu = MockGpuBackend::new();
             let c = config(0, 1);
             let store = store(&gpu, &c, layer);
@@ -415,8 +415,7 @@ fn fp8_kv_cache_halves_latent_bytes_and_allocates_rowwise_scales() {
             assert_eq!(cache.latent_bytes, slots * stride);
             if kv_fp8 {
                 assert!(!cache.latent_scales.is_null());
-                // Two FP32 rowwise scales (dims 0..512 / 512..576) per slot.
-                assert_eq!(cache.latent_bytes / stride * 8, slots * 8);
+                assert_eq!(cache.latent_scales_bytes(), slots * 16);
             } else {
                 assert!(cache.latent_scales.is_null());
             }

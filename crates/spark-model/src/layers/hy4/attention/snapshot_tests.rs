@@ -15,7 +15,7 @@ fn snapshots_restore_overwritten_window_and_partial_dsa_group_bytes_and_cursors(
             cache.first_group_position = Some([512; 3]);
             cache.stream = Some(17);
             let scales_bytes = if kv_fp8 {
-                cache.latent_bytes / cache.kv_stride() * 8
+                cache.latent_scales_bytes()
             } else {
                 0
             };

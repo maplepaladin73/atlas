@@ -213,7 +213,7 @@ impl Hy4Attention<'_> {
 }
 
 impl AttentionCache<'_, '_> {
-    /// Append the fp8 rowwise-scale arg to a `_fp8kv` launch when this cache
+    /// Append the fp8 tilewise-scale arg to a `_fp8kv` launch when this cache
     /// stores fp8 latents; the BF16 twin keeps its exact original arg list.
     fn with_kv_scales<'a>(&self, launch: KernelLaunch<'a>) -> KernelLaunch<'a> {
         if self.layer.kv_fp8 {
@@ -265,37 +265,35 @@ impl AttentionCache<'_, '_> {
     ) -> Result<()> {
         let a = self.layer;
         let gpu = a.memory.gpu;
-        self.with_kv_scales(
-            KernelLaunch::new(
-                gpu,
-                gpu.op_cache()
-                    .kernel(gpu, "hy4_mla", a.batch_kv_rotary_kernel())?,
-            )
-            .grid([1, batched as u32, 1])
-            .block([32, 1, 1])
-            .arg_ptr(kv)
-            .arg_ptr(self.latent)
-            .arg_u32(576)
-            .arg_u32(576)
-            .arg_u32(512)
-            .arg_u32(512)
-            .arg_u32(576)
-            .arg_u32(576)
-            .arg_ptr(self.table)
-            .arg_u32(start_position as u32)
-            .arg_u32(self.layout.page_size as u32)
-            .arg_u32(self.layout.table.len() as u32)
-            .arg_u32(u32::from(a.window.is_some()))
-            .arg_u32(1)
-            .arg_u64(base[0] as u64)
-            .arg_u64(base[1] as u64)
-            .arg_u64(base[2] as u64)
-            .arg_f32(a.rope.rope_theta as f32)
-            .arg_u32(a.rope.mrope_section[1] as u32)
-            .arg_u32(a.rope.mrope_section[2] as u32)
-            .arg_u32(u32::from(a.rope.mrope_interleaved))
-            .arg_u32(0),
+        KernelLaunch::new(
+            gpu,
+            gpu.op_cache()
+                .kernel(gpu, "hy4_mla", a.batch_kv_rotary_kernel())?,
         )
+        .grid([1, batched as u32, 1])
+        .block([32, 1, 1])
+        .arg_ptr(kv)
+        .arg_ptr(self.latent)
+        .arg_u32(576)
+        .arg_u32(576)
+        .arg_u32(512)
+        .arg_u32(512)
+        .arg_u32(576)
+        .arg_u32(576)
+        .arg_ptr(self.table)
+        .arg_u32(start_position as u32)
+        .arg_u32(self.layout.page_size as u32)
+        .arg_u32(self.layout.table.len() as u32)
+        .arg_u32(u32::from(a.window.is_some()))
+        .arg_u32(1)
+        .arg_u64(base[0] as u64)
+        .arg_u64(base[1] as u64)
+        .arg_u64(base[2] as u64)
+        .arg_f32(a.rope.rope_theta as f32)
+        .arg_u32(a.rope.mrope_section[1] as u32)
+        .arg_u32(a.rope.mrope_section[2] as u32)
+        .arg_u32(u32::from(a.rope.mrope_interleaved))
+        .arg_u32(0)
         .launch(stream)
     }
 

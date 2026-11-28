@@ -140,7 +140,7 @@ impl AttentionCache<'_, '_> {
         let slot = self.layout.slot(self.len)?;
         let row = self.latent.offset(slot * self.kv_stride());
         if a.kv_fp8 {
-            // FP8 latent write: quantize normed dims 0..512 with one rowwise scale.
+            // FP8 latent write: quantize normed dims 0..512 with four tilewise scales.
             KernelLaunch::new(gpu, a.kernels.kv_norm_fp8)
                 .grid([1, 1, 1])
                 .block([256, 1, 1])
@@ -167,13 +167,12 @@ impl AttentionCache<'_, '_> {
             stream,
         )?;
         if a.kv_fp8 {
-            // FP8 latent write: quantize rotary dims 512..576 with its own scale.
+            // FP8 latent write: keep rotary dims 512..576 in BF16.
             KernelLaunch::new(gpu, a.kernels.rotary_fp8)
                 .grid([1, 1, 1])
                 .block([32, 1, 1])
                 .arg_ptr(s.kv)
                 .arg_ptr(self.latent)
-                .arg_ptr(self.latent_scales)
                 .arg_u32(slot as u32)
                 .arg_u32(576)
                 .arg_u32(512)

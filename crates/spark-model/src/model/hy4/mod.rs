@@ -41,7 +41,7 @@ struct Shared {
     comm: Option<Arc<dyn CommBackend>>,
     max_seq: usize,
     page_size: usize,
-    /// Opt-in FP8 (E4M3 rowwise) latent KV cache; false keeps the BF16 layout.
+    /// Opt-in FP8 (E4M3 tilewise) latent KV cache; false keeps the BF16 layout.
     kv_fp8: bool,
 }
 impl Drop for Shared {

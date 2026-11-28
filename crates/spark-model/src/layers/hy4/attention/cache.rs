@@ -7,14 +7,16 @@ use spark_runtime::gpu::DevicePtr;
 
 /// Latent dims per token slot (512 NoPE + 64 rotary).
 pub(super) const LATENT_DIMS: usize = 576;
-/// FP32 rowwise scales per fp8 slot: dims 0..512 and 512..576.
-pub(super) const LATENT_SCALES_PER_SLOT: usize = 2;
+/// FP32 scales per fp8 slot: one per 128-dim tile of the 512 quantized dims.
+pub(super) const LATENT_SCALES_PER_SLOT: usize = 4;
+/// FP8 slot bytes: 512 E4M3 latent dims plus 64 BF16 rope dims.
+pub(super) const FP8_LATENT_SLOT_BYTES: usize = 640;
 
 impl Hy4Attention<'_> {
-    /// Per-slot latent byte stride: 576 E4M3 bytes when fp8, 1152 BF16 bytes.
+    /// Per-slot latent byte stride: 640 fp8kv bytes or 1152 BF16 bytes.
     pub(super) fn kv_stride(&self) -> usize {
         if self.kv_fp8 {
-            LATENT_DIMS
+            FP8_LATENT_SLOT_BYTES
         } else {
             LATENT_DIMS * 2
         }
@@ -29,7 +31,7 @@ pub struct AttentionCache<'layer, 'gpu> {
     pub(super) layout: PagedLayout,
     pub(super) table: DevicePtr,
     pub(super) latent: DevicePtr,
-    /// FP8 rowwise scales, two FP32 per latent slot; NULL when the cache is BF16.
+    /// FP8 tilewise scales, four FP32 per latent slot; NULL when BF16.
     pub(super) latent_scales: DevicePtr,
     pub(super) pool_table: DevicePtr,
     pub(super) pool: DevicePtr,
@@ -211,12 +213,12 @@ impl<'layer, 'gpu> AttentionCache<'layer, 'gpu> {
     pub fn committed_len(&self) -> usize {
         self.len
     }
-    /// Per-slot latent byte stride (576 fp8 / 1152 bf16).
+    /// Per-slot latent byte stride (640 fp8kv / 1152 bf16).
     pub(super) fn kv_stride(&self) -> usize {
         self.layer.kv_stride()
     }
-    /// Byte size of the rowwise-scale buffer (0 when the cache is BF16).
-    fn latent_scales_bytes(&self) -> usize {
+    /// Byte size of the tilewise-scale buffer (0 when the cache is BF16).
+    pub(super) fn latent_scales_bytes(&self) -> usize {
         if self.layer.kv_fp8 {
             self.latent_bytes / self.kv_stride() * LATENT_SCALES_PER_SLOT * 4
         } else {

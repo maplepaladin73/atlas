@@ -129,10 +129,10 @@ extern "C" __global__ void hy4_dfly_attention(const __nv_bfloat16* q,
     }
 }
 
-// ── FP8 (E4M3) rowwise latent cache variants ───────────────────────────
-// Slot layout matches hy4_mla.cu: 576 E4M3 bytes, scales[2*slot] for dims
-// 0..512 and scales[2*slot+1] for dims 512..576. The scale buffer is the
-// trailing kernel arg.
+// ── FP8 (E4M3) latent cache variants ─────────────────────────────────
+// Slot layout matches hy4_mla.cu: dims 0..512 as E4M3, dims 512..576 as
+// BF16 at byte offset 512, and four FP32 scales per slot covering 128-dim
+// tiles of the first half. The scale buffer is the trailing kernel arg.
 __device__ __forceinline__ unsigned char hy4_dfly_enc_e4m3(float v) {
 #if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
     return rw_enc_fp8(v);
@@ -146,17 +146,21 @@ __device__ __forceinline__ float hy4_dfly_fp8_row_scale(float amax) {
 }
 __device__ __forceinline__ float hy4_dfly_kv_at(const unsigned char* cache,
     const float* scales, size_t row, unsigned d) {
-    __nv_fp8_e4m3 v; v.__x=cache[row*576+d];
-    return (float)v*(d<512?scales[2*row]:scales[2*row+1]);
+    const unsigned char* base=cache+row*640;
+    if(d<512) {
+        __nv_fp8_e4m3 v; v.__x=base[d];
+        return (float)v*scales[4*row+d/128];
+    }
+    return (float)((const __nv_bfloat16*)(base+512))[d-512];
 }
 
 // FP8 variant of hy4_dfly_pack: the query rotary output stays BF16; the
-// aliased KV slot is written as E4M3 with one rowwise scale per 512-dim half.
+// aliased KV slot quantizes dims 0..512 tilewise and stores rope as BF16.
 extern "C" __global__ void hy4_dfly_pack_fp8kv(const __nv_bfloat16* q,
     const __nv_bfloat16* kv,__nv_bfloat16* absorbed,unsigned char* cache8,
     unsigned heads,unsigned anchor,float theta,float* scales) {
     unsigned row=blockIdx.y,head=blockIdx.x,i=threadIdx.x;
-    __shared__ float red[256],sc;
+    __shared__ float amax[4],sc[4];
     const __nv_bfloat16* qr=q+((size_t)row*heads+head)*256+192;
     __nv_bfloat16* dst=absorbed+((size_t)row*heads+head)*576+512;
     if(i<32) {
@@ -169,37 +173,32 @@ extern "C" __global__ void hy4_dfly_pack_fp8kv(const __nv_bfloat16* q,
     if(!head) {
         size_t slot=(size_t)(anchor+row);
         const __nv_bfloat16* kr=kv+(size_t)row*576;
-        unsigned char* kd=cache8+slot*576;
-        float mx=0.f;
-        for(unsigned d=i;d<512;d+=blockDim.x) mx=fmaxf(mx,fabsf((float)kr[d]));
-        red[i]=mx; __syncthreads();
-        for(unsigned half=128;half;half>>=1) {
-            if(i<half) red[i]=fmaxf(red[i],red[i+half]); __syncthreads();
-        }
-        if(i==0) { float t=hy4_dfly_fp8_row_scale(red[0]); scales[2*slot]=t; sc=t; }
+        unsigned char* kd=cache8+slot*640;
+        if(i<4) amax[i]=0.f;
         __syncthreads();
         for(unsigned d=i;d<512;d+=blockDim.x)
-            kd[d]=hy4_dfly_enc_e4m3((float)kr[d]/sc);
+            atomicMax((unsigned*)&amax[d/128],__float_as_uint(fabsf((float)kr[d])));
+        __syncthreads();
+        if(i<4) {
+            sc[i]=hy4_dfly_fp8_row_scale(amax[i]);
+            scales[4*slot+i]=sc[i];
+        }
+        __syncthreads();
+        for(unsigned d=i;d<512;d+=blockDim.x)
+            kd[d]=hy4_dfly_enc_e4m3((float)kr[d]/sc[d/128]);
         if(i<32) {
             float angle=(float)(anchor+row)*powf(theta,-(float)i/32.f),s,c;
             sincosf(angle,&s,&c);
             float a=(float)kr[512+i*2],b=(float)kr[512+i*2+1];
-            float v0=a*c-b*s,v1=a*s+b*c;
-            float m=fmaxf(fabsf(v0),fabsf(v1));
-            #pragma unroll
-            for(unsigned off=16;off;off>>=1)
-                m=fmaxf(m,__shfl_xor_sync(0xffffffffu,m,off));
-            float t=hy4_dfly_fp8_row_scale(m);
-            if(!i) scales[2*slot+1]=t;
-            float inv=__shfl_sync(0xffffffffu,t,0);
-            kd[512+i*2]=hy4_dfly_enc_e4m3(v0/inv);
-            kd[512+i*2+1]=hy4_dfly_enc_e4m3(v1/inv);
+            __nv_bfloat16* rope=(__nv_bfloat16*)(kd+512);
+            rope[i*2]=__float2bfloat16_rn(a*c-b*s);
+            rope[i*2+1]=__float2bfloat16_rn(a*s+b*c);
         }
     }
 }
 
-// FP8 variant of hy4_dfly_attention: reads dequantize each latent row with
-// its per-half rowwise scale.
+// FP8 variant of hy4_dfly_attention: reads dequantize dims 0..512 tilewise
+// and read rope dims directly as BF16.
 extern "C" __global__ void hy4_dfly_attention_fp8kv(const __nv_bfloat16* q,
     const unsigned char* cache8,const int* history,
     const __nv_bfloat16* sink,__nv_bfloat16* out,unsigned heads,
